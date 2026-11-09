@@ -16,6 +16,6 @@ To install:
 
 Needs glibc 2.38 or newer and Vulkan 1.3 drivers. Settings (`ng2.toml`) and logs are kept next to `ng2`.
 
-Bugs that also happen on PC go to [upstream](https://github.com/gamboozino/ng2recomp/issues), ARM-only ones here. that means before opening an issue here, first see whether it can be replicated on an upstream build.
+Bugs that also happen on PC go to [upstream](https://github.com/gamboozino/ng2recomp/issues), ARM-only ones here. That means before opening an issue here, first see whether it can be replicated on an upstream build.
 
 The game's code is GPL-3.0-or-later like upstream.
