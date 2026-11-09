@@ -19,8 +19,7 @@
 // frames: 30 refreshes in a 5 s window that disagree before the period is
 // trusted make it count as variable for the session, and the game keeps its
 // own 60 Hz clock, which such a screen shows evenly. What's reported is the
-// frame period, as present_wait's clock gives it: whole refreshes nearest
-// 60 Hz (2 on a 120 Hz screen).
+// refresh period; the vblank lock takes every few (2 on a 120 Hz screen).
 
 #include "gpu/win_display.h"
 
@@ -199,9 +198,6 @@ void Run(HWND hwnd, const std::atomic<bool>* run, int64_t (*now)(), DisplayVblan
     if (windowUnits >= 300) {
       windowUnits = 0, windowOff = 0;
     }
-    // The frame period: the whole refreshes nearest 60 Hz (2 at 120 Hz, 2 at
-    // 144 Hz, which then isn't near enough 60 for the lock).
-    int64_t frame = measured * std::clamp<int64_t>((16'666'667 + measured / 2) / std::max<int64_t>(measured, 1), 1, 4);
     if (trusted != was) {
       REXLOG_INFO("video: display clock (DXGI) {} at {:.3f} Hz", trusted ? "steady" : "no longer steady",
                   1e9 / double(measured));
@@ -209,7 +205,7 @@ void Run(HWND hwnd, const std::atomic<bool>* run, int64_t (*now)(), DisplayVblan
         agreeing = 0;
       }
     }
-    report(t, frame, trusted);
+    report(t, measured, trusted);
   }
   if (output) {
     output->Release();

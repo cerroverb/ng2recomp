@@ -48,7 +48,8 @@ devices, and none of the player's settings or saves.
 - `NG2_PAD_SCRIPT=30000:start,34000:a,...` plays a controller (`<ms>:<button>[:<hold ms>]`;
   buttons and sticks in `src/script_input.h`). From boot, `30000:start,34000:a,37000:a,40000:a,
   58000:a,63000:a,80000:a,262000:a,280000:a` reaches Chapter 1's first fight at about 280 s (TU3:
-  the chapter card takes the press at 80 s); Back about 300 s opens the in-game menu.
+  the chapter card takes the press at 80 s); Back about 300 s opens the in-game menu. With the
+  Mission Mode DLC installed, New Game first asks for a costume: add `43000:a,46000:a`.
 - `tools/collect_pipelines.sh <out dir>` remakes the packaged pipeline seed
   (`packaging/ng2-pipelines-seed.bin`): headless runs through Chapter 1 and Mission Mode (missions
   1-12, fighting), their pipeline lists merged by `tools/merge_pipelines.py`. The game makes the
@@ -96,6 +97,15 @@ devices, and none of the player's settings or saves.
   `NG2_TRACE_FRAMES` (60) frames and a small picture every 10, in `~/ng2-trace-<n>` (`HOME` decides
   where).
 - `NG2_DUMP_TEXTURES=<dir>`: write decoded textures (PGM/PAM/DDS).
+- `NG2_TRACE_PICTURES=<n>`: a trace picture every n frames (10; 0: none). `NG2_TRACE_PICTURES_ONLY=1`:
+  F7 takes the pictures alone, no draws or memory (a trace's own stall can hide what it's after).
+  `NG2_TRACE_STACKS=1`: each traced draw with its guest call chain. Traced draws carry their shader
+  constants ("consts").
+- `NG2_DEBUG_SKIP=<vs hash prefix>[:<count>],...`: those draws aren't made; with
+  `NG2_DEBUG_SKIP_BLINK=1` only 3 s of every 6 (to see what a part of the picture is).
+- `NG2_TEST_TOGGLE_LOG=1`: logs draws whose shader constants switch between two sets of values from
+  frame to frame (once each, with what differs). `NG2_TEST_WAIT_GPU=1`: the CPU waits for the GPU
+  at each present.
 - `NG2_DEBUG_HIGHLIGHT=<vs hash>|<hash>,<hash>...|cycle:<s>|all|rigid`: draw a vertex shader's
   draws in magenta (a list or all: a colour per shader, logged; rigid: the unskinned ones;
   `NG2_DEBUG_EXCLUDE=<hash>,...` leaves some out).

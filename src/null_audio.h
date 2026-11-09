@@ -15,6 +15,8 @@
 
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
+#include <rex/audio/sdl/sdl_audio_system.h>
+#include <rex/logging.h>
 #include <rex/thread.h>
 
 namespace ng2 {
@@ -83,6 +85,38 @@ class NullAudioSystem : public rex::audio::AudioSystem {
   }
 
   void DestroyDriver(rex::audio::AudioDriver* driver) override { delete driver; }
+};
+
+// The default backend: SDL, and where no output device opens (#84: WASAPI
+// "can't initialize audio client" on every start), the driver above, so the
+// game runs without sound instead of calling the callback it never got.
+class SdlOrSilentAudioSystem : public rex::audio::sdl::SDLAudioSystem {
+ public:
+  using SDLAudioSystem::SDLAudioSystem;
+
+  static std::unique_ptr<rex::audio::AudioSystem> Create(
+      rex::runtime::FunctionDispatcher* function_dispatcher) {
+    return std::make_unique<SdlOrSilentAudioSystem>(function_dispatcher);
+  }
+
+  X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
+                        rex::audio::AudioDriver** out_driver) override {
+    X_STATUS status = SDLAudioSystem::CreateDriver(index, semaphore, out_driver);
+    if (XSUCCEEDED(status)) {
+      return status;
+    }
+    REXLOG_WARN("audio: no output device could be opened; the game runs without sound");
+    *out_driver = new NullAudioDriver(memory(), semaphore);
+    return X_STATUS_SUCCESS;
+  }
+
+  void DestroyDriver(rex::audio::AudioDriver* driver) override {
+    if (dynamic_cast<NullAudioDriver*>(driver)) {
+      delete driver;
+      return;
+    }
+    SDLAudioSystem::DestroyDriver(driver);
+  }
 };
 
 }  // namespace ng2

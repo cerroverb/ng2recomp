@@ -139,6 +139,8 @@ namespace reg = rex::graphics::reg;
 
 namespace ng2::video {
 
+void RequestDisplayRate();  // (the display clock, below)
+
 namespace {
 
 constexpr size_t NUM_FRAMES = 2;
@@ -858,6 +860,7 @@ int64_t g_traceFrames = 0, g_traceLeft = 0;
 // F7's first frame: each draw's vertex shader constants (256 x 16 bytes, as
 // the guest has them: big-endian), in draw order, beside its draw lines.
 FILE* g_traceConstants = nullptr;
+thread_local std::string g_drawStack;  // NG2_TRACE_STACKS: the last draw's guest call chain
 
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
@@ -880,9 +883,19 @@ void TraceLog(fmt::format_string<Args...> format, Args&&... args) {
 // NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
 // that starts that long after the first draw. A +<count> suffix traces that
 // many frames from there.
+// NG2_TRACE_PICTURES_ONLY=1: F7 takes the pictures alone, no draws or memory (a
+// trace's own slowness can hide what it's after).
+bool TracePicturesOnly() {
+  static const bool only = [] {
+    const char* v = std::getenv("NG2_TRACE_PICTURES_ONLY");
+    return v && *v && *v != '0';
+  }();
+  return only;
+}
+
 bool Tracing() {
   if (g_traceFile) {
-    return true;
+    return !TracePicturesOnly();
   }
   static const char* spec = std::getenv("NG2_TRACE_FRAME");
   static const bool byTime = spec && spec[0] == 't';
@@ -1048,7 +1061,8 @@ void EvenOutPresent() {
   int64_t refresh = 0, period = 16'666'667;
   int64_t measured = 0;
   if (DisplayRefresh(&refresh, &measured) && measured > 4'000'000 && measured < 50'000'000) {
-    period = measured;
+    // (a frame's: the whole refreshes nearest 60 Hz, 2 on a 120 Hz panel)
+    period = measured * std::clamp<int64_t>((16'666'667 + measured / 2) / measured, 1, 4);
   }
   int64_t now = SteadyNs();
   int64_t until = last + period * 9 / 10;
@@ -4335,8 +4349,84 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   if (ps) {
     copyConstants(psConstants.data, psSource, ps->entry->floatConstantMask, 224);
   }
+
   Upload sharedUpload = Allocate(sizeof(shared));
   std::memcpy(sharedUpload.data, &shared, sizeof(shared));
+
+  // NG2_TEST_TOGGLE_LOG=1 (#21): draws whose shader constants switch between
+  // two sets of values from frame to frame, logged with what differs.
+  static const bool toggleLog = [] {
+    const char* v = std::getenv("NG2_TEST_TOGGLE_LOG");
+    return v && *v == '1';
+  }();
+  if (toggleLog) {
+    struct Seen {
+      std::vector<std::pair<uint64_t, std::vector<uint32_t>>> values;  // the last two sets
+      std::vector<uint64_t> history;  // the last 8 frames'
+      uint64_t frame = 0;
+      bool logged = false;
+    };
+    static std::unordered_map<uint64_t, Seen> seen;
+    static std::unordered_map<uint64_t, int> occurrences;
+    static uint64_t occurrenceFrame = ~0ull;
+    if (occurrenceFrame != g_frameCount) {
+      occurrences.clear();
+      occurrenceFrame = g_frameCount;
+    }
+    uint64_t base = vs->entry->hash * 31 + (ps ? ps->entry->hash : 0) * 7 + count;
+    uint64_t key = base * 131 + occurrences[base]++;
+    std::vector<uint32_t> now;
+    auto collect = [&](const uint8_t* data, const uint64_t (&mask)[4], uint32_t registers, uint32_t tag) {
+      const auto* words = reinterpret_cast<const uint32_t*>(data);
+      for (uint32_t word = 0; word < 4; word++) {
+        for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
+          uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+          if (r >= registers) break;
+          now.push_back(tag | r);
+          for (uint32_t c = 0; c < 4; c++) now.push_back(words[r * 4 + c]);
+        }
+      }
+    };
+    collect(vsConstants.data, vs->entry->floatConstantMask, 256, 0);
+    if (ps) collect(psConstants.data, ps->entry->floatConstantMask, 224, 0x1000);
+    Seen& s = seen[key];
+    if (s.frame + 1 != g_frameCount) {
+      s.history.clear();
+    }
+    uint64_t h = XXH3_64bits(now.data(), now.size() * 4);
+    if (s.values.size() < 2 || (s.values[0].first != h && s.values[1].first != h)) {
+      if (s.values.size() == 2) s.values.erase(s.values.begin());
+      s.values.push_back({h, now});
+    }
+    s.history.push_back(h);
+    if (s.history.size() > 8) s.history.erase(s.history.begin());
+    if (!s.logged && s.history.size() == 8) {
+      std::unordered_set<uint64_t> distinct(s.history.begin(), s.history.end());
+      int switches = 0;
+      for (size_t i = 1; i < s.history.size(); i++) switches += s.history[i] != s.history[i - 1];
+      if (distinct.size() == 2 && switches >= 3 && s.values.size() == 2) {
+        s.logged = true;
+        const auto& va = s.values[0].second;
+        const auto& vb = s.values[1].second;
+        std::string diff;
+        for (size_t i = 0; i + 4 < va.size() && i + 4 < vb.size(); i += 5) {
+          bool same = true;
+          for (int c = 1; c <= 4; c++) same = same && va[i + c] == vb[i + c];
+          if (!same) {
+            float fa[4], fb[4];
+            std::memcpy(fa, &va[i + 1], 16);
+            std::memcpy(fb, &vb[i + 1], 16);
+            diff += fmt::format(" {}c{}: {:.5g},{:.5g},{:.5g},{:.5g} / {:.5g},{:.5g},{:.5g},{:.5g}",
+                                va[i] & 0x1000 ? "ps " : "vs ", va[i] & 0xFFF, fa[0], fa[1], fa[2], fa[3],
+                                fb[0], fb[1], fb[2], fb[3]);
+          }
+        }
+        REXLOG_INFO("toggle: vs {:016X} ps {:016X} count {} ({} switches in 8 frames):{}", vs->entry->hash,
+                    ps ? ps->entry->hash : 0, count, switches, diff);
+      }
+    }
+    s.frame = g_frameCount;
+  }
 
   // Index data (converted to little-endian).
   uint32_t drawCount = count;
@@ -4421,6 +4511,35 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     pixelShader = g_debugShader.get();
     DebugColor(vs->entry->hash, reinterpret_cast<SharedConstants*>(sharedUpload.data)->debugColor);
   }
+  // NG2_DEBUG_SKIP=<vs hash prefix>[:<count>],...: those draws aren't made (to
+  // find what a picture is made of); NG2_DEBUG_SKIP_BLINK=1: only 3 s of every 6.
+  if (static const char* skip = std::getenv("NG2_DEBUG_SKIP"); skip && [&] {
+        static const bool blink = std::getenv("NG2_DEBUG_SKIP_BLINK") != nullptr;
+        if (blink) {
+          static const auto start = std::chrono::steady_clock::now();
+          auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+          if ((secs / 3) % 2 == 0) {
+            return false;
+          }
+        }
+        std::string hash = fmt::format("{:016X}", vs->entry->hash);
+        std::string list = skip;
+        for (size_t at = 0; at <= list.size();) {
+          size_t end = list.find(',', at);
+          if (end == std::string::npos) end = list.size();
+          std::string entry = list.substr(at, end - at);
+          size_t colon = entry.find(':');
+          std::string prefix = entry.substr(0, colon);
+          if (!prefix.empty() && hash.compare(0, prefix.size(), prefix) == 0 &&
+              (colon == std::string::npos || std::strtoul(entry.c_str() + colon + 1, nullptr, 10) == count)) {
+            return true;
+          }
+          at = end + 1;
+        }
+        return false;
+      }()) {
+    return;
+  }
   RenderPipeline* pipeline = GetPipeline(key, vertexShader, pixelShader);
   if (!pipeline) {
     return;
@@ -4441,7 +4560,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
                 "base {} indx_offset {:#x} min/max {:#x}/{:#x} colorcontrol {:#x} bools {:08x} "
                 "bias {} {} cull {} depthfmt {} depthtex {:x} scissor {} {} {} {} {} key {:016X} "
-                "vport {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} z {} {} clip {:#x} mode {:#x} vtx {:#x} {:#x} {:#x}",
+                "vport {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} z {} {} clip {:#x} mode {:#x} vtx {:#x} {:#x} {:#x} viz {:#x}",
                 primitive, count, indexed, vs->entry->hash, ps ? ps->entry->hash : 0,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
@@ -4455,7 +4574,39 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 Register(device, 0x2111), Register(device, 0x2112), Register(device, 0x2113),
                 Register(device, 0x2114), viewport.minDepth, viewport.maxDepth, Register(device, 0x2204),
                 Register(device, 0x2205), Register(device, 0x2300), Register(device, 0x2301),
-                Register(device, 0x2302));
+                Register(device, 0x2302), Register(device, 0x2293));
+    if (!g_drawStack.empty()) {
+      TraceLog("  stack {}", g_drawStack);
+    }
+    // The constants the shaders read, in full (with a hash of each set), to see
+    // what changes between frames.
+    auto readConstants = [](const uint8_t* data, const uint64_t (&mask)[4], uint32_t registers,
+                            bool full) {
+      const auto* words = reinterpret_cast<const uint32_t*>(data);
+      std::vector<uint32_t> used;
+      std::string text;
+      for (uint32_t word = 0; word < 4; word++) {
+        for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
+          uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+          if (r >= registers) {
+            break;
+          }
+          for (uint32_t c = 0; c < 4; c++) {
+            used.push_back(words[r * 4 + c]);
+          }
+          if (full) {
+            float f[4];
+            std::memcpy(f, words + r * 4, sizeof(f));
+            text += fmt::format(" c{}={:.5g},{:.5g},{:.5g},{:.5g}", r, f[0], f[1], f[2], f[3]);
+          }
+        }
+      }
+      return std::make_pair(XXH3_64bits(used.data(), used.size() * 4), text);
+    };
+    auto vsc = readConstants(vsConstants.data, vs->entry->floatConstantMask, 256, true);
+    auto psc = ps ? readConstants(psConstants.data, ps->entry->floatConstantMask, 224, true)
+                  : std::make_pair(uint64_t(0), std::string());
+    TraceLog("  consts vs {:016x} ps {:016x}{} |{}", vsc.first, psc.first, psc.second, vsc.second);
   }
   DrawRecord record;
   record.pipeline = pipeline;
@@ -4617,7 +4768,7 @@ void TraceFrame(HostTexture* frontBuffer) {
     g_traceLeft = frames ? std::max(std::atoi(frames), 1) : 60;
     g_traceFrames = 0;
     REXLOG_INFO("video: tracing {} frames to {}", g_traceLeft, g_traceDir);
-    if (g_traceFile && !std::getenv("NG2_TRACE_NOMEMORY")) {
+    if (g_traceFile && !std::getenv("NG2_TRACE_NOMEMORY") && !TracePicturesOnly()) {
       WriteTraceMemory(fmt::format("{}/memory-{}.zst", g_traceDir, g_frameCount));
       g_traceConstants = std::fopen(fmt::format("{}/vs-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
     }
@@ -4630,7 +4781,11 @@ void TraceFrame(HostTexture* frontBuffer) {
   }
   TraceLog("present frame {}", g_frameCount);
   std::fflush(g_traceFile);  // quitting doesn't flush stdio
-  if (g_traceFrames++ % 10 == 0 && frontBuffer && frontBuffer->samples == RenderSampleCount::COUNT_1 &&
+  static const int pictureEvery = [] {  // NG2_TRACE_PICTURES=<n>: a picture every n frames (10)
+    const char* v = std::getenv("NG2_TRACE_PICTURES");
+    return v ? std::max(std::atoi(v), 0) : 10;  // (0: none)
+  }();
+  if (pictureEvery > 0 && g_traceFrames++ % pictureEvery == 0 && frontBuffer && frontBuffer->samples == RenderSampleCount::COUNT_1 &&
       (frontBuffer->format == RenderFormat::R8G8B8A8_UNORM ||
        frontBuffer->format == RenderFormat::R16G16B16A16_UNORM)) {
     TracePicture& picture = g_tracePicture;
@@ -4729,6 +4884,24 @@ void Present(HostTexture* frontBuffer) {
     std::error_code error;
     if (std::filesystem::remove(traceFile, error)) {
       g_traceRequest = true;
+    }
+  }
+  // NG2_TEST_WAIT_GPU=1: the CPU waits for the GPU at each present, as F7's
+  // pictures make it (a test for races between the two).
+  static const bool waitGpu = [] {
+    const char* v = std::getenv("NG2_TEST_WAIT_GPU");
+    return v && *v == '1';
+  }();
+  if (waitGpu) {
+    WaitForGPU();
+  }
+  // The display's rate (SDL's, from the UI thread) for the display clock's
+  // refreshes a frame, asked for every 5 s: a 120 Hz switch shows up.
+  {
+    static int64_t rateAskedAt = 0;
+    if (int64_t now = SteadyNs(); now - rateAskedAt > 5'000'000'000) {
+      rateAskedAt = now;
+      RequestDisplayRate();
     }
   }
   if (g_traceFile || g_traceRequest || g_tracePicture.pending) {
@@ -5162,6 +5335,10 @@ bool IsNativeRenderer() {
 // refresh, once steady for two seconds. It counts the frames that stayed up
 // an extra refresh too (a repeat, the drift between the guest's vblank timer
 // and the display, or a slow frame).
+// (below: the rate of the display the window is on, as SDL reports it)
+extern std::atomic<double> g_displayModeHz;
+void RequestDisplayRate();
+
 namespace {
 std::atomic<int64_t> g_displayRefreshNs{0}, g_displayPeriodNs{0};
 std::atomic<bool> g_displaySteady{false}, g_displayRun{false};
@@ -5206,7 +5383,25 @@ void DisplayClockThread() {
   uint64_t secondRepeats = 0;
   int64_t secondStart = 0;
   double period = 1e9 / 60.0;
+  // Refreshes a frame takes: 1 near 60 Hz; on a 120 or 240 Hz panel 2 or 4,
+  // from SDL's rate, so frames are counted in the panel's own refreshes (the
+  // gaps rounded to 60 Hz units read 61 Hz on a 120 Hz laptop panel, and Auto
+  // never locked). 144-170 Hz, which 60 doesn't divide, stays at 1, as before.
+  int every = 1;
   while (g_displayRun.load()) {
+    // (the rate is asked for from the presents, every 5 s: see Present)
+    if (double hz = g_displayModeHz.load(); hz > 0) {
+      int n = std::clamp(int(hz / 60.0 + 0.5), 1, 4);
+      if (n > 1 && std::abs(hz / n - 60.0) > 1.2) {
+        n = 1;
+      }
+      if (n != every) {
+        every = n;
+        period = 1e9 / (60.0 * every);
+        last = 0;  // (measured afresh, below)
+        REXLOG_INFO("video: display clock counts {} refreshes a frame ({:.2f} Hz display)", every, hz);
+      }
+    }
     RenderSwapChain* swapChain = g_swapChain.get();
     uint64_t id = swapChain ? swapChain->getPresentId() : 0;
     if (!id) {
@@ -5246,14 +5441,19 @@ void DisplayClockThread() {
       g_repeatsLastSecond.store(0);
       g_displaySteady.store(false);
     } else if (dt > period / 4) {  // (another present shown at the same refresh: none)
+      // (k refreshes; a frame not a whole number of frame periods is off time)
       uint64_t k = std::max<uint64_t>(1, uint64_t(double(dt) / period + 0.5));
       double residual = double(dt) - double(k) * period;
-      uint64_t off = std::abs(residual) > period * 0.2 ? 1 : 0;
+      // Off time: over a fifth of a refresh away, but at least 1.2 ms (shown
+      // times come from a loop that polls every millisecond: at 240 Hz a fifth
+      // is less than that).
+      uint64_t off = std::abs(residual) > std::max(period * 0.2, 1.2e6) || k % every ? 1 : 0;
+      uint64_t extra = k >= uint64_t(every) ? k / every - 1 : 0;
       uneven += off, windowUneven += off;
-      repeats += k - 1, frames++;
-      secondRepeats += k - 1;
+      repeats += extra, frames++;
+      secondRepeats += extra;
       runUnits += k, windowUnits += k;
-      if (runUnits >= 60) {
+      if (runUnits >= 60u * every) {
         period = double(t - runStart) / double(runUnits);
       }
       // Steady: fewer than 1 in 10 refreshes off their expected time, judged
@@ -5274,7 +5474,7 @@ void DisplayClockThread() {
         }
         windowUnits = 0, windowUneven = 0;
       }
-      g_displayPeriodNs.store(int64_t(period));
+      g_displayPeriodNs.store(int64_t(period));  // (a refresh: the lock takes every few)
       g_displayRefreshNs.store(t);
       g_displaySteady.store(steady);
     }
@@ -5342,6 +5542,10 @@ rex::ui::WindowedAppContext* g_appContext = nullptr;
 std::atomic<double> g_displayModeHz{0.0};
 std::atomic<bool> g_displayModeQueued{false};
 std::atomic<bool> g_presentDrainCheck{false};  // off before the swapchain goes
+
+void NoteDrawStack(const std::string& stack) {
+  g_drawStack = stack;
+}
 
 void SetAppContext(rex::ui::WindowedAppContext* context) {
   g_appContext = context;

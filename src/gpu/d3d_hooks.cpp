@@ -64,7 +64,9 @@ void ReportStats() {
 // frame). Finds what draws a picture the 2D pass doesn't.
 void LogDrawStack(PPCContext& ctx, const char* kind) {
   static const bool on = std::getenv("NG2_DRAW_STACKS") != nullptr;
-  if (!on) {
+  // NG2_TRACE_STACKS=1: the chain goes on each draw's trace line too.
+  static const bool traced = std::getenv("NG2_TRACE_STACKS") != nullptr;
+  if (!on && !traced) {
     return;
   }
   static std::mutex mutex;
@@ -85,6 +87,12 @@ void LogDrawStack(PPCContext& ctx, const char* kind) {
     }
     key += fmt::format(" {:08X}", ng2::guest::Load32(next - 8));
     sp = next;
+  }
+  if (traced) {
+    ng2::video::NoteDrawStack(key);
+  }
+  if (!on) {
+    return;
   }
   std::lock_guard lock(mutex);
   if (seen.insert(key).second) {

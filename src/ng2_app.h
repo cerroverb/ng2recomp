@@ -101,6 +101,8 @@ class Ng2App : public rex::ReXApp {
     if (audio && audio[0] == '0') {
       config.audio_factory = REX_AUDIO_BACKEND(ng2::NullAudioSystem);
       REXLOG_INFO("NG2_AUDIO=0: sound off (no output device)");
+    } else {
+      config.audio_factory = REX_AUDIO_BACKEND(ng2::SdlOrSilentAudioSystem);
     }
 
     // NG2_PAD_SCRIPT / NG2_PAD_LIVE: a scripted controller for player one.

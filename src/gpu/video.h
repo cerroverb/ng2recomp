@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <string>
 #include <filesystem>
 
 #include <cstdint>
@@ -81,5 +82,8 @@ int64_t DisplayClockNow();
 // frame (the handoff).
 void NoteInputRead();
 void NoteFrameTaken();
+
+// NG2_TRACE_STACKS=1: the guest call chain of the draw about to be made, for its trace line.
+void NoteDrawStack(const std::string& stack);
 
 }  // namespace ng2::video

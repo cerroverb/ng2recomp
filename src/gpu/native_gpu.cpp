@@ -374,6 +374,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     uint64_t last = rex::chrono::Clock::QueryGuestTickCount();
     const int64_t guestPeriodNs = int64_t(1e9 / hz);
     int64_t lastVblankNs = 0;
+    int64_t lastTargetNs = 0;  // the locked vblanks' last target (0: unlocked since)
     bool lockedLogged = false;
     int64_t lastDrainNs = 0, drainPausedUntil = 0, drainPauseNs = 30'000'000'000;
     int drainsLogged = 0, drainsQuick = 0;
@@ -405,13 +406,20 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             REXLOG_INFO("gpu: vblanks on the display's refreshes ({:.3f} Hz, every {})",
                         1e9 / double(periodNs), every);
           }
-          // frame_pacing_phase after one, the first at least half a step
-          // after the last vblank (no two close together when the lock starts).
+          // frame_pacing_phase after a refresh: the first refresh at least a
+          // step, less half a refresh, after the last vblank (no two close
+          // together when the lock starts). Refresh by refresh, so on a 120 Hz
+          // panel (every 2) the vblanks keep to every second refresh whichever
+          // refresh the clock last reported.
           int64_t phase = std::clamp<int32_t>(REXCVAR_GET(frame_pacing_phase), 0, 50);
           int64_t target = refreshNs + periodNs * phase / 100;
-          while (target < lastVblankNs + step / 2) {
-            target += step;
+          // From the last target, not the wake-up after it: an overslept
+          // wake-up would push this one a refresh late.
+          int64_t after = lastTargetNs ? lastTargetNs : lastVblankNs;
+          while (target < after + step - periodNs / 2) {
+            target += periodNs;
           }
+          lastTargetNs = target;
           int64_t wait = target - ng2::video::DisplayClockNow();
           if (wait > 0) {
             SleepNs(wait);
@@ -503,6 +511,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           continue;
         }
         lastVblankNs = ng2::video::DisplayClockNow();
+        lastTargetNs = 0;
         DispatchInterrupt(0, 2);
         WakeWaits();
         continue;

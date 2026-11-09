@@ -4,11 +4,22 @@
 // Translated vertex shaders write TEXCOORD0-7 (locations 0-7), COLOR0-1
 // (8-9) and TEXCOORD8-15 (10-17); NG2's pixel shaders only read TEXCOORD0-7
 // and COLOR0-1, and passing all 18 would exceed the 64 geometry input
-// components some GPUs allow, so only those pass through.
+// components some GPUs allow, so only those pass through. Each is its own
+// variable at its location, as the vertex shader declares them (an array at
+// locations 0-7 is matched element by element on most drivers, but not, it
+// seems, on Intel's: there the sprites drawn as rectangles took their colour
+// from the wrong slot, #18).
 struct Vertex
 {
     float4 position : SV_Position;
-    [[vk::location(0)]] float4 texCoord[8] : TEXCOORD0;
+    [[vk::location(0)]] float4 t0 : TEXCOORD0;
+    [[vk::location(1)]] float4 t1 : TEXCOORD1;
+    [[vk::location(2)]] float4 t2 : TEXCOORD2;
+    [[vk::location(3)]] float4 t3 : TEXCOORD3;
+    [[vk::location(4)]] float4 t4 : TEXCOORD4;
+    [[vk::location(5)]] float4 t5 : TEXCOORD5;
+    [[vk::location(6)]] float4 t6 : TEXCOORD6;
+    [[vk::location(7)]] float4 t7 : TEXCOORD7;
     [[vk::location(8)]] float4 color0 : COLOR0;
     [[vk::location(9)]] float4 color1 : COLOR1;
 };
@@ -17,8 +28,14 @@ Vertex Fourth(Vertex corner, Vertex a, Vertex b)
 {
     Vertex v;
     v.position = a.position + b.position - corner.position;
-    [unroll] for (uint i = 0; i < 8; i++)
-        v.texCoord[i] = a.texCoord[i] + b.texCoord[i] - corner.texCoord[i];
+    v.t0 = a.t0 + b.t0 - corner.t0;
+    v.t1 = a.t1 + b.t1 - corner.t1;
+    v.t2 = a.t2 + b.t2 - corner.t2;
+    v.t3 = a.t3 + b.t3 - corner.t3;
+    v.t4 = a.t4 + b.t4 - corner.t4;
+    v.t5 = a.t5 + b.t5 - corner.t5;
+    v.t6 = a.t6 + b.t6 - corner.t6;
+    v.t7 = a.t7 + b.t7 - corner.t7;
     v.color0 = a.color0 + b.color0 - corner.color0;
     v.color1 = a.color1 + b.color1 - corner.color1;
     return v;
