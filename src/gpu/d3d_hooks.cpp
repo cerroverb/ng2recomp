@@ -431,7 +431,11 @@ REX_HOOK_RAW(sub_83774800) {
     if (spins >= 4096) {
       std::this_thread::yield();
     } else {
+#if defined(__x86_64__) || defined(_M_X64)
       __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+      __builtin_arm_yield();
+#endif
     }
   }
 }
