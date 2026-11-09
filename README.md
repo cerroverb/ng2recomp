@@ -326,6 +326,12 @@ The Windows build is cross-compiled from Linux after the native one: `packaging/
 also needs its `contrib/D3D12MemoryAllocator` submodule there). It builds the SDK for Windows, fetches
 FFmpeg's Windows build, and packs `out/windows/NinjaGaiden2-windows-x64.zip`.
 
+The 64-bit ARM Linux build is cross-compiled the same way, after the native one:
+`packaging/aarch64/build.sh` (FFmpeg 9.0.2's source in `thirdparty/ffmpeg-n9.0.2`) fetches an
+Ubuntu 24.04 arm64 sysroot, builds the SDK, a small FFmpeg and the game, and puts them in
+`out/aarch64-dist`. Copy that folder to the device, put the game in `game_files/` inside it and
+run `./ng2`.
+
 How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
 [docs/menus.md](docs/menus.md) (the menus), [docs/shaders.md](docs/shaders.md). How to contribute:
 [CONTRIBUTING.md](CONTRIBUTING.md); the layout, tools and test rules, also for coding agents:

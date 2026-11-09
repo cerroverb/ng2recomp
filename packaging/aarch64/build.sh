@@ -11,8 +11,8 @@
 # (cmake/toolchains/linux-aarch64-clang.cmake) and collects the program and the libraries it
 # needs that a system may lack in out/aarch64-dist.
 #
-# Needs: out/aarch64-sysroot (packaging/aarch64/fetch-sysroot.py), thirdparty/ffmpeg-n9.0.2
-# (github.com/FFmpeg/FFmpeg, tag n9.0.2), cmake, ninja, clang, lld, llvm-ar.
+# Needs: thirdparty/ffmpeg-n9.0.2 (github.com/FFmpeg/FFmpeg, tag n9.0.2), cmake, ninja, clang,
+# lld, llvm-ar, gpgv and the Ubuntu archive keyring (/usr/share/keyrings, for the sysroot).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -28,8 +28,16 @@ mkdir -p "$logs"
 
 [ -f "$repo/out/build/linux-amd64-release/shaders/ng2_shader_cache.cpp" ] ||
     { echo "No native build: build out/build/linux-amd64-release first (README)." >&2; exit 1; }
+# The sysroot: what the SDK's own linux-arm64 build installs (its _build-platform.yaml) and the
+# AppImage's Dockerfile, as Ubuntu 24.04 arm64 packages.
 [ -f "$sysroot/usr/lib/aarch64-linux-gnu/libc.so.6" ] ||
-    { echo "No sysroot: run packaging/aarch64/fetch-sysroot.py first." >&2; exit 1; }
+    python3 -I "$here/fetch-sysroot.py" "$repo/out/noble-dl" "$sysroot" \
+        libc6-dev libstdc++-13-dev libgcc-13-dev linux-libc-dev libzstd-dev \
+        libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxrandr-dev libxcursor-dev \
+        libxfixes-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev \
+        wayland-protocols libdecor-0-dev libegl-dev libgbm-dev libdrm-dev libvulkan-dev \
+        libpulse-dev libpipewire-0.3-dev libasound2-dev libdbus-1-dev libudev-dev \
+        libusb-1.0-0-dev >"$logs/sysroot-packages.txt"
 
 # The SDK for aarch64, brought up to date every time (cheap when nothing changed).
 if [ ! -f "$sdk/out/build/linux-arm64/build.ninja" ]; then
@@ -69,11 +77,16 @@ cmake -S "$repo" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
     ${NG2_CMAKE_ARGS:-} >"$logs/ng2-arm64-configure.log"
 cmake --build "$build" -j"$jobs" --target ng2 >"$logs/ng2-arm64-build.log"
 
-# The program, the SDK's runtime and GPU plugin (the build stages them next to it) and FFmpeg next to it ($ORIGIN rpath), the pipeline seed and
-# the licences. Vulkan, the GPU driver, X11/Wayland and the sound server are the system's.
+# The program (ng2.bin) with a start script that gives it the game_files folder next to it, so a
+# Steam shortcut to ng2 needs no launch options; the SDK's runtime and GPU plugin (the build
+# stages them next to it) and FFmpeg ($ORIGIN rpath), the pipeline seed and the licences.
+# Vulkan, the GPU driver, Wayland and the sound server are the system's.
 rm -rf "${dist:?}"
 mkdir -p "$dist/licenses"
-llvm-strip -o "$dist/ng2" "$build/ng2"
+llvm-strip -o "$dist/ng2.bin" "$build/ng2"
+printf '%s\n' '#!/bin/sh' 'here=$(dirname "$(readlink -f "$0")")' \
+    'exec "$here/ng2.bin" --game_data_root="$here/game_files" "$@"' > "$dist/ng2"
+chmod +x "$dist/ng2"
 for lib in "$build"/lib*.so*; do cp -P "$lib" "$dist/"; done
 for lib in avformat avcodec avutil swresample swscale; do
     cp -P "$sysroot/usr/lib/lib$lib.so."* "$dist/"
