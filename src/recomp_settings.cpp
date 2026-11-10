@@ -125,6 +125,8 @@ constexpr uint32_t kPlayTimeName = 0x2F;
 // one, 53 letters): All Weapons and Ninpo's warning, written over it.
 constexpr uint32_t kNoteSlot = 0x39;
 constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your saves, even turned off.";
+// Frame Interpolation's description (placed with the labels).
+constexpr std::u16string_view kInterpNote = u"Experimental: pictures between the game's frames.";
 // The Music Test's track names: room for our texts.
 constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
@@ -393,7 +395,7 @@ void Override(uint32_t slot, std::u16string_view text) {
 // Each of our texts a spare id of the Options table (its strings unused by
 // Options), given our text by the lookup.
 void PlaceTexts() {
-  std::vector<std::u16string_view> texts{kRestoreText};
+  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
     // List values are strings of ours (ListString); only choice rows'
@@ -1541,8 +1543,9 @@ REX_HOOK_RAW(sub_836D6898) {
 // description is the game's for its page and row (a table of text ids by
 // page * 8 + row), and the Game Settings page's rows 5 and 6 get Change
 // Storage Device before the hints above. On ours: no description but on
-// Restore Defaults ("Restore settings to their defaults."), through the
-// text lookup's hook (storage_prompt.cpp), and that page seen as another.
+// Restore Defaults ("Restore settings to their defaults."), All Weapons and
+// Ninpo and Frame Interpolation, through the text lookup's hook
+// (storage_prompt.cpp), and that page seen as another.
 void SetDescriptionText(uint32_t id);  // storage_prompt.cpp; 0: the game's
 REX_EXTERN(__imp__sub_836D6AC8);
 REX_HOOK_RAW(sub_836D6AC8) {
@@ -1555,11 +1558,11 @@ REX_HOOK_RAW(sub_836D6AC8) {
   }
   constexpr uint32_t kRestoreDescription = kTable | 0x9A, kEmpty = kTable | 0x34;
   uint32_t row = Load32(model + 8 * (Load32(model + 8) + 2));
-  bool allWeapons = row < page->count &&
-                    std::string_view(kSettings[page->rows[row].setting].name) == "cheat_all_weapons";
-  SetDescriptionText(row == page->count ? kRestoreDescription
-                     : allWeapons        ? (kTable | kNoteSlot)
-                                         : kEmpty);
+  std::string_view name = row < page->count ? kSettings[page->rows[row].setting].name : "";
+  SetDescriptionText(row == page->count                 ? kRestoreDescription
+                     : name == "cheat_all_weapons"      ? (kTable | kNoteSlot)
+                     : name == "frame_interpolation"    ? TextId(kInterpNote)
+                                                        : kEmpty);
   uint32_t shown = Load32(model);
   if (shown == 1) {
     Store32(model, 2);
