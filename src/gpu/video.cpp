@@ -1712,7 +1712,14 @@ RenderCommandList* CommandList() {
 }
 
 void Transition(HostTexture& texture, RenderTextureLayout layout) {
-  if (texture.layout != layout) {
+  // A copy or resolve into a texture that was the last one's destination too
+  // still needs a barrier: without it the earlier write (often the previous
+  // frame's, a resolve redone each frame) can land after this one, and the
+  // texture holds an old picture for that frame (flicker where the GPU runs
+  // frames overlapped; the synchronization validation's write-after-write).
+  bool rewrite = texture.layout == layout && (layout == RenderTextureLayout::COPY_DEST ||
+                                              layout == RenderTextureLayout::RESOLVE_DEST);
+  if (texture.layout != layout || rewrite) {
     g_profile.barriers++;
     CommandList()->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
                             RenderTextureBarrier(texture.texture.get(), layout));
