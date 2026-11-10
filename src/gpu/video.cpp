@@ -1973,6 +1973,32 @@ bool ResolveCurrent(uint32_t address) {
     if (memory.stale && Tracing()) {
       TraceLog("video: resolve memory {:#x} overwritten", address);
     }
+    // NG2_TEST_STALE_LOG=1: each copy judged overwritten (flicker test), a
+    // count per address once a second.
+    static const bool staleLog = [] {
+      const char* v = std::getenv("NG2_TEST_STALE_LOG");
+      return v && *v == '1';
+    }();
+    if (staleLog && memory.stale) {
+      static std::map<uint32_t, int> counts;
+      static int64_t lastNs = 0;
+      counts[address]++;
+      if (int64_t now = SteadyNs(); now - lastNs > 1'000'000'000) {
+        lastNs = now;
+        std::string text;
+        for (auto& [a, n] : counts) text += fmt::format(" {:#x} x{} ({} bytes)", a, n, g_resolvedMemory[a].size);
+        REXLOG_INFO("stale: resolved memory overwritten:{}", text);
+        counts.clear();
+      }
+    }
+  }
+  // NG2_TEST_NO_STALE=1: the GPU's copy always (flicker test).
+  static const bool noStale = [] {
+    const char* v = std::getenv("NG2_TEST_NO_STALE");
+    return v && *v == '1';
+  }();
+  if (noStale) {
+    return true;
   }
   return !memory.stale;
 }
@@ -4154,6 +4180,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   bool movieQuad = false;    // samples a movie's frame (movie.h)
   uint32_t textureSlots = vs->entry->textureSlotMask | (ps ? ps->entry->textureSlotMask : 0);
   uint32_t indexBase = 0, indexWidth = 0, indexHeight = 0;  // slot 0's, an 8-bit picture
+  // (NG2_TEST_TOGGLE_LOG: each sampled texture's descriptor and memory, below)
+  std::vector<uint32_t> textureRecords;
   for (uint32_t slot = 0; slot < 32; slot++) {
     if (!(textureSlots & (1u << slot))) {
       continue;
@@ -4178,6 +4206,19 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     if (slot == kBloomSlot && ps &&
         (ps->entry->hash == kToneMapPixelShader || ps->entry->hash == kCompositePixelShader)) {
       descriptor = AdjustBloom(fetch, descriptor);
+    }
+    {
+      static const bool toggleLog = [] {
+        const char* v = std::getenv("NG2_TEST_TOGGLE_LOG");
+        return v && *v == '1';
+      }();
+      if (toggleLog) {
+        uint32_t texBase = (uint32_t(fetch.base_address) << 12) & 0x1FFFFFFF;
+        uint32_t bytes = std::min<uint32_t>(4u << 10, GUEST_MEMORY_SIZE - texBase);
+        uint64_t h = XXH3_64bits(guest::Physical(texBase), bytes);
+        textureRecords.insert(textureRecords.end(),
+                              {0x4000u | slot, descriptor, uint32_t(h), uint32_t(h >> 32), texBase});
+      }
     }
     if (Tracing()) {
       TraceLog("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
@@ -4404,6 +4445,25 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     };
     collect(vsConstants.data, vs->entry->floatConstantMask, 256, 0);
     if (ps) collect(psConstants.data, ps->entry->floatConstantMask, 224, 0x1000);
+    now.insert(now.end(), textureRecords.begin(), textureRecords.end());
+    // Render state: the blend/depth/raster registers (tag 0x8000 | register).
+    for (uint32_t r = 0x2100; r < 0x2115; r++) now.insert(now.end(), {0x8000u | r, Register(device, r), 0, 0, 0});
+    for (uint32_t r = 0x2200; r < 0x220C; r++) now.insert(now.end(), {0x8000u | r, Register(device, r), 0, 0, 0});
+    // The vertex data each fetch slot reads, as the guest memory holds it now
+    // (tag 0x2000 | slot, the hash's two halves, address, size).
+    for (uint32_t i = 0; i < 96u; i++) {
+      if (!(fetchMask[i / 32] & (1u << (i % 32)))) continue;
+      uint32_t word0 = shared.vertexFetch[i][0], word1 = shared.vertexFetch[i][1];
+      if ((word0 & 3) != uint32_t(xenos::FetchConstantType::kVertex)) continue;
+      uint32_t address = (word0 & 0xFFFFFFFC) & 0x1FFFFFFF, size = word1 & 0x3FFFFFC;
+      if (!size || size > (16u << 20) || uint64_t(address) + size > GUEST_MEMORY_SIZE) continue;
+      uint64_t h = XXH3_64bits(guest::Physical(address), size);
+      now.push_back(0x2000 | i);
+      now.push_back(uint32_t(h));
+      now.push_back(uint32_t(h >> 32));
+      now.push_back(address);
+      now.push_back(size);
+    }
     Seen& s = seen[key];
     if (s.frame + 1 != g_frameCount) {
       s.history.clear();
@@ -4419,7 +4479,12 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       std::unordered_set<uint64_t> distinct(s.history.begin(), s.history.end());
       int switches = 0;
       for (size_t i = 1; i < s.history.size(); i++) switches += s.history[i] != s.history[i - 1];
-      if (distinct.size() == 2 && switches >= 3 && s.values.size() == 2) {
+      // A, B, A: one frame unlike the ones either side (a single-frame glitch
+      // as well as a steady flip-flop).
+      size_t n = s.history.size();
+      bool aba = s.history[n - 1] == s.history[n - 3] && s.history[n - 2] != s.history[n - 1];
+      (void)distinct;
+      if (aba && switches >= 2 && s.values.size() == 2) {
         s.logged = true;
         const auto& va = s.values[0].second;
         const auto& vb = s.values[1].second;
@@ -4427,7 +4492,15 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
         for (size_t i = 0; i + 4 < va.size() && i + 4 < vb.size(); i += 5) {
           bool same = true;
           for (int c = 1; c <= 4; c++) same = same && va[i + c] == vb[i + c];
-          if (!same) {
+          if (!same && (va[i] & 0x8000)) {
+            diff += fmt::format(" register {:#x}: {:#x} / {:#x}", va[i] & 0x7FFF, va[i + 1], vb[i + 1]);
+          } else if (!same && (va[i] & 0x4000)) {
+            diff += fmt::format(" texture slot {} at {:#x}: {}", va[i] & 0xFFF, va[i + 4],
+                                va[i + 1] != vb[i + 1] ? fmt::format("descriptor {} / {}", va[i + 1], vb[i + 1])
+                                                       : std::string("memory changed"));
+          } else if (!same && (va[i] & 0x2000)) {
+            diff += fmt::format(" vertex slot {} at {:#x}, {} bytes, changed", va[i] & 0xFFF, va[i + 3], va[i + 4]);
+          } else if (!same) {
             float fa[4], fb[4];
             std::memcpy(fa, &va[i + 1], 16);
             std::memcpy(fb, &vb[i + 1], 16);
@@ -4891,6 +4964,19 @@ HostTexture* MovieTexture() {
 
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
+  {
+    static uint32_t lastTicks = 0;
+    uint32_t ticks = guest::Load32(0x84C55B50);
+    if (lastTicks) {
+      uint32_t d = ticks - lastTicks;
+      if (d == 0) {
+        g_framesNoTick++;
+      } else if (d >= 2 && d < 600) {  // (not a load or a pause)
+        g_framesManyTicks++;
+      }
+    }
+    lastTicks = ticks;
+  }
   auto* commandList = CommandList();
   FinishGuestMemory();
   // NG2_TRACE_FILE=<file>: as F7 when the file appears (for test runs).
@@ -5501,9 +5587,13 @@ void DisplayClockThread() {
     if (t - logAt > 10'000'000'000) {
       if (logAt) {
         int relaxations = g_lowRelaxations.load();
-        REXLOG_INFO("video: display {:.3f} Hz{}, {} frames shown, {} stayed an extra refresh{}",
+        uint32_t noTick = g_framesNoTick.exchange(0), manyTicks = g_framesManyTicks.exchange(0);
+        REXLOG_INFO("video: display {:.3f} Hz{}, {} frames shown, {} stayed an extra refresh{}{}",
                     1e9 / period, g_displaySteady.load() ? " (steady)" : "", frames, repeats,
-                    relaxations ? fmt::format(", Low queued a frame {} times", relaxations) : "");
+                    relaxations ? fmt::format(", Low queued a frame {} times", relaxations) : "",
+                    noTick || manyTicks
+                        ? fmt::format("; game frames with no tick {}, with 2 or more {}", noTick, manyTicks)
+                        : "");
       }
       logAt = t, frames = 0, repeats = 0;
     }

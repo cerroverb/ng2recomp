@@ -104,8 +104,11 @@ devices, and none of the player's settings or saves.
 - `NG2_DEBUG_SKIP=<vs hash prefix>[:<count>],...`: those draws aren't made; with
   `NG2_DEBUG_SKIP_BLINK=1` only 3 s of every 6 (to see what a part of the picture is).
 - `NG2_TEST_TOGGLE_LOG=1`: logs draws whose shader constants switch between two sets of values from
-  frame to frame (once each, with what differs). `NG2_TEST_WAIT_GPU=1`: the CPU waits for the GPU
-  at each present.
+  frame to frame (once each, with what differs: constants, vertex data, the textures sampled, render
+  state). `NG2_TEST_WAIT_GPU=1`: the CPU waits for the GPU at each present.
+- `NG2_TEST_STALE_LOG=1`: once a second, the resolved textures whose guest memory was found changed
+  since (read from guest memory instead of the GPU's copy); `NG2_TEST_NO_STALE=1` always uses the GPU's
+  copy.
 - `NG2_DEBUG_HIGHLIGHT=<vs hash>|<hash>,<hash>...|cycle:<s>|all|rigid`: draw a vertex shader's
   draws in magenta (a list or all: a colour per shader, logged; rigid: the unskinned ones;
   `NG2_DEBUG_EXCLUDE=<hash>,...` leaves some out).
