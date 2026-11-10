@@ -90,7 +90,7 @@ devices, and none of the player's settings or saves.
   instead of the "Render Commands" thread (for comparisons).
 - Exclusive full screen (Windows): with Frame Interpolation on and Window Mode Fullscreen (`fullscreen`
   and `exclusive_fullscreen`), the swapchain takes the display (VK_EXT_full_screen_exclusive, plume
-  patches 0017 and 0020), so its presents are flipped by the display instead of composed by DWM, which
+  patches 0017, 0020 and 0021), so its presents are flipped by the display instead of composed by DWM, which
   drops pictures at high refresh rates; decided again when either changes. `NG2_EXCLUSIVE=1` takes it
   always, `2` leaves it to the driver, `0` never.
 - Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
