@@ -1051,10 +1051,10 @@ bool TestNoBorder() {
 // (Windows' sleeps are whole milliseconds).
 void EvenOutPresent() {
   static const bool on = !TestSwitch("NG2_TEST_EVEN_PRESENT", "0");
-  // (with V-Sync on, FIFO or Mailbox: off or Adaptive, the game runs
-  // uncapped and this would cap it near the refresh rate)
+  // (with V-Sync on: FIFO, Mailbox or Adaptive; off, the game runs uncapped
+  // and this would cap it near the refresh rate)
   int32_t mode = REXCVAR_GET(present_mode);
-  if (!on || !REXCVAR_GET(vsync) || (mode != 1 && mode != 2)) {
+  if (!on || !REXCVAR_GET(vsync) || (mode != 1 && mode != 2 && mode != 3)) {
     return;
   }
   static int64_t last = 0;
