@@ -30,6 +30,7 @@ endif()
 set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
+    src/gpu/interp.cpp
     src/gpu/native_gpu.cpp
     src/gpu/win_display.cpp
     src/gpu/menu_label.cpp

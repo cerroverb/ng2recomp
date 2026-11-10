@@ -125,6 +125,8 @@ constexpr uint32_t kPlayTimeName = 0x2F;
 // one, 53 letters): All Weapons and Ninpo's warning, written over it.
 constexpr uint32_t kNoteSlot = 0x39;
 constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your saves, even turned off.";
+// Frame Interpolation's description (placed with the labels).
+constexpr std::u16string_view kInterpNote = u"Experimental: pictures between the game's frames.";
 // The Music Test's track names: room for our texts.
 constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
@@ -206,6 +208,13 @@ constexpr Setting kSettings[] = {
     {u"Input Latency", {u"Standard", u"Low"}, 2, "input_latency", Kind::kLevel},
     // The guest's vblanks on the display's refreshes (gpu/native_gpu.cpp).
     {u"Frame Pacing", {u"Auto", u"Timer"}, 2, "frame_pacing", Kind::kLevel},
+    // Pictures made between the game's frames: one each refresh of the
+    // display (Full Rate) or each second one (Half Rate; each one below
+    // 120 Hz, so never fewer than the game's 60), or one between each two
+    // of the game's frames (2x: 120 for its 60); gpu/interp.cpp.
+    // (Short: a longer choice is squeezed narrow to fit.)
+    {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate", u"2x"}, 4,
+     "frame_interpolation", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -258,7 +267,7 @@ constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{Row(0), Row(3), Row(1), Row(21), Row(2), Row(20)}},
      6},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28)}}, 5},
+    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
      {{Row(8), Row(9), Row(11), Row(24), Row(25), Row(26)}},
@@ -386,7 +395,7 @@ void Override(uint32_t slot, std::u16string_view text) {
 // Each of our texts a spare id of the Options table (its strings unused by
 // Options), given our text by the lookup.
 void PlaceTexts() {
-  std::vector<std::u16string_view> texts{kRestoreText};
+  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
     // List values are strings of ours (ListString); only choice rows'
@@ -1534,8 +1543,9 @@ REX_HOOK_RAW(sub_836D6898) {
 // description is the game's for its page and row (a table of text ids by
 // page * 8 + row), and the Game Settings page's rows 5 and 6 get Change
 // Storage Device before the hints above. On ours: no description but on
-// Restore Defaults ("Restore settings to their defaults."), through the
-// text lookup's hook (storage_prompt.cpp), and that page seen as another.
+// Restore Defaults ("Restore settings to their defaults."), All Weapons and
+// Ninpo and Frame Interpolation, through the text lookup's hook
+// (storage_prompt.cpp), and that page seen as another.
 void SetDescriptionText(uint32_t id);  // storage_prompt.cpp; 0: the game's
 REX_EXTERN(__imp__sub_836D6AC8);
 REX_HOOK_RAW(sub_836D6AC8) {
@@ -1548,11 +1558,11 @@ REX_HOOK_RAW(sub_836D6AC8) {
   }
   constexpr uint32_t kRestoreDescription = kTable | 0x9A, kEmpty = kTable | 0x34;
   uint32_t row = Load32(model + 8 * (Load32(model + 8) + 2));
-  bool allWeapons = row < page->count &&
-                    std::string_view(kSettings[page->rows[row].setting].name) == "cheat_all_weapons";
-  SetDescriptionText(row == page->count ? kRestoreDescription
-                     : allWeapons        ? (kTable | kNoteSlot)
-                                         : kEmpty);
+  std::string_view name = row < page->count ? kSettings[page->rows[row].setting].name : "";
+  SetDescriptionText(row == page->count                 ? kRestoreDescription
+                     : name == "cheat_all_weapons"      ? (kTable | kNoteSlot)
+                     : name == "frame_interpolation"    ? TextId(kInterpNote)
+                                                        : kEmpty);
   uint32_t shown = Load32(model);
   if (shown == 1) {
     Store32(model, 2);

@@ -20,6 +20,9 @@ float Aspect();
 // The gameplay HUD was drawn in the last 2D pass.
 bool HudShown();
 
+// A draw now is the 2D pass's (HUD, menus; render thread).
+bool In2DPass();
+
 // How much 2D is squeezed along x and y (1: not), about the centre of the
 // game's 1280x720 space, for the presenter to stretch back.
 float SqueezeX();

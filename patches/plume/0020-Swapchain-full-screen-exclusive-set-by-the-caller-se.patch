@@ -1,0 +1,127 @@
+From f7d0d67f281c6bac02af2610876129c437ce4db1 Mon Sep 17 00:00:00 2001
+From: Huntez <osigor5464@gmail.com>
+Date: Sun, 8 Nov 2026 20:43:24 +0100
+Subject: [PATCH 20/21] Swapchain: full screen exclusive set by the caller
+ (setFullScreenExclusive), whether it is held (isFullScreenExclusive)
+
+NG2_EXCLUSIVE is no longer read here: the caller decides, and the mode is
+used from the next resize (taken back from the display when it changes
+from 1). isFullScreenExclusive says whether the swapchain holds the
+display now: taken, and not lost since (an overlay, another window).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plume_render_interface.h |  5 +++++
+ plume_vulkan.cpp         | 30 ++++++++++++++++++++----------
+ plume_vulkan.h           |  5 ++++-
+ 3 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 8219457..b826fcc 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -118,6 +118,11 @@ namespace plume {
+         virtual uint32_t getTextureCount() const = 0;
+         // Images asked for from the next resize (the surface's limits still apply).
+         virtual void setTextureCount(uint32_t count) { (void)count; }
++        // Full screen exclusive (Windows, VK_EXT_full_screen_exclusive), from the
++        // next resize: 0 off, 1 taken by the application, 2 left to the driver.
++        virtual void setFullScreenExclusive(int mode) { (void)mode; }
++        // Whether the swapchain holds the display now (taken, and not lost since).
++        virtual bool isFullScreenExclusive() const { return false; }
+         virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
+         // Acquires in short waits, the swapchain's lock let go between them (for a
+         // caller that presents from another thread); off: one wait, as before.
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index a423b5d..424436f 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -103,15 +103,10 @@ namespace plume {
+ 
+     // Common functions.
+ 
+-    // VK_EXT_full_screen_exclusive offered (Windows), and asked for (NG2_EXCLUSIVE=1):
+-    // the swapchain owns the display, its presents flipped by the display
++    // VK_EXT_full_screen_exclusive offered (Windows): the swapchain can own the
++    // display (setFullScreenExclusive), its presents flipped by the display
+     // itself instead of composed by the desktop's compositor.
+     static bool g_fullScreenExclusive = false;
+-    // 1: the application's (acquired after creating), 2: the driver's choice.
+-    static int ExclusiveWanted() {
+-        const char *v = getenv("NG2_EXCLUSIVE");
+-        return (g_fullScreenExclusive && v) ? atoi(v) : 0;
+-    }
+ 
+     static uint32_t roundUp(uint32_t value, uint32_t powerOf2Alignment) {
+         return (value + powerOf2Alignment - 1) & ~(powerOf2Alignment - 1);
+@@ -2426,11 +2421,11 @@ namespace plume {
+         }
+         
+ #   if defined(_WIN64)
+-        if ((ExclusiveWanted() == 1) && !exclusiveHeld && (++exclusiveRetry % 180 == 0)) {
++        if (g_fullScreenExclusive && (exclusiveMode == 1) && !exclusiveHeld && (++exclusiveRetry % 180 == 0)) {
+             const std::scoped_lock lock(vkMutex);
+             VkResult got = vkAcquireFullScreenExclusiveModeEXT(commandQueue->device->vk, vk);
+             exclusiveHeld = got == VK_SUCCESS;
+-            if (exclusiveHeld) {
++            if (exclusiveHeld.load()) {
+                 fprintf(stderr, "plume: full screen exclusive: yes, on a later try\n");
+             } else if (exclusiveRetry % 1800 == 0) {
+                 fprintf(stderr, "plume: full screen exclusive: still no (0x%X)\n", got);
+@@ -2534,7 +2529,10 @@ namespace plume {
+ #   if defined(_WIN64)
+         VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo = {};
+         VkSurfaceFullScreenExclusiveWin32InfoEXT exclusiveWin32 = {};
+-        const int exclusive = ExclusiveWanted();
++        const int exclusive = g_fullScreenExclusive ? exclusiveMode : 0;
++        if (exclusiveHeld.load() && (exclusive != 1) && (vk != VK_NULL_HANDLE)) {
++            vkReleaseFullScreenExclusiveModeEXT(commandQueue->device->vk, vk);
++        }
+         if (exclusive) {
+             exclusiveWin32.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+             exclusiveWin32.hmonitor = MonitorFromWindow(HWND(renderWindow), MONITOR_DEFAULTTONEAREST);
+@@ -2655,6 +2653,18 @@ namespace plume {
+         return createdPresentMode == VK_PRESENT_MODE_FIFO_KHR;
+     }
+ 
++    void VulkanSwapChain::setFullScreenExclusive(int mode) {
++        exclusiveMode = mode;
++    }
++
++    bool VulkanSwapChain::isFullScreenExclusive() const {
++#   if defined(_WIN64)
++        return exclusiveHeld.load();
++#   else
++        return false;
++#   endif
++    }
++
+     uint32_t VulkanSwapChain::getWidth() const {
+         return width;
+     }
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index ba6b5ba..a82b852 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -226,7 +226,8 @@ namespace plume {
+ 
+     struct VulkanSwapChain : RenderSwapChain {
+         VkSwapchainKHR vk = VK_NULL_HANDLE;
+-        bool exclusiveHeld = false;  // (VK_EXT_full_screen_exclusive, NG2_EXCLUSIVE=1)
++        int exclusiveMode = 0;  // (VK_EXT_full_screen_exclusive: setFullScreenExclusive)
++        std::atomic<bool> exclusiveHeld{false};
+         uint32_t exclusiveRetry = 0;
+         std::atomic<bool> acquireShortWaits{false};  // (setAcquireInShortWaits)
+         VulkanCommandQueue *commandQueue = nullptr;
+@@ -264,6 +265,8 @@ namespace plume {
+         bool needsResize() const override;
+         void setVsyncEnabled(bool vsyncEnabled) override;
+         bool isVsyncEnabled() const override;
++        void setFullScreenExclusive(int mode) override;
++        bool isFullScreenExclusive() const override;
+         bool setPresentMode(RenderPresentMode mode) override;
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+-- 
+2.56.0
+

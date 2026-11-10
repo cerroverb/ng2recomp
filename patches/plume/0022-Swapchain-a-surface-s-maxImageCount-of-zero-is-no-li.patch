@@ -1,0 +1,90 @@
+From e0e8eb6d375614a63910aaf4a071bf89efc5cbd3 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Tue, 10 Nov 2026 18:57:00 +0000
+Subject: [PATCH] Swapchain: a surface's maxImageCount of zero is no limit
+ (gamescope: 3 images where 8 were asked for); getMinTextureCount, the
+ surface's minImageCount
+
+---
+ plume_render_interface.h |  3 +++
+ plume_vulkan.cpp         | 13 ++++++++++++-
+ plume_vulkan.h           |  2 ++
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index b826fcc..7a87bf3 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -116,6 +116,9 @@ namespace plume {
+         virtual uint32_t getHeight() const = 0;
+         virtual RenderTexture *getTexture(uint32_t textureIndex) = 0;
+         virtual uint32_t getTextureCount() const = 0;
++        // The surface's minImageCount: an acquire without a timeout may wait for
++        // ever once more than getTextureCount() minus it are held.
++        virtual uint32_t getMinTextureCount() const { return 1; }
+         // Images asked for from the next resize (the surface's limits still apply).
+         virtual void setTextureCount(uint32_t count) { (void)count; }
+         // Full screen exclusive (Windows, VK_EXT_full_screen_exclusive), from the
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index dde7aeb..aa3d8ce 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -2314,9 +2314,15 @@ namespace plume {
+             return;
+         }
+ 
+-        // Make sure maxImageCount is never below minImageCount, as it's allowed to be zero.
++        // A maxImageCount of zero means no limit (gamescope's surfaces): taken as
++        // the minimum it asked for 3 images where 8 were wanted.
++        if (surfaceCapabilities.maxImageCount == 0) {
++            surfaceCapabilities.maxImageCount = UINT32_MAX;
++        }
+         surfaceCapabilities.maxImageCount = std::max(surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
+ 
++        minTextureCount = std::max(surfaceCapabilities.minImageCount, 1u);
++
+         // Clamp the requested buffer count between the bounds of the surface capabilities.
+         this->textureCount = std::clamp(textureCount, surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
+ 
+@@ -2505,6 +2511,7 @@ namespace plume {
+         // gamescope surface is mapped), so clamp again.
+         VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
+         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
++        minTextureCount = std::max(surfaceCapabilities.minImageCount, 1u);
+         textureCount = std::max(textureCount, surfaceCapabilities.minImageCount);
+         if (surfaceCapabilities.maxImageCount != 0) {
+             textureCount = std::min(textureCount, surfaceCapabilities.maxImageCount);
+@@ -2685,6 +2692,10 @@ namespace plume {
+         return textureCount;
+     }
+ 
++    uint32_t VulkanSwapChain::getMinTextureCount() const {
++        return minTextureCount;
++    }
++
+     RenderWindow VulkanSwapChain::getWindow() const {
+         return renderWindow;
+     }
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 9c4147f..800957e 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -237,6 +237,7 @@ namespace plume {
+         std::unique_ptr<CocoaWindow> windowWrapper;
+ #endif
+         uint32_t textureCount = 0;
++        uint32_t minTextureCount = 1;  // the surface's minImageCount
+         uint64_t presentCount = 0;
+         RenderFormat format = RenderFormat::UNKNOWN;
+         uint32_t width = 0;
+@@ -272,6 +273,7 @@ namespace plume {
+         uint32_t getHeight() const override;
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+         uint32_t getTextureCount() const override;
++        uint32_t getMinTextureCount() const override;
+         void setTextureCount(uint32_t count) override;
+         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
+         void setAcquireInShortWaits(bool shortWaits) override;
+-- 
+2.56.0
+

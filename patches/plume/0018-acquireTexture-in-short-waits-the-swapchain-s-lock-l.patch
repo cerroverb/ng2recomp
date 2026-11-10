@@ -1,0 +1,109 @@
+From ef0368160df062ebc836850c2db574435569bb9b Mon Sep 17 00:00:00 2001
+From: Huntez <osigor5464@gmail.com>
+Date: Sat, 7 Nov 2026 13:47:07 +0100
+Subject: [PATCH 18/21] acquireTexture: in short waits, the swapchain's lock
+ let go between them (setAcquireInShortWaits)
+
+A present from another thread (which frees an image) isn't held up by an
+acquire waiting for one. Only when the caller asks for it
+(setAcquireInShortWaits(true)); otherwise one blocking wait, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plume_render_interface.h |  3 +++
+ plume_vulkan.cpp         | 27 +++++++++++++++++++++++++--
+ plume_vulkan.h           |  2 ++
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index c1e3754..f55fd79 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -117,6 +117,9 @@ namespace plume {
+         virtual RenderTexture *getTexture(uint32_t textureIndex) = 0;
+         virtual uint32_t getTextureCount() const = 0;
+         virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
++        // Acquires in short waits, the swapchain's lock let go between them (for a
++        // caller that presents from another thread); off: one wait, as before.
++        virtual void setAcquireInShortWaits(bool shortWaits) { (void)shortWaits; }
+         virtual RenderWindow getWindow() const = 0;
+         virtual bool isEmpty() const = 0;
+ 
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 3f524fb..42ea2bb 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -14,6 +14,7 @@
+ #include <cmath>
+ #include <climits>
+ #include <cstdlib>
++#include <thread>
+ #include <unordered_map>
+ 
+ #if DLSS_ENABLED
+@@ -2716,11 +2717,29 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
+-        const std::scoped_lock lock(vkMutex);
+         assert(signalSemaphore != nullptr);
+ 
+         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
+-        VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
++        VkResult res;
++        if (!acquireShortWaits.load()) {
++            const std::scoped_lock lock(vkMutex);
++            res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
++        }
++        else {
++            // In short waits, the swapchain's lock let go between them: a present
++            // from another thread (which frees an image) isn't held up by an
++            // acquire waiting for one.
++            while (true) {
++                {
++                    const std::scoped_lock lock(vkMutex);
++                    res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, 2000000, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
++                }
++                if ((res != VK_TIMEOUT) && (res != VK_NOT_READY)) {
++                    break;
++                }
++                std::this_thread::yield();
++            }
++        }
+         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
+             return false;
+         }
+@@ -2728,6 +2747,10 @@ namespace plume {
+         return true;
+     }
+ 
++    void VulkanSwapChain::setAcquireInShortWaits(bool shortWaits) {
++        acquireShortWaits = shortWaits;
++    }
++
+     void VulkanSwapChain::releaseSwapChain() {
+         const std::scoped_lock lock(vkMutex);
+         if (vk != VK_NULL_HANDLE) {
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 83b8ddb..2f97b72 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -228,6 +228,7 @@ namespace plume {
+         VkSwapchainKHR vk = VK_NULL_HANDLE;
+         bool exclusiveHeld = false;  // (VK_EXT_full_screen_exclusive, NG2_EXCLUSIVE=1)
+         uint32_t exclusiveRetry = 0;
++        std::atomic<bool> acquireShortWaits{false};  // (setAcquireInShortWaits)
+         VulkanCommandQueue *commandQueue = nullptr;
+         VkSurfaceKHR surface = VK_NULL_HANDLE;
+         RenderWindow renderWindow = {};
+@@ -269,6 +270,7 @@ namespace plume {
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+         uint32_t getTextureCount() const override;
+         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
++        void setAcquireInShortWaits(bool shortWaits) override;
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
+-- 
+2.56.0
+

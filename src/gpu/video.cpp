@@ -24,7 +24,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <filesystem>
+#include <future>
 #include <thread>
 #if defined(__linux__)
 #include <pthread.h>
@@ -47,6 +49,15 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <rex/ui/windowed_app_context.h>
 #if defined(__linux__)
 #include <unistd.h>
@@ -63,9 +74,11 @@
 #include <zstd.h>
 
 #include <plume_render_interface.h>
+#include <plume_vulkan.h>  // (the textures' layouts plume keeps: frame interpolation's pictures)
 #include <smolv.h>
 
 #include "guest.h"
+#include "interp.h"
 #include "menu_label.h"
 #include "shader_cache.h"
 
@@ -124,6 +137,12 @@ REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1"
 // display (FIFO's three images let two): about one or two refreshes less
 // between a press and its picture, with less slack for a slow frame.
 REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_KHR_present_wait)");
+// Frame Interpolation: pictures made between the game's frames (its draws
+// again, part of the way from the last frame's), one for each refresh of the
+// display, or each second one; switched live. NG2_INTERP=1/0 overrides.
+REXCVAR_DEFINE_INT32(frame_interpolation, 0, "Video",
+                     "0: off, 1: a picture each refresh, 2: each second refresh (each one below 120 Hz), "
+                     "3: 2x (one picture between the game's frames)");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -147,7 +166,15 @@ std::atomic<uint32_t> g_framesNoTick{0}, g_framesManyTicks{0};
 
 namespace {
 
-constexpr size_t NUM_FRAMES = 2;
+// Frame slots: the game is at most this many frames ahead of the GPU. Two;
+// three with NG2_INTERP (FrameSlots): the pictures between are made after the
+// frame and drawn before it, so with two the game waited for the build and
+// three draws of the scene (in a crowd, 25 ms frames); a third lets each go
+// on at once (the game, the build, the GPU), each within a frame.
+constexpr size_t NUM_FRAMES = 3;
+uint32_t FrameSlots() {
+  return InterpEnabled() ? 3u : 2u;
+}
 constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
 // Bindless heaps, laid out as the translated shaders expect (docs/shaders.md).
 constexpr uint32_t TEXTURE_DESCRIPTOR_COUNT = 65536;
@@ -233,6 +260,29 @@ struct TaggedPresent {
 };
 std::mutex g_taggedMutex;
 TaggedPresent g_tagged[64];
+
+int64_t SteadyNs();
+// (NG2_LATENCY_LOG) which: 0 the frame's first picture, 1 its own (the last)
+void NotePadToPresent(int64_t ns, int which) {
+  static std::mutex mutex;
+  static double sum[2] = {}, worst[2] = {};
+  static uint64_t count[2] = {};
+  static int64_t logAt = 0;
+  std::lock_guard lock(mutex);
+  double ms = double(ns) / 1e6;
+  sum[which] += ms, worst[which] = std::max(worst[which], ms), count[which]++;
+  int64_t now = SteadyNs();
+  if (!logAt) {
+    logAt = now;
+  }
+  if (now - logAt > 10'000'000'000) {
+    REXLOG_INFO("latency pad to present: first picture {:.1f} ms (worst {:.1f}), the frame's own "
+                "{:.1f} ms (worst {:.1f}); {} frames",
+                count[0] ? sum[0] / double(count[0]) : 0.0, worst[0],
+                count[1] ? sum[1] / double(count[1]) : 0.0, worst[1], count[1]);
+    sum[0] = sum[1] = worst[0] = worst[1] = 0, count[0] = count[1] = 0, logAt = now;
+  }
+}
 
 int64_t SteadyNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -707,6 +757,9 @@ struct UploadAllocator {
   }
 };
 UploadAllocator g_uploads[NUM_FRAMES];
+// The pictures between's constants and bones, made on their own thread while
+// the game goes on (NG2_INTERP): reset with the frame's.
+UploadAllocator g_interpUploads[NUM_FRAMES];
 struct Upload {
   RenderBuffer* buffer;
   uint64_t offset;
@@ -1198,6 +1251,33 @@ class OpArena {
     count_ = 0;
   }
 
+  // Runs every op in order and keeps them (a frame's log, run again).
+  void RunKeep(RenderCommandList* list) {
+    for (size_t c = 0; c < chunks_.size(); c++) {
+      Chunk& chunk = chunks_[c];
+      for (size_t at = 0; at < chunk.used;) {
+        auto* header = reinterpret_cast<Header*>(chunk.data.get() + at);
+        header->run(chunk.data.get() + at + kHeaderSize, list);
+        at += header->size;
+      }
+    }
+  }
+
+  // Forgets every op without running it.
+  void Clear() {
+    for (size_t c = 0; c < chunks_.size(); c++) {
+      Chunk& chunk = chunks_[c];
+      for (size_t at = 0; at < chunk.used;) {
+        auto* header = reinterpret_cast<Header*>(chunk.data.get() + at);
+        header->destroy(chunk.data.get() + at + kHeaderSize);
+        at += header->size;
+      }
+      chunk.used = 0;
+    }
+    current_ = 0;
+    count_ = 0;
+  }
+
   size_t count() const { return count_; }
 
  private:
@@ -1228,6 +1308,202 @@ class OpArena {
   size_t count_ = 0;
 };
 
+// Frame interpolation (NG2_INTERP=1, with the render thread): each frame's
+// commands are kept (g_frameLogs, per frame slot) and run again at its
+// present with each draw's vertex constants part of the way from the last
+// frame's, for pictures between the two (interp.cpp).
+OpArena g_frameLogs[NUM_FRAMES];
+bool g_logOps = false;     // game thread: commands are being kept
+int32_t g_drawTag = -1;    // game thread: the draw whose push constants come next
+// Render thread: while a log runs again, each tagged draw's push constants.
+thread_local const std::vector<std::array<uint64_t, 3>>* g_replayConstants = nullptr;
+// Bone palettes (fetch slot 94, in guest memory): the copy that fills one is
+// tagged with its index in the frame, and filled from elsewhere when the log
+// runs again (g_replayCopies, by palette; ref null = as it was).
+int32_t g_copyTag = -1;
+thread_local const std::vector<RenderBufferReference>* g_replayCopies = nullptr;
+// Draws that export to memory (memexport) aren't run again for the pictures:
+// what they write is the frame's, once (g_drawMemExport: the next draw is one).
+bool g_drawMemExport = false;
+
+// What a frame carries from the last one in textures: a resolved texture
+// read in the frame before anything is resolved to it (the eye's adaptation
+// to the brightness, afterimages and glows mixed with the last frame's).
+// Each picture between runs the whole frame again, so each would move that
+// state on once more (the effect sped up, and the next frame starting from a
+// picture's state instead of the last frame's): it's saved before the
+// pictures and put back after each one (SaveCarried, RestoreCarried).
+std::unordered_map<HostTexture*, bool> g_carriedTouch;  // game thread: the frame's first use, true if read
+void NoteCarriedRead(HostTexture* texture) {
+  if (g_logOps) {
+    g_carriedTouch.emplace(texture, true);
+  }
+}
+void NoteCarriedWrite(HostTexture* texture) {
+  if (g_logOps) {
+    g_carriedTouch.emplace(texture, false);
+  }
+}
+struct CarriedTexture {
+  HostTexture* texture;  // (freed frames later, through g_garbage)
+  RenderTextureLayout layout;  // its layout at the frame's end, as the frame left it
+};
+// The frame's carried textures, and the touches forgotten for the next.
+std::vector<CarriedTexture> TakeCarried() {
+  std::vector<CarriedTexture> carried;
+  for (auto [texture, read] : g_carriedTouch) {
+    if (read && texture->texture && texture->samples == RenderSampleCount::COUNT_1) {
+      carried.push_back({texture, texture->layout});
+    }
+  }
+  g_carriedTouch.clear();
+  static size_t logged = ~size_t(0);
+  if (carried.size() != logged) {
+    logged = carried.size();
+    std::string list;
+    for (auto& c : carried) {
+      list += fmt::format(" {}x{}", c.texture->width, c.texture->height);
+    }
+    REXLOG_INFO("video: interp: {} textures carried from frame to frame:{}", carried.size(), list);
+  }
+  return carried;
+}
+// Render thread: each carried texture's saved copy, kept while it's carried
+// (one no longer used goes after a few frames: the GPU may still read it).
+struct CarriedCopy {
+  std::unique_ptr<RenderTexture> texture;
+  uint32_t width = 0, height = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;
+  uint64_t usedFrame = 0;
+};
+std::unordered_map<const HostTexture*, CarriedCopy> g_carriedCopies;
+std::vector<std::pair<uint64_t, std::unique_ptr<RenderTexture>>> g_carriedRetired;
+uint64_t g_carriedFrame = 0;
+RenderTexture* CarriedCopyOf(const HostTexture& texture) {
+  auto& copy = g_carriedCopies[&texture];
+  if (copy.texture && (copy.width != texture.width || copy.height != texture.height ||
+                       copy.format != texture.format)) {
+    g_carriedRetired.emplace_back(g_carriedFrame, std::move(copy.texture));
+  }
+  if (!copy.texture) {
+    copy.texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+        texture.width, texture.height, 1, texture.format, RenderTextureFlag::RENDER_TARGET));
+    copy.width = texture.width, copy.height = texture.height, copy.format = texture.format;
+  }
+  copy.usedFrame = g_carriedFrame;
+  return copy.texture.get();
+}
+// Before the first picture: each carried texture copied aside.
+void SaveCarried(RenderCommandList* l, const std::vector<CarriedTexture>& carried) {
+  g_carriedFrame++;
+  for (auto& c : carried) {
+    RenderTexture* copy = CarriedCopyOf(*c.texture);
+    if (!copy) {
+      continue;
+    }
+    l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                RenderTextureBarrier(c.texture->texture.get(), RenderTextureLayout::COPY_SOURCE));
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_DEST));
+    l->copyTextureRegion(RenderTextureCopyLocation::Subresource(copy),
+                         RenderTextureCopyLocation::Subresource(c.texture->texture.get()));
+    if (c.layout != RenderTextureLayout::UNKNOWN) {
+      l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                  RenderTextureBarrier(c.texture->texture.get(), c.layout));
+    }
+  }
+  // Copies of textures no longer carried, and replaced ones, freed a few frames on.
+  for (auto it = g_carriedCopies.begin(); it != g_carriedCopies.end();) {
+    if (g_carriedFrame - it->second.usedFrame > 8) {
+      g_carriedRetired.emplace_back(g_carriedFrame, std::move(it->second.texture));
+      it = g_carriedCopies.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::erase_if(g_carriedRetired, [](auto& retired) { return g_carriedFrame - retired.first > 8; });
+}
+// After each picture: the carried textures as the last frame left them.
+void RestoreCarried(RenderCommandList* l, const std::vector<CarriedTexture>& carried) {
+  for (auto& c : carried) {
+    auto it = g_carriedCopies.find(c.texture);
+    if (it == g_carriedCopies.end() || !it->second.texture) {
+      continue;
+    }
+    RenderTexture* copy = it->second.texture.get();
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_SOURCE));
+    l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                RenderTextureBarrier(c.texture->texture.get(), RenderTextureLayout::COPY_DEST));
+    l->copyTextureRegion(RenderTextureCopyLocation::Subresource(c.texture->texture.get()),
+                         RenderTextureCopyLocation::Subresource(copy));
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_DEST));
+    if (c.layout != RenderTextureLayout::UNKNOWN) {
+      l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                  RenderTextureBarrier(c.texture->texture.get(), c.layout));
+    }
+  }
+}
+
+// The textures' layouts around the pictures. plume keeps a texture's layout
+// on the object, as last recorded; the pictures run the frame's commands
+// again, which were recorded for the layouts the frame found, but are
+// recorded after the frame's own commands (and each after the one before),
+// so plume would take those commands' last layouts for where a picture
+// starts (a texture made this frame: as if loaded already). Each texture's
+// layout as the frame found it is noted (game thread, in Transition, while
+// the frame's commands are kept); each picture is recorded from those, and
+// ends by putting the textures back to them, so the next picture and the
+// frame's own commands start from them.
+using TextureLayouts = std::vector<std::pair<HostTexture*, RenderTextureLayout>>;
+std::unordered_map<HostTexture*, RenderTextureLayout> g_frameStartLayouts;
+void NoteStartLayout(HostTexture& texture) {
+  if (g_logOps) {
+    g_frameStartLayouts.emplace(&texture, texture.layout);
+  }
+}
+struct PictureLayouts {
+  TextureLayouts start;  // as the frame found them
+  TextureLayouts end;    // as a picture's commands (and the frame's) leave them
+  // The frame's (game thread), and the notes forgotten for the next.
+  void Take() {
+    start.assign(g_frameStartLayouts.begin(), g_frameStartLayouts.end());
+    g_frameStartLayouts.clear();
+  }
+  static void Track(const TextureLayouts& layouts) {  // (plume's idea of them)
+    for (auto [texture, layout] : layouts) {
+      if (texture->texture) {
+        static_cast<plume::VulkanTexture*>(texture->texture.get())->textureLayout = layout;
+      }
+    }
+  }
+  // Before a picture's commands are recorded.
+  void BeforeRecord() const { Track(start); }
+  // After the first picture's: where they leave each texture.
+  void NoteEnd() {
+    end = start;
+    for (auto& [texture, layout] : end) {
+      if (texture->texture) {
+        layout = static_cast<plume::VulkanTexture*>(texture->texture.get())->textureLayout;
+      }
+    }
+  }
+  // Before a picture's submit (its blit and the rest recorded then), and
+  // after the pictures (for the frame's present and the next frame).
+  void AtEnd() const { Track(end); }
+  // Barriers back to where the frame started.
+  void BackToStart(RenderCommandList* l) const {
+    for (auto [texture, layout] : start) {
+      auto* vk = texture->texture ? static_cast<plume::VulkanTexture*>(texture->texture.get()) : nullptr;
+      if (vk && layout != RenderTextureLayout::UNKNOWN && vk->textureLayout != layout) {
+        l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                    RenderTextureBarrier(texture->texture.get(), layout));
+      }
+    }
+  }
+};
+
+// NG2_PROFILE: how long the Render Commands thread ran batches (ns), and of
+// that in the presents (ns, by part), logged once a second by the presents.
+std::atomic<int64_t> g_renderBusyNs{0};
 class RenderThread {
  public:
   // At exit without DestroyHostDevice: let the thread go (joining could wait
@@ -1327,7 +1603,14 @@ class RenderThread {
         queue_.pop_front();
         busy_ = true;
       }
+      // (timed for NG2_PROFILE's log only)
+      const bool timed = g_profile.enabled;
+      auto runStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       batch->RunAll();
+      if (timed) {
+        g_renderBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - runStart).count();
+      }
       {
         std::lock_guard lock(mutex_);
         free_.push_back(std::move(batch));
@@ -1371,6 +1654,9 @@ class QueuedCommandList final : public RenderCommandList {
  public:
   template <typename F>
   void Op(F&& f) {
+    if (g_logOps) {
+      g_frameLogs[g_frame].Push(f);  // (a copy, run again for the pictures between: NG2_INTERP)
+    }
     g_renderThread.Push(std::forward<F>(f));
   }
 
@@ -1387,10 +1673,20 @@ class QueuedCommandList final : public RenderCommandList {
     });
   }
   void drawInstanced(uint32_t a, uint32_t b, uint32_t c, uint32_t d) override {
-    Op([=](RenderCommandList* l) { l->drawInstanced(a, b, c, d); });
+    bool once = g_logOps && g_drawMemExport;  // (not in the pictures: g_replayConstants set)
+    Op([=](RenderCommandList* l) {
+      if (!(once && g_replayConstants)) {
+        l->drawInstanced(a, b, c, d);
+      }
+    });
   }
   void drawIndexedInstanced(uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) override {
-    Op([=](RenderCommandList* l) { l->drawIndexedInstanced(a, b, c, d, e); });
+    bool once = g_logOps && g_drawMemExport;
+    Op([=](RenderCommandList* l) {
+      if (!(once && g_replayConstants)) {
+        l->drawIndexedInstanced(a, b, c, d, e);
+      }
+    });
   }
   void setPipeline(const RenderPipeline* p) override {
     Op([=](RenderCommandList* l) { l->setPipeline(p); });
@@ -1407,6 +1703,20 @@ class QueuedCommandList final : public RenderCommandList {
     std::array<uint8_t, PUSH_CONSTANT_SIZE> bytes{};
     size = uint32_t(std::min<size_t>(size ? size : PUSH_CONSTANT_SIZE, bytes.size()));
     std::memcpy(bytes.data(), data, size);
+    if (g_logOps && g_drawTag >= 0) {
+      // A draw's: its constants are replaced when the log runs again.
+      int32_t tag = g_drawTag;
+      g_frameLogs[g_frame].Push([=](RenderCommandList* l) {
+        if (g_replayConstants && size_t(tag) < g_replayConstants->size()) {
+          l->setGraphicsPushConstants(range, (*g_replayConstants)[tag].data(), offset, size);
+        } else {
+          l->setGraphicsPushConstants(range, bytes.data(), offset, size);
+        }
+      });
+      g_renderThread.Push(
+          [=](RenderCommandList* l) { l->setGraphicsPushConstants(range, bytes.data(), offset, size); });
+      return;
+    }
     Op([=](RenderCommandList* l) { l->setGraphicsPushConstants(range, bytes.data(), offset, size); });
   }
   void setGraphicsDescriptorSet(RenderDescriptorSet* set, uint32_t index) override {
@@ -1450,6 +1760,18 @@ class QueuedCommandList final : public RenderCommandList {
     });
   }
   void copyBufferRegion(RenderBufferReference dst, RenderBufferReference src, uint64_t size) override {
+    if (g_logOps && g_copyTag >= 0) {
+      int32_t tag = g_copyTag;
+      g_frameLogs[g_frame].Push([=](RenderCommandList* l) {
+        if (g_replayCopies && size_t(tag) < g_replayCopies->size() && (*g_replayCopies)[tag].ref) {
+          l->copyBufferRegion(dst, (*g_replayCopies)[tag], size);
+        } else {
+          l->copyBufferRegion(dst, src, size);
+        }
+      });
+      g_renderThread.Push([=](RenderCommandList* l) { l->copyBufferRegion(dst, src, size); });
+      return;
+    }
     Op([=](RenderCommandList* l) { l->copyBufferRegion(dst, src, size); });
   }
   void copyTextureRegion(const RenderTextureCopyLocation& dst, const RenderTextureCopyLocation& src,
@@ -1497,11 +1819,12 @@ class QueuedCommandList final : public RenderCommandList {
   void buildTopLevelAS(const RenderAccelerationStructure*, RenderBufferReference, RenderBufferReference,
                        const RenderTopLevelASBuildInfo&) override { Unused("buildTopLevelAS"); }
   void discardTexture(const RenderTexture*) override { Unused("discardTexture"); }
+  // (not kept for interpolation: a query written twice)
   void resetQueryPool(const RenderQueryPool* pool, uint32_t first, uint32_t count) override {
-    Op([=](RenderCommandList* l) { l->resetQueryPool(pool, first, count); });
+    g_renderThread.Push([=](RenderCommandList* l) { l->resetQueryPool(pool, first, count); });
   }
   void writeTimestamp(const RenderQueryPool* pool, uint32_t index) override {
-    Op([=](RenderCommandList* l) { l->writeTimestamp(pool, index); });
+    g_renderThread.Push([=](RenderCommandList* l) { l->writeTimestamp(pool, index); });
   }
 };
 QueuedCommandList g_queuedCommandList;
@@ -1567,10 +1890,285 @@ void WaitForFrame(uint32_t frame) {
   }
 }
 
+// NG2_INTERP: a frame's pictures are presented one at a time, a part of
+// the frame interval apart, by a thread of their own (presents queued
+// together may be shown as one, the newest, as Windows does), while the
+// render thread goes on with the next frame.
+// NG2_INTERP: long waits for a swapchain image, logged.
+void NoteAcquire(int64_t ns) {
+  static int64_t total = 0, longest = 0;
+  static uint32_t count = 0, slow = 0;
+  total += ns;
+  longest = std::max(longest, ns);
+  slow += ns > 4000000;
+  if (++count == 1800) {
+    REXLOG_INFO("video: interp: acquires {:.2f} ms each, max {:.1f}, {} over 4 ms; {} images",
+                double(total) / 1800e6, double(longest) / 1e6, slow, g_swapChain->getTextureCount());
+    total = longest = 0;
+    count = slow = 0;
+  }
+}
+
+// A picture's drawing's fence, waited for once after each submit (plume's
+// wait resets it): by the presenter before presenting the picture, or by the
+// render thread before the picture's list and fence are used again, three
+// frames on (in exclusive full screen the presenter doesn't wait, and a
+// fence submitted again while still signaled is invalid).
+struct PictureFence {
+  std::unique_ptr<RenderCommandFence> fence;
+  std::atomic<int> state{0};  // 0: nothing to wait for, 1: submitted, 2: being waited for
+  void Submitted() {
+    state = 1;
+  }
+  void Wait() {
+    int expected = 1;
+    if (state.compare_exchange_strong(expected, 2)) {
+      g_queue->waitForCommandFence(fence.get());
+      state = 0;
+      state.notify_all();
+      return;
+    }
+    while (expected == 2) {  // (the other thread's wait: until it's done)
+      state.wait(2);
+      expected = state.load();
+    }
+  }
+};
+
+// Each frame slot's pictures between: their acquire semaphores, lists and
+// fences (the render thread's; released in DestroyHostDevice, before the
+// device).
+std::unique_ptr<RenderCommandSemaphore> g_interpAcquire[NUM_FRAMES][kInterpMaxPictures - 1];
+std::unique_ptr<RenderCommandList> g_interpLists[NUM_FRAMES][kInterpMaxPictures - 1];
+PictureFence g_interpFences[NUM_FRAMES][kInterpMaxPictures - 1];
+
+class Presenter {
+ public:
+  struct Item {
+    uint32_t index;
+    RenderCommandSemaphore* semaphore;
+    int64_t atNs;
+    uint64_t frame;                     // the game's frame it shows
+    PictureFence* done = nullptr;        // its drawing's (a picture between)
+    int64_t inputNs = 0;                 // the frame's pad read (NG2_LATENCY_LOG)
+    uint8_t order = 0;                   // 1: the frame's first picture, 2: its own, 3: both
+    bool timed = false;                  // a slow screen's: by the clock always
+  };
+
+  ~Presenter() {
+    Stop();
+  }
+
+  // The thread stopped and joined (DestroyHostDevice, after WaitForGPU: nothing
+  // queued is left); a later Push starts it again.
+  void Stop() {
+    if (thread_.joinable()) {
+      {
+        std::lock_guard lock(mutex_);
+        stop_ = true;
+      }
+      cv_.notify_all();
+      idle_.notify_all();
+      thread_.join();
+      std::lock_guard lock(mutex_);
+      stop_ = false;
+      queue_.clear();
+      busy_ = 0;
+      busyTimed_ = false;
+      lastId_ = 0;
+    }
+  }
+
+  void Push(const Item& item) {
+    {
+      std::lock_guard lock(mutex_);
+      queue_.push_back(item);
+      if (!thread_.joinable()) {
+        thread_ = std::thread([this] { Main(); });
+      }
+    }
+    cv_.notify_all();
+  }
+
+  // The pictures waiting for their time (a slow screen's) presented at once,
+  // and waited for: before a frame's drawing that acquires images (in
+  // exclusive full screen an image is freed only by a later present, which
+  // queued behind that drawing's wait would never come: the GPU stood 12 s).
+  void Hurry() {
+    {
+      std::lock_guard lock(mutex_);
+      bool timed = busyTimed_;
+      for (auto& queued : queue_) {
+        timed |= queued.timed;
+      }
+      if (!timed) {
+        return;  // (none waits for its time)
+      }
+      for (auto& queued : queue_) {
+        queued.atNs = 0;
+      }
+      hurry_ = true;
+    }
+    WaitFor(0);
+    hurry_ = false;
+  }
+
+  // Pictures handed over and not yet presented.
+  size_t Pending() {
+    std::lock_guard lock(mutex_);
+    return queue_.size() + busy_;
+  }
+
+  // Until at most `left` pictures wait.
+  void WaitFor(size_t left) {
+    std::unique_lock lock(mutex_);
+    idle_.wait(lock, [&] { return queue_.size() + busy_ <= left || stop_; });
+  }
+
+  std::atomic<bool> failed{false};  // a present found the swapchain out of date
+  std::atomic<uint64_t> presented{0};
+  std::atomic<int64_t> presentNs{0}, presentMaxNs{0};
+
+ private:
+  void Main() {
+    while (true) {
+      Item item;
+      {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty() || stop_; });
+        if (stop_) {
+          return;
+        }
+        item = queue_.front();
+        queue_.pop_front();
+        busy_ = 1;
+        busyTimed_ = item.timed;
+        // Behind (a later frame waits): shown at once, to catch up (the
+        // screen keeps the newest of them). Not one with its time on the
+        // display's grid: the last frame's last picture still waits for its
+        // refresh when the next frame's come, and shown at once it came a
+        // refresh or two early, then a gap (a stutter in a turn).
+        if (!item.timed && !queue_.empty() && queue_.back().frame > item.frame) {
+          item.atNs = 0;
+        }
+      }
+      // Presented once drawn: a present ahead of its picture's drawing is
+      // shown when that ends, with the next one if it ends with it.
+      // (Not while the swapchain holds the display, exclusive full screen:
+      // there a drawing can wait for its image, freed by a later present, and
+      // the display flips one a refresh itself. Asked for and not held, or
+      // lost to an overlay, it's composed as in a window, and paced so.)
+      const bool exclusive = g_swapChain->isFullScreenExclusive();
+      if (item.done && !exclusive) {
+        item.done->Wait();
+      }
+      // Exclusive full screen: the display flips one picture a refresh from
+      // its queue itself, so each goes at once (a timer that let the queue
+      // run dry showed a picture two or three refreshes, a double to the
+      // eye in a turn).
+      if (exclusive && !item.timed) {
+        item.atNs = 0;
+      }
+#if defined(_WIN32)
+      // Sleeps of a millisecond (the system timer at 1 ms: timeBeginPeriod)
+      // to near the time, the rest spun. (Waiting for the display's vblank,
+      // D3DKMT or DwmFlush, stalled the game in full screen.)
+      static const bool period = [] {
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        using PeriodFn = UINT(WINAPI*)(UINT);
+        auto begin = winmm ? reinterpret_cast<PeriodFn>(GetProcAddress(winmm, "timeBeginPeriod")) : nullptr;
+        return begin && begin(1) == 0;
+      }();
+      (void)period;
+      while (!hurry_.load() && item.atNs - SteadyNs() > 2000000) {
+        Sleep(1);
+      }
+#endif
+      for (int64_t now = SteadyNs(); now < item.atNs && !hurry_.load(); now = SteadyNs()) {
+        if (item.atNs - now > 2000000) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+          std::this_thread::yield();
+        }
+      }
+      if (item.atNs && lastId_) {
+        int64_t until = SteadyNs() + 30000000;
+        while (g_swapChain->pollPresent(lastId_) == 0 && SteadyNs() < until) {
+#if defined(_WIN32)
+          Sleep(0);
+#else
+          std::this_thread::yield();
+#endif
+        }
+      }
+      int64_t presentStart = SteadyNs();
+      if (!g_swapChain->present(item.index, &item.semaphore, 1)) {
+        failed = true;
+      }
+      lastId_ = g_swapChain->getPresentId();
+      if (item.inputNs) {
+        if (item.order & 1) {
+          NotePadToPresent(SteadyNs() - item.inputNs, 0);
+          if (lastId_) {
+            std::lock_guard lock(g_taggedMutex);
+            g_tagged[lastId_ % 64] = {lastId_, item.inputNs, SteadyNs()};
+          }
+        }
+        if (item.order & 2) {
+          NotePadToPresent(SteadyNs() - item.inputNs, 1);
+        }
+      }
+      if (item.timed) {
+        static int64_t lastNs = 0, lateSum = 0, lateMax = 0, gapMin = INT64_MAX, gapMax = 0;
+        static uint32_t count = 0, gaps = 0, short4 = 0, long15 = 0;
+        int64_t late = presentStart - item.atNs;
+        lateSum += late, lateMax = std::max(lateMax, late);
+        if (lastNs && presentStart - lastNs < 100'000'000) {
+          int64_t gap = presentStart - lastNs;
+          gapMin = std::min(gapMin, gap), gapMax = std::max(gapMax, gap);
+          short4 += gap < 4'000'000, long15 += gap > 15'000'000;
+          gaps++;
+        }
+        lastNs = presentStart;
+        if (++count == 120) {
+          REXLOG_INFO("video: interp: slow screen presents: {:.2f} ms late on average (max {:.1f}); "
+                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}",
+                      double(lateSum) / 120e6, double(lateMax) / 1e6, double(gapMin) / 1e6, double(gapMax) / 1e6,
+                      short4, long15, gaps);
+          lateSum = lateMax = gapMax = 0, gapMin = INT64_MAX;
+          count = gaps = short4 = long15 = 0;
+        }
+      }
+      int64_t took = SteadyNs() - presentStart;
+      presentNs += took;
+      presentMaxNs = std::max<int64_t>(presentMaxNs, took);
+      presented++;
+      {
+        std::lock_guard lock(mutex_);
+        busy_ = 0;
+        busyTimed_ = false;
+      }
+      idle_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_, idle_;
+  std::deque<Item> queue_;
+  size_t busy_ = 0;
+  std::atomic<bool> hurry_{false};
+  bool busyTimed_ = false;  // the picture being presented is a timed one (mutex_)
+  bool stop_ = false;
+  uint64_t lastId_ = 0;  // the last present's (presenter thread)
+  std::thread thread_;
+};
+Presenter g_presenter;
+
 void WaitForGPU() {
   if (RenderThreadEnabled()) {
     g_renderThread.Flush();
   }
+  g_presenter.WaitFor(0);
   for (uint32_t i = 0; i < NUM_FRAMES; i++) {
     WaitForFrame(i);
   }
@@ -1682,23 +2280,82 @@ void BeginFrame() {
   }
 }
 
+void SwitchInterp();
+
+// The images a frame may hold at once (its pictures and its own) before any
+// is presented: an acquire is only sure to return while no more than the
+// count less the surface's minimum are held (gamescope: 3 of 8 the minimum).
+uint32_t SpareImages() {
+  uint32_t count = g_swapChain->getTextureCount();
+  uint32_t least = g_swapChain->getMinTextureCount();
+  return count >= least ? count - least + 1 : 0;
+}
+
+// The most pictures a frame, its own counted: what the swapchain's images
+// leave (after each resize, which may change their count).
+void SetInterpPictureCap() {
+  g_interpPictureCap = std::max(1u, std::min(kInterpMaxPictures, SpareImages()));
+}
+
+// Exclusive full screen (the swapchain takes the display, its presents
+// flipped by it instead of composed by DWM, which spoils the pictures'
+// pacing): only for frame interpolation, in Window Mode Fullscreen
+// (fullscreen and exclusive_fullscreen). NG2_EXCLUSIVE (0, 1, 2: left to the
+// driver) over it. Decided again between frames: the menu changes both.
+int ExclusiveMode() {
+#if defined(_WIN32)
+  static const char* forced = std::getenv("NG2_EXCLUSIVE");
+  if (forced && forced[0]) {
+    return std::clamp(std::atoi(forced), 0, 2);
+  }
+  return InterpEnabled() && rex::cvar::Query<bool>("fullscreen") &&
+                 rex::cvar::Query<bool>("exclusive_fullscreen")
+             ? 1
+             : 0;
+#else
+  return 0;
+#endif
+}
+int g_exclusiveMode = 0;  // the swapchain's (game thread)
+// The swapchain's mode set to ExclusiveMode's; true if it changed (made
+// again at the next resize).
+bool UpdateExclusiveMode() {
+  int mode = ExclusiveMode();
+  if (!g_swapChain || mode == g_exclusiveMode) {
+    return false;
+  }
+  REXLOG_INFO("video: exclusive full screen {}", mode ? "asked for" : "off");
+  g_exclusiveMode = mode;
+  g_swapChain->setFullScreenExclusive(mode);
+  return true;
+}
+
 RenderCommandList* CommandList() {
   if (!g_recording) {
+    SwitchInterp();
+    if (UpdateExclusiveMode()) {
+      g_resizeRequested = true;  // (Borderless from Fullscreen: no resize of its own)
+    }
     if (g_resizeRequested.load()) {
       WaitForGPU();  // (queued presents may raise it again: cleared after)
       g_resizeRequested.store(false);
       g_swapChainFramebuffers.clear();
       g_swapChainValid = g_swapChain->resize();
+      SetInterpPictureCap();
     }
     WaitForFrame(g_frame);
     ReadGpuTiming(g_frame);
     g_boundFramebuffer = nullptr;
     g_uploads[g_frame].Reset();
+    g_interpUploads[g_frame].Reset();
     for (auto& texture : g_garbage[g_frame]) {
       g_descriptors.Free(texture->descriptor);
       ForgetTexture(texture.get());
     }
     g_garbage[g_frame].clear();
+    // (its present, which ran the log again, has been submitted)
+    g_frameLogs[g_frame].Clear();
+    g_logOps = InterpEnabled();
     uint32_t frame = g_frame;
     if (RenderThreadEnabled()) {
       g_renderThread.Push([frame](RenderCommandList*) {
@@ -1716,6 +2373,7 @@ RenderCommandList* CommandList() {
 }
 
 void Transition(HostTexture& texture, RenderTextureLayout layout) {
+  NoteStartLayout(texture);
   // A copy or resolve into a texture that was the last one's destination too
   // still needs a barrier: without it the earlier write (often the previous
   // frame's, a resolve redone each frame) can land after this one, and the
@@ -2094,8 +2752,7 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
 
 // Uploads ----------------------------------------------------------------------
 
-Upload Allocate(uint64_t size, uint64_t alignment = 256) {
-  auto& allocator = g_uploads[g_frame];
+Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignment = 256) {
   allocator.offset = (allocator.offset + alignment - 1) & ~(alignment - 1);
   // Move on while the current chunk can't hold it (chunks can be bigger
   // than UPLOAD_CHUNK_SIZE for big uploads).
@@ -2117,14 +2774,19 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
     chunk.data = static_cast<uint8_t*>(chunk.buffer->map());
     chunk.address = chunk.buffer->getDeviceAddress();
     allocator.chunks.push_back(std::move(chunk));
-    REXLOG_INFO("video: upload chunk {} of frame slot {} ({} MB)", allocator.chunks.size(),
-                g_frame, allocator.chunks.back().size >> 20);
+    REXLOG_INFO("video: upload chunk {}{} ({} MB)", allocator.chunks.size(),
+                &allocator >= g_interpUploads && &allocator < g_interpUploads + NUM_FRAMES ? " (interpolation)" : "",
+                allocator.chunks.back().size >> 20);
   }
   auto& chunk = allocator.chunks[allocator.chunk];
   Upload upload{chunk.buffer.get(), allocator.offset, chunk.data + allocator.offset,
                 chunk.address + allocator.offset};
   allocator.offset += size;
   return upload;
+}
+
+Upload Allocate(uint64_t size, uint64_t alignment = 256) {
+  return AllocateFrom(g_uploads[g_frame], size, alignment);
 }
 
 // A copy into g_guestMemory. Recorded in the frame's command list it ends the
@@ -2224,7 +2886,9 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     if (range.lateFrame != g_frameCount) {
       range.lateFrame = g_frameCount;
       Upload upload = Allocate(size, 16);
+      g_copyTag = bones && InterpEnabled() ? NoteInterpPalette(address, size) : -1;
       RecordGuestMemoryCopy(address, upload, size, inOrder);
+      g_copyTag = -1;
       g_frameRanges.push_back({address, size, &range, upload.data});
     }
     return;
@@ -3124,10 +3788,12 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     // texels (XenosRecomp's getGuestTexture2DDimensions).
     if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
         it != g_resolvedTextures.end()) {
+      NoteCarriedRead(it->second.get());
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
       return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
     if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
+      NoteCarriedRead(it->second);
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
       return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
@@ -3901,6 +4567,7 @@ struct DrawRecord {
   uint32_t drawCount = 0;
   uint32_t startVertex = 0;
   uint64_t vertexShader = 0, pixelShader = 0;  // hashes, for NG2_PROFILE=2
+  int32_t interpIndex = -1;  // in g_interp.current (NG2_INTERP)
 };
 
 // BeginVertices / BeginIndexedVertices hand the game a pointer into the
@@ -3923,6 +4590,74 @@ struct PendingDraw {
 };
 std::optional<PendingDraw> g_pendingDraw;
 
+
+std::atomic<int64_t> g_modeRefreshNs{0};  // the display mode's refresh (SDL), 0 not known
+// The swapchain's images: 8 with interpolation, else 3.
+uint32_t SwapChainImages() {
+  if (!InterpEnabled()) {
+    return 3;
+  }
+  return 8u;
+}
+
+// What interpolation keeps on the GPU from frame to frame: the carried
+// render targets' copies, the pictures' upload memory, their lists (with the
+// GPU, the render thread and the presenter idle: switched off, or the device
+// going).
+void ReleaseInterpResources() {
+  g_carriedCopies.clear();
+  g_carriedRetired.clear();
+  for (auto& allocator : g_interpUploads) {
+    allocator.chunks.clear();
+    allocator.Reset();
+  }
+  for (auto& lists : g_interpLists) {
+    for (auto& list : lists) {
+      list.reset();
+    }
+  }
+  for (auto& semaphores : g_interpAcquire) {
+    for (auto& semaphore : semaphores) {
+      semaphore.reset();
+    }
+  }
+  for (auto& fences : g_interpFences) {
+    for (auto& fence : fences) {
+      fence.fence.reset();
+      fence.state = 0;
+    }
+  }
+}
+
+// Frame Interpolation switched in the menu: between frames, with the GPU and
+// the build idle; the swapchain made again with its images (8 with it, 3
+// without: FIFO's queue of 7 would be the latency of a frame that outruns
+// the display).
+void SwitchInterp() {
+  bool wanted = InterpWanted();
+  if (wanted == InterpEnabled()) {
+    return;
+  }
+  WaitInterpBuild();
+  WaitForGPU();
+  ResetInterp(wanted);
+  if (!wanted) {
+    ReleaseInterpResources();  // (memory given back: nothing of it is used off)
+  }
+  UpdateExclusiveMode();  // (with interpolation only: made again below)
+  if (g_frame >= FrameSlots()) {
+    g_frame = 0;
+  }
+  g_swapChain->setTextureCount(SwapChainImages());
+  // (with it, an acquire lets the presenter thread's presents through)
+  g_swapChain->setAcquireInShortWaits(wanted);
+  g_swapChainFramebuffers.clear();
+  g_swapChainValid = g_swapChain->resize();
+  SetInterpPictureCap();
+  REXLOG_INFO("video: frame interpolation {} ({} swapchain images)", wanted ? "on" : "off",
+              g_swapChain->getTextureCount());
+}
+
 void SubmitDraw(DrawRecord& record) {
   BindFramebuffer(record.targets, record.targetCount, record.depth);
   auto* commandList = CommandList();
@@ -3932,7 +4667,10 @@ void SubmitDraw(DrawRecord& record) {
   commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
   commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
   commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+  NoteInterpDraw(record.interpIndex, record.pushConstants);
+  g_drawTag = record.interpIndex;
   commandList->setGraphicsPushConstants(0, record.pushConstants, 0, sizeof(record.pushConstants));
+  g_drawTag = -1;
   // Plume gives a pipeline one viewport per color target.
   RenderViewport viewports[4];
   RenderRect scissors[4];
@@ -3950,12 +4688,14 @@ void SubmitDraw(DrawRecord& record) {
       WriteGpuMark(commandList, g_frame, mark);
     }
   }
+  g_drawMemExport = record.memExport;
   if (record.indexed) {
     commandList->setIndexBuffer(&*record.indexView);
     commandList->drawIndexedInstanced(record.drawCount, 1, 0, int32_t(record.startVertex), 0);
   } else {
     commandList->drawInstanced(record.drawCount, 1, record.startVertex, 0);
   }
+  g_drawMemExport = false;
   if (g_profile.perDraw) {
     // (what comes before the next draw, clears and copies, isn't the draw's)
     if (uint32_t mark = AllocGpuMark(GpuMark::kDrawEnd); mark != UINT32_MAX) {
@@ -4309,6 +5049,18 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   // Vertex data the shader reads (inline data is synced when it has been
   // written).
+  uint32_t interpBoneAddress = 0, interpBoneSize = 0;  // the bone palette (NG2_INTERP)
+  // Which mesh this is (NG2_INTERP): its vertex and index data and range, the
+  // same a frame on whatever the camera did (0: inline data, not known).
+  uint64_t interpMesh = 0;
+  if (!inlineData && InterpEnabled()) {
+    interpMesh = (uint64_t(startVertex) << 32 | count) * 0x9E3779B97F4A7C15ull ^ startIndex;
+    if (indexed) {
+      if (uint32_t indexBuffer = guest::Load32(device + 0x308C)) {
+        interpMesh = interpMesh * 0x100000001B3ull ^ guest::Load32(indexBuffer + 24);
+      }
+    }
+  }
   for (uint32_t i = 0; i < (inlineData ? 95u : 96u); i++) {
     if (!(fetchMask[i / 32] & (1u << (i % 32)))) {
       continue;
@@ -4320,8 +5072,15 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     }
     uint32_t address = word0 & 0xFFFFFFFC;
     uint32_t size = word1 & 0x3FFFFFC;  // size in dwords at bit 2: bytes
+    if (interpMesh && i != 94) {
+      interpMesh = (interpMesh ^ (uint64_t(i) << 32 | address)) * 0x100000001B3ull;
+    }
     if (size && size <= (16u << 20)) {
       SyncGuestMemory(address & 0x1FFFFFFF, size, false, i == 94);
+      if (i == 94) {
+        interpBoneAddress = address & 0x1FFFFFFF;
+        interpBoneSize = size;
+      }
     }
   }
 
@@ -4404,6 +5163,19 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   copyConstants(vsConstants.data, vsSource, vs->entry->floatConstantMask, 256);
   if (ps) {
     copyConstants(psConstants.data, psSource, ps->entry->floatConstantMask, 224);
+  }
+  int32_t interpIndex = -1;
+  if (InterpEnabled()) {
+    const HostTexture* shape = target ? target : depth;
+    uint64_t group = vs->entry->hash * 0x9E3779B97F4A7C15ull ^ (ps ? ps->entry->hash : 0) * 31 ^
+                     (uint64_t(shape->width) << 40) ^ (uint64_t(shape->height) << 16) ^
+                     uint64_t(shape->format) ^ (target ? 0 : 1ull << 63);
+    interpIndex = CaptureInterpDraw(group, vsSource, vs->entry->floatConstantMask, ps ? psSource : nullptr,
+                                    ps ? &ps->entry->floatConstantMask : nullptr);
+    InterpDraw& captured = InterpCaptured(interpIndex);
+    captured.boneAddress = interpBoneAddress;
+    captured.boneSize = interpBoneSize;
+    captured.mesh = interpMesh;
   }
 
   Upload sharedUpload = Allocate(sizeof(shared));
@@ -4710,6 +5482,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   record.vertexShader = vs->entry->hash;
   record.pixelShader = ps ? ps->entry->hash : 0;
   record.memExport = memExport;
+  record.interpIndex = interpIndex;
   g_frameMemExport |= memExport;
   std::copy(targets, targets + targetCount, record.targets);
   record.targetCount = targetCount;
@@ -5030,6 +5803,22 @@ void Present(HostTexture* frontBuffer) {
                                            : ng2::aspect::Aspect();
   uint32_t gamma = g_gammaTable ? g_gammaTable->descriptor : 0u;
   uint32_t frame = g_frame;
+  // The pictures between the last frame and this one (NG2_INTERP); not for a
+  // movie the presenter draws itself.
+  // Made on their own thread while the game goes on to its next frame (in a
+  // crowd it took up to 15 ms of the game's 16); the render thread waits for
+  // them before drawing them.
+  std::shared_future<std::shared_ptr<InterpFrames>> interpJob;
+  const bool interpWanted = source == frontBuffer && sourceDescriptor;
+  std::vector<CarriedTexture> carried;
+  PictureLayouts layouts;
+  if (InterpEnabled()) {
+    interpJob = StartInterpBuild(frame, g_frameCount, SteadyNs());
+    carried = TakeCarried();
+    layouts.Take();
+  }
+  g_logOps = false;
+  OpArena* frameLog = &g_frameLogs[frame];
   g_boundFramebuffer = nullptr;
   g_recording = false;
   (void)commandList;
@@ -5065,7 +5854,55 @@ void Present(HostTexture* frontBuffer) {
   uint32_t endMark = AllocGpuMark(GpuMark::kFrameEnd);  // (each written once: see the resize path)
   // The swapchain's part, with the frame's real command list.
   OnRenderThread([=](RenderCommandList* list) mutable {
+    // (render thread timing, NG2_INTERP: what a frame's pictures waited on)
+    static int64_t jobWaitNs = 0, jobWaitMaxNs = 0, replayNs = 0, replayMaxNs = 0, roomWaitNs = 0,
+                   roomWaitMaxNs = 0;
+    int64_t jobStart = SteadyNs();
+    // (NG2_PROFILE, once a second: this thread's time and the present's parts)
+    struct PresentParts {
+      int64_t whole = 0, build = 0, record = 0, room = 0, acquire = 0, submit = 0, logAt = 0;
+      uint32_t frames = 0;
+    };
+    static PresentParts parts;
+    struct PartsTimed {
+      int64_t start;
+      ~PartsTimed() {
+        int64_t end = SteadyNs();
+        parts.whole += end - start;
+        parts.frames++;
+        if (!parts.logAt) {
+          parts.logAt = end;
+        }
+        if (end - parts.logAt >= 1'000'000'000 && g_profile.enabled) {
+          double s = double(end - parts.logAt) / 1e9;
+          REXLOG_INFO("video: render commands thread: busy {:.0f} ms a second ({} frames); presents {:.0f} ms: "
+                      "waiting for the build {:.0f}, recording pictures {:.0f}, waiting for the presenter {:.0f}, "
+                      "acquiring images {:.0f}, submitting {:.0f}",
+                      double(g_renderBusyNs.exchange(0)) / 1e6 / s, parts.frames, double(parts.whole) / 1e6 / s,
+                      double(parts.build) / 1e6 / s, double(parts.record) / 1e6 / s, double(parts.room) / 1e6 / s,
+                      double(parts.acquire) / 1e6 / s, double(parts.submit) / 1e6 / s);
+          parts = PresentParts{};
+          parts.logAt = end;
+        }
+      }
+    } partsTimed{jobStart};
+    std::shared_ptr<InterpFrames> interp = interpJob.valid() ? interpJob.get() : nullptr;
+    parts.build += SteadyNs() - jobStart;
+    if (interpJob.valid()) {
+      int64_t took = SteadyNs() - jobStart;
+      jobWaitNs += took;
+      jobWaitMaxNs = std::max(jobWaitMaxNs, took);
+    }
+    if (!interpWanted) {
+      interp.reset();
+    }
     static int32_t loggedMode = -1;
+    // NG2_INTERP: the presenter shows a picture each refresh itself; mailbox
+    // presents don't block (a FIFO present in full screen may wait for the
+    // screen holding the queue, and the frame's submit with it).
+    if (InterpEnabled() && mode != 0) {
+      mode = 2;
+    }
     bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
     if (mode != loggedMode) {
       loggedMode = mode;
@@ -5089,16 +5926,16 @@ void Present(HostTexture* frontBuffer) {
       WaitForGPU();
       g_swapChainFramebuffers.clear();
       g_swapChainValid = g_swapChain->resize();
+      SetInterpPictureCap();
       list->begin();
     }
 
-    uint32_t index = 0;
     // (waits that keep timing out: a compositor that doesn't report the
     // screen, as a hidden window may; Low is left off
     // for 5 s then, and tried again)
     static int timeouts = 0;
     static auto pausedUntil = std::chrono::steady_clock::time_point{};
-    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() &&
+    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() && !interp &&
         std::chrono::steady_clock::now() >= pausedUntil) {
       // Low leaves a frame one refresh to be ready, and a scene whose frames
       // take about that long shows many of them twice for minutes (#36,
@@ -5152,16 +5989,10 @@ void Present(HostTexture* frontBuffer) {
         pausedUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       }
     }
-    if (g_swapChainValid) {
-      int64_t acquireStart = SteadyNs();
-      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &index);
-      g_blockedNs = SteadyNs() - acquireStart;  // (the present's wait is added below)
-    }
-    while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
-      g_renderSemaphores.push_back(g_device->createCommandSemaphore());
-    }
 
-    if (g_swapChainValid) {
+    // The frame's picture into a swapchain image: index and the semaphore
+    // its acquire signals.
+    auto blit = [&](RenderCommandList* l, uint32_t index) {
       g_swapChainFramebuffers.resize(g_swapChain->getTextureCount());
       RenderTexture* target = g_swapChain->getTexture(index);
       auto& framebuffer = g_swapChainFramebuffers[index];
@@ -5172,11 +6003,10 @@ void Present(HostTexture* frontBuffer) {
         desc.colorAttachmentsCount = 1;
         framebuffer = g_device->createFramebuffer(desc);
       }
-      WriteGpuMark(list, frame, presentMark);
-      list->barriers(RenderBarrierStage::GRAPHICS,
+      l->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
-      list->setFramebuffer(framebuffer.get());
-      list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      l->setFramebuffer(framebuffer.get());
+      l->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
       if (sourceDescriptor) {
         // Fit the guest picture into the window at the chosen aspect ratio
@@ -5191,42 +6021,315 @@ void Present(HostTexture* frontBuffer) {
                                 height);
         RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
         uint32_t constants[3] = {sourceDescriptor, SAMPLER_LINEAR_CLAMP, gamma};
-        list->setGraphicsPipelineLayout(g_pipelineLayout.get());
-        list->setPipeline(g_presentPipeline.get());
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
-        list->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
-        list->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
-        list->setViewports(&viewport, 1);
-        list->setScissors(&scissor, 1);
-        list->drawInstanced(3, 1, 0, 0);
+        l->setGraphicsPipelineLayout(g_pipelineLayout.get());
+        l->setPipeline(g_presentPipeline.get());
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+        l->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+        l->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+        l->setViewports(&viewport, 1);
+        l->setScissors(&scissor, 1);
+        l->drawInstanced(3, 1, 0, 0);
       }
-      list->barriers(RenderBarrierStage::GRAPHICS,
+      l->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+    };
+
+    // Images in the order they are shown: the pictures between, then the
+    // frame's (drawn first: its commands have run).
+    constexpr uint32_t kMaxPictures = kInterpMaxPictures;
+    // A slow screen's partial frame: the last picture again, not shown (the
+    // last full frame's pictures are still being shown by the clock).
+    // Too few images for a picture besides the frame's own: shown alone, as
+    // with interpolation off (an acquire would wait for an image that only a
+    // present behind it frees).
+    const uint32_t spare = SpareImages();
+    const bool starved = spare < 2;
+    if (interp && starved) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        REXLOG_WARN("video: interp: the swapchain has {} images ({} its least): no pictures between",
+                    g_swapChain->getTextureCount(), g_swapChain->getMinTextureCount());
+      }
+    }
+    const bool hide = !starved && interp && interp->partial && (interp->slow || interp->paced);
+    const bool ownHidden = hide || (!starved && interp && interp->paced && !interp->ownShown);
+    // The pictures waiting for their time hurried out only when an acquire
+    // could otherwise wait for an image that only their present frees: the
+    // images not yet presented and those taken this frame near all the
+    // swapchain's, less the display's own (hurried each frame, the last
+    // frame's last picture came early: a stutter in a turn). Only in
+    // exclusive full screen, where the display holds no more than that:
+    // elsewhere a compositor (gamescope, DWM) keeps images of its own, and
+    // an image taken whose release waited for a present behind its own
+    // drawing stood the GPU still (the Steam Deck: 40 s) - there each frame
+    // hurries the last one's out before its first acquire, as before.
+    const bool exclusive = g_swapChain->isFullScreenExclusive();
+    auto hurryIfShort = [&](uint32_t taken) {
+      if (hide || !InterpEnabled()) {
+        return;
+      }
+      if (exclusive ? g_presenter.Pending() + taken + 3 > g_swapChain->getTextureCount() : taken == 0) {
+        g_presenter.Hurry();
+      }
+    };
+    uint32_t indices[kMaxPictures] = {};
+    uint32_t pictures = 0;
+    uint32_t frameIndex = 0;
+    // Each picture between in a list and submit of its own, before the
+    // frame's (so its drawing's end is its own, and what the next frame finds
+    // is the frame's): the frame's commands again, its draws part of the way
+    // from the last frame's. Recorded first, one after another (plume keeps
+    // each texture's and buffer's layout and stages on the object itself:
+    // lists recorded at once raced on them, for wrong barriers), before
+    // waiting for the presenter to have room.
+    size_t recorded = 0;
+    if (g_swapChainValid && interp) {
+      // (with the frame's own image, no more than the swapchain spares)
+      recorded = std::min<size_t>({interp->phases.size(), kMaxPictures - 1, size_t(spare > 1 ? spare - 1 : 0)});
+      int64_t replayStart = SteadyNs();
+      auto record = [&](size_t k) {
+        layouts.BeforeRecord();
+        if (k == 0) {
+          SaveCarried(g_interpLists[frame][k].get(), carried);
+          layouts.BackToStart(g_interpLists[frame][k].get());  // (SaveCarried leaves them as the frame ends)
+        }
+        g_replayConstants = &interp->phases[k];
+        g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
+        frameLog->RunKeep(g_interpLists[frame][k].get());
+        g_replayConstants = nullptr;
+        g_replayCopies = nullptr;
+        if (k == 0) {
+          layouts.NoteEnd();
+        }
+      };
+      for (size_t k = 0; k < recorded; k++) {
+        if (!g_interpAcquire[frame][k]) {
+          g_interpAcquire[frame][k] = g_device->createCommandSemaphore();
+          g_interpLists[frame][k] = g_queue->createCommandList();
+          g_interpFences[frame][k].fence = g_device->createCommandFence();
+        }
+        g_interpFences[frame][k].Wait();  // (its last drawing done: the list is free)
+        g_interpLists[frame][k]->begin();
+      }
+      for (size_t k = 0; k < recorded; k++) {
+        record(k);
+      }
+      int64_t took = SteadyNs() - replayStart;
+      parts.record += took;
+      replayNs += took;
+      replayMaxNs = std::max(replayMaxNs, took);
+    }
+    // At most a frame's pictures waiting to be shown (the swapchain's images
+    // last; plume's acquire lets go of the swapchain between short waits).
+    if ((interp || InterpEnabled()) && !hide) {
+      int64_t roomStart = SteadyNs();
+      g_presenter.WaitFor(3);
+      int64_t took = SteadyNs() - roomStart;
+      parts.room += took;
+      roomWaitNs += took;
+      roomWaitMaxNs = std::max(roomWaitMaxNs, took);
+      if (g_presenter.failed.exchange(false)) {
+        g_swapChainValid = false;
+      }
+    }
+    // The game's frame interval, from these presents (the pictures between are spread over it).
+    static int64_t lastPresentNs = 0;
+    static double intervalNs = 1e9 / 60.0;
+    int64_t presentNs = SteadyNs();
+    if (lastPresentNs) {
+      double gap = double(presentNs - lastPresentNs);
+      if (gap > 5e6 && gap < 70e6) {
+        intervalNs += (gap - intervalNs) * 0.1;
+      }
+    }
+    lastPresentNs = presentNs;
+    auto growSemaphores = [] {
+      while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
+        g_renderSemaphores.push_back(g_device->createCommandSemaphore());
+      }
+    };
+    RenderCommandSemaphore* signalSemaphores[kMaxPictures] = {};
+    PictureFence* doneFences[kMaxPictures] = {};
+    if (g_swapChainValid && interp) {
+      if (prologue && PrologueMode() == 2) {
+        // (the frame's submit runs it too: copies of the same memory)
+        const RenderCommandList* lists[] = {g_prologueLists[frame].get()};
+        g_queue->executeCommandLists(lists, 1);
+      }
+      size_t k = 0;
+      for (; k < recorded; k++) {
+        auto& semaphore = g_interpAcquire[frame][k];
+        auto& interpList = g_interpLists[frame][k];
+        auto& fence = g_interpFences[frame][k];
+        uint32_t index = 0;
+        int64_t acquireStart = SteadyNs();
+        hurryIfShort(pictures);
+        if (!g_swapChain->acquireTexture(semaphore.get(), &index)) {
+          break;
+        }
+        NoteAcquire(SteadyNs() - acquireStart);
+        parts.acquire += SteadyNs() - acquireStart;
+        growSemaphores();
+        layouts.AtEnd();  // (the lists recorded since moved plume's idea of them on)
+        blit(interpList.get(), index);
+        RestoreCarried(interpList.get(), carried);  // (the next picture, or the frame, starts from them)
+        layouts.BackToStart(interpList.get());
+        interpList->end();
+        RenderCommandSemaphore* wait = semaphore.get();
+        RenderCommandSemaphore* signal = g_renderSemaphores[index].get();
+        const RenderCommandList* lists[] = {interpList.get()};
+        g_queue->executeCommandLists(lists, 1, &wait, 1, &signal, 1, fence.fence.get());
+        fence.Submitted();
+        indices[pictures] = index;
+        signalSemaphores[pictures] = signal;
+        doneFences[pictures] = &fence;
+        pictures++;
+      }
+      for (; k < recorded; k++) {
+        g_interpLists[frame][k]->end();  // (recorded, not shown: no image)
+      }
+      layouts.AtEnd();
+    } else if (recorded) {
+      for (size_t k = 0; k < recorded; k++) {
+        g_interpLists[frame][k]->end();
+      }
+    }
+    if (g_swapChainValid && !ownHidden) {
+      hurryIfShort(pictures);
+      int64_t acquireStart = SteadyNs();
+      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
+      if (InterpEnabled()) {
+        NoteAcquire(SteadyNs() - acquireStart);
+      }
+      g_blockedNs = SteadyNs() - acquireStart;  // (the present's wait is added below)
+      parts.acquire += SteadyNs() - acquireStart;
+    }
+    growSemaphores();
+    if (g_swapChainValid) {
+      WriteGpuMark(list, frame, presentMark);
+      if (!ownHidden) {
+        blit(list, frameIndex);
+      }
     }
     WriteGpuMark(list, frame, endMark);
 
     list->end();
-    if (g_swapChainValid) {
-      RenderCommandSemaphore* waitSemaphores[] = {g_acquireSemaphores[frame].get()};
-      RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
-      submit(list, waitSemaphores, 1, signalSemaphores, 1);
-      FrameSubmitted();
-      EvenOutPresent();
-      int64_t presentStart = SteadyNs();
-      g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
-      // A full FIFO queue blocks the acquire (AMD, Mesa) or the present
-      // (NVIDIA): either counts.
-      if (g_blockedNs + SteadyNs() - presentStart >= 1'500'000) {
-        g_acquireFreeRun.store(0, std::memory_order_relaxed);
-      } else if (g_acquireFreeRun.load(std::memory_order_relaxed) < 1000) {
-        g_acquireFreeRun.fetch_add(1, std::memory_order_relaxed);
+    if (g_swapChainValid && !hide && (!ownHidden || pictures)) {
+      static int64_t submitNs = 0, submitMaxNs = 0;
+      if (!ownHidden) {
+        RenderCommandSemaphore* waits[] = {g_acquireSemaphores[frame].get()};
+        RenderCommandSemaphore* signals[] = {g_renderSemaphores[frameIndex].get()};
+        int64_t submitStart = SteadyNs();
+        submit(list, waits, 1, signals, 1);
+        int64_t took = SteadyNs() - submitStart;
+        parts.submit += took;
+        submitNs += took;
+        submitMaxNs = std::max(submitMaxNs, took);
+        indices[pictures] = frameIndex;
+        signalSemaphores[pictures] = signals[0];
+        pictures++;
+      } else {
+        submit(list, nullptr, 0, nullptr, 0);  // (its pictures between only)
       }
-      // (timed at the present itself, on the thread that makes it)
-      ReportPresentGaps(std::chrono::steady_clock::now());
+      FrameSubmitted();
+      static uint64_t presents = 0;
+      if (InterpEnabled() && interp && interp->paced && !starved) {
+        // Each at its time on the display's grid.
+        int64_t readyNs = SteadyNs();
+        int64_t lag = readyNs - interp->presentNs;
+        int64_t kept = g_interpReadyLagNs.load();
+        g_interpReadyLagNs = lag > kept ? lag : kept - (kept - lag) / 64;  // (the slowest, let go slowly)
+        static uint64_t late = 0, shownPaced = 0;
+        for (uint32_t i = 0; i < pictures; i++) {
+          int64_t at = i < interp->times.size() ? interp->times[i] : readyNs;
+          late += at < readyNs;
+          shownPaced++;
+          g_presenter.Push({indices[i], signalSemaphores[i], at, presents, doneFences[i], inputNs,
+                            uint8_t((i == 0 ? 1 : 0) | (i + 1 == pictures ? 2 : 0)), true});
+        }
+        if (shownPaced >= 6000) {
+          REXLOG_INFO("video: interp: paced by the display ({:.2f} Hz, a picture each {} refresh): {} of {} "
+                      "pictures ready after their time; made {:.1f} ms after the present at most lately",
+                      1e9 / double(std::max<int64_t>(InterpRefreshNs(), 1)), InterpDivider(), late, shownPaced,
+                      double(g_interpReadyLagNs.load()) / 1e6);
+          late = shownPaced = 0;
+        }
+      } else if (InterpEnabled() && interp && !starved) {
+        // One at a time, a part of the frame interval apart (Presenter); a
+        // slow screen's evenly over the time since its last full frame, the
+        // first at once.
+        int64_t firstNs = SteadyNs();
+        const bool timed = interp && interp->slow && !interp->partial && pictures > 1;
+        // A slow screen's: one after another a spacing apart, on from the
+        // last frame's (the game's frames come unevenly, 26 then 41 ms), the
+        // first no sooner than now.
+        static int64_t slowNext = 0;
+        int64_t spacing = 0;
+        if (timed) {
+          spacing = interp->spacingNs ? interp->spacingNs : interp->spanNs / pictures;
+          if (slowNext > firstNs + 4 * interp->spanNs || slowNext + 4 * interp->spanNs < firstNs) {
+            slowNext = firstNs;  // (a new screen, or far off)
+          }
+          while (slowNext < firstNs) {
+            slowNext += spacing;
+          }
+        }
+        for (uint32_t i = 0; i < pictures; i++) {
+          int64_t at = timed ? slowNext : firstNs + int64_t(intervalNs * (i + 1) / pictures);
+          if (timed) {
+            slowNext += spacing;
+          }
+          g_presenter.Push({indices[i], signalSemaphores[i], at, presents, doneFences[i], inputNs,
+                            uint8_t((i == 0 ? 1 : 0) | (i + 1 == pictures ? 2 : 0)), timed});
+        }
+      } else {
+        // (no pictures: autopause, a cut. Shown at once as with interpolation
+        // off, after any still waiting: through the presenter it came a whole
+        // frame later, and where the GPU took 10 ms a frame the game ran at 51)
+        if (InterpEnabled()) {
+          g_presenter.WaitFor(0);
+        }
+        EvenOutPresent();
+        int64_t presentStart = SteadyNs();
+        g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
+        // A full FIFO queue blocks the acquire (AMD, Mesa) or the present
+        // (NVIDIA): either counts.
+        if (g_blockedNs + SteadyNs() - presentStart >= 1'500'000) {
+          g_acquireFreeRun.store(0, std::memory_order_relaxed);
+        } else if (g_acquireFreeRun.load(std::memory_order_relaxed) < 1000) {
+          g_acquireFreeRun.fetch_add(1, std::memory_order_relaxed);
+        }
+        // (timed at the present itself, on the thread that makes it)
+        ReportPresentGaps(std::chrono::steady_clock::now());
+        if (inputNs) {
+          NotePadToPresent(SteadyNs() - inputNs, 0);
+          NotePadToPresent(SteadyNs() - inputNs, 1);
+        }
+      }
+      if (++presents == 600 && !InterpEnabled()) {
+        presents = 0;  // (the stats below are interpolation's)
+      }
+      if (presents == 600) {
+        uint64_t shown = g_presenter.presented.exchange(0);  // (once: the order arguments are read in isn't set)
+        REXLOG_INFO("video: interp: {} pictures shown for 600 frames; present {:.2f} ms each (max "
+                    "{:.1f}), the frame's submit {:.2f} ms (max {:.1f})",
+                    shown,
+                    double(g_presenter.presentNs.exchange(0)) / 1e6 / double(std::max<uint64_t>(shown, 1)),
+                    double(g_presenter.presentMaxNs.exchange(0)) / 1e6, double(submitNs) / 600e6,
+                    double(submitMaxNs) / 1e6);
+        submitNs = submitMaxNs = 0;
+        presents = 0;
+        REXLOG_INFO("video: interp: render thread ms a frame: waiting for the build {:.2f} (max {:.1f}), "
+                    "recording the pictures {:.2f} (max {:.1f}), waiting for the presenter {:.2f} (max {:.1f})",
+                    double(jobWaitNs) / 600e6, double(jobWaitMaxNs) / 1e6, double(replayNs) / 600e6,
+                    double(replayMaxNs) / 1e6, double(roomWaitNs) / 600e6, double(roomWaitMaxNs) / 1e6);
+        jobWaitNs = jobWaitMaxNs = replayNs = replayMaxNs = roomWaitNs = roomWaitMaxNs = 0;
+      }
       ReportLatency();
-      if (inputNs) {
+      if (inputNs && !InterpEnabled()) {
         if (uint64_t id = g_swapChain->getPresentId()) {
           std::lock_guard lock(g_taggedMutex);
           g_tagged[id % 64] = {id, inputNs, SteadyNs()};
@@ -5237,13 +6340,12 @@ void Present(HostTexture* frontBuffer) {
       FrameSubmitted();
     }
   });
-
   g_commandListPending[frame] = true;
   g_submitTicket[frame] = ++g_framesQueued;
   if (RenderThreadEnabled()) {
     g_renderThread.Send();
   }
-  g_frame = (g_frame + 1) % NUM_FRAMES;
+  g_frame = (g_frame + 1) % FrameSlots();
   g_frameCount++;
 }
 
@@ -5257,6 +6359,16 @@ bool GetRenderWindow(RenderWindow& renderWindow) {
   if (!window) {
     REXLOG_ERROR("video: no SDL window");
     return false;
+  }
+  if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
+    if (mode->refresh_rate > 20.0f) {
+      g_modeRefreshNs = int64_t(1e9 / double(mode->refresh_rate));
+      REXLOG_INFO("video: display mode {:.2f} Hz", mode->refresh_rate);
+    }
+  }
+  // NG2_INTERP_REFRESH=<Hz>: interpolation paced as for that display (tests).
+  if (const char* v = std::getenv("NG2_INTERP_REFRESH"); v && std::atof(v) > 20.0) {
+    g_modeRefreshNs = int64_t(1e9 / std::atof(v));
   }
 #if defined(__linux__)
   SDL_PropertiesID props = SDL_GetWindowProperties(window);
@@ -5468,8 +6580,9 @@ void NoteInputToScreen(int64_t inputNs, int64_t presentNs, int64_t shownNs) {
   }
   if (shownNs - logAt > 10'000'000'000 && count) {
     REXLOG_INFO("latency pad to present {:.1f} ms, pad to screen {:.1f} ms (best {:.1f}, worst "
-                "{:.1f}; {} frames)",
-                toPresent / double(count), toScreen / double(count), best, worst, count);
+                "{:.1f}; {} frames; present to screen {:.1f})",
+                toPresent / double(count), toScreen / double(count), best, worst, count,
+                (toScreen - toPresent) / double(count));
     toPresent = toScreen = worst = 0, best = 1e9, count = 0, logAt = shownNs;
   }
 }
@@ -5621,6 +6734,29 @@ void ReportWindowsVblank(int64_t vblankNs, int64_t periodNs, bool steady) {
   g_displaySteady.store(steady && periodNs > 0);
 }
 
+// The display's refresh: measured (VK_KHR_present_wait) when steady, else
+// the display mode's; 0 not known.
+int64_t InterpRefreshNs() {
+  int64_t last = 0, period = 0;
+  if (DisplayRefresh(&last, &period)) {
+    return period;
+  }
+  return g_modeRefreshNs.load();
+}
+
+int64_t ModeRefreshNs() {
+  return g_modeRefreshNs.load();
+}
+
+InterpUpload AllocateInterpUpload(uint32_t slot, uint64_t size, uint64_t alignment) {
+  Upload upload = AllocateFrom(g_interpUploads[slot], size, alignment);
+  return {upload.buffer, upload.offset, upload.data, upload.address};
+}
+
+bool UsesRenderThread() {
+  return RenderThreadEnabled();
+}
+
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs) {
   int64_t last = g_displayRefreshNs.load(), period = g_displayPeriodNs.load();
   if (!g_displaySteady.load() || !last || !period || SteadyNs() - last > 250'000'000) {
@@ -5746,7 +6882,12 @@ bool CreateHostDevice() {
     g_acquireSemaphores[i] = g_device->createCommandSemaphore();
   }
 
-  g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
+  g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
+  g_swapChain->setAcquireInShortWaits(InterpEnabled());  // (see SwitchInterp)
+  if (UpdateExclusiveMode()) {
+    g_swapChain->resize();  // (made again with it)
+  }
+  SetInterpPictureCap();
   g_presentDrainCheck.store(g_swapChain != nullptr);
   // NG2_TEST_DXGI_CLOCK=1 (Windows): the DXGI display clock even with present_wait.
   static const bool forceDxgi = [] {
@@ -6186,6 +7327,7 @@ void DestroyHostDevice() {
       g_renderThread.Stop();
     }
   }
+  g_presenter.Stop();  // (its presents use the swapchain and queue)
   StopPipelineWorkers();
   g_pipelines.clear();
   g_guestShaders.clear();
@@ -6201,6 +7343,7 @@ void DestroyHostDevice() {
   for (auto& allocator : g_uploads) {
     allocator.chunks.clear();
   }
+  ReleaseInterpResources();
   g_guestMemory.reset();
   g_frameRanges.clear();
   std::free(g_guestMemoryShadow);
@@ -6400,6 +7543,7 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
     uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
     HostTexture* dest = GetResolveDestination(address, fetch, target->scale);
     if (dest) {
+      NoteCarriedWrite(dest);
       int32_t x1 = 0, y1 = 0, x2 = int32_t(target->width), y2 = int32_t(target->height);
       if (sourceRect) {
         x1 = guest::LoadS32(sourceRect);

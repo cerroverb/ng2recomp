@@ -1,0 +1,70 @@
+From f459451d48b0b56b11e3110599982b4849e0cc8c Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Tue, 10 Nov 2026 18:21:12 +0000
+Subject: [PATCH 21/21] Swapchain: full screen exclusive mode read by present
+ atomically, the display let go by the old swapchain
+
+setFullScreenExclusive is called by the game thread while another thread
+presents (which reads the mode to retry taking the display): the mode is
+atomic. resize let the old swapchain hold the display while the new one
+took it in mode 1: it lets go of it first in every mode. createInfo.pNext
+pointed at resize's locals after it returned: reset after the create.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plume_vulkan.cpp | 10 +++++++---
+ plume_vulkan.h   |  2 +-
+ 2 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 424436f..dde7aeb 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -2421,7 +2421,7 @@ namespace plume {
+         }
+         
+ #   if defined(_WIN64)
+-        if (g_fullScreenExclusive && (exclusiveMode == 1) && !exclusiveHeld && (++exclusiveRetry % 180 == 0)) {
++        if (g_fullScreenExclusive && (exclusiveMode.load() == 1) && !exclusiveHeld && (++exclusiveRetry % 180 == 0)) {
+             const std::scoped_lock lock(vkMutex);
+             VkResult got = vkAcquireFullScreenExclusiveModeEXT(commandQueue->device->vk, vk);
+             exclusiveHeld = got == VK_SUCCESS;
+@@ -2529,9 +2529,12 @@ namespace plume {
+ #   if defined(_WIN64)
+         VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo = {};
+         VkSurfaceFullScreenExclusiveWin32InfoEXT exclusiveWin32 = {};
+-        const int exclusive = g_fullScreenExclusive ? exclusiveMode : 0;
+-        if (exclusiveHeld.load() && (exclusive != 1) && (vk != VK_NULL_HANDLE)) {
++        const int exclusive = g_fullScreenExclusive ? exclusiveMode.load() : 0;
++        // The display let go by the old swapchain before the new one takes it
++        // (or isn't to have it).
++        if (exclusiveHeld.load() && (vk != VK_NULL_HANDLE)) {
+             vkReleaseFullScreenExclusiveModeEXT(commandQueue->device->vk, vk);
++            exclusiveHeld = false;
+         }
+         if (exclusive) {
+             exclusiveWin32.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+@@ -2546,6 +2549,7 @@ namespace plume {
+ 
+         VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
+ #   if defined(_WIN64)
++        createInfo.pNext = nullptr;  // (exclusiveInfo is gone after this call)
+         exclusiveHeld = false;
+         exclusiveRetry = 0;
+         if ((exclusive == 1) && (res == VK_SUCCESS)) {
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index a82b852..9c4147f 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -226,7 +226,7 @@ namespace plume {
+ 
+     struct VulkanSwapChain : RenderSwapChain {
+         VkSwapchainKHR vk = VK_NULL_HANDLE;
+-        int exclusiveMode = 0;  // (VK_EXT_full_screen_exclusive: setFullScreenExclusive)
++        std::atomic<int> exclusiveMode{0};  // (VK_EXT_full_screen_exclusive: setFullScreenExclusive; read by present)
+         std::atomic<bool> exclusiveHeld{false};
+         uint32_t exclusiveRetry = 0;
+         std::atomic<bool> acquireShortWaits{false};  // (setAcquireInShortWaits)
+-- 
+2.56.0
+
