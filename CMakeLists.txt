@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 VERSION 0.5.63 LANGUAGES CXX)
+project(ng2 VERSION 0.5.64 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,7 @@ endif()
 set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
+    src/gpu/interp.cpp
     src/gpu/native_gpu.cpp
     src/gpu/win_display.cpp
     src/gpu/menu_label.cpp

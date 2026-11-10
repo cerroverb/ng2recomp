@@ -381,8 +381,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     bool skipNext = false;
     while (running_) {
       int64_t refreshNs = 0, periodNs = 0;
-      // (FIFO and Mailbox only: there the presents reach the screen on its
-      // refreshes; with V-Sync Off or Adaptive a late one shows at once)
+      // (FIFO, Mailbox and Adaptive: there the presents reach the screen on
+      // its refreshes, Adaptive's when on time, as they are once locked; with
+      // V-Sync Off they show at once. Adaptive left out, its vblanks ran on the
+      // timer and drifted against the screen: choppy until a V-Sync toggle
+      // happened to line them up again, #36)
       // NG2_TEST_GAMESCOPE_AUTO=1 (#46): Auto under gamescope too, where it
       // otherwise acts as Timer.
       static const bool gamescopeAuto = [] {
@@ -396,7 +399,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       int32_t presentMode = REXCVAR_GET(present_mode);
       if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 &&
           (!ng2::video::UnderGamescope() || gamescopeAuto) &&
-          (presentMode == 1 || presentMode == 2) &&
+          (presentMode == 1 || presentMode == 2 || presentMode == 3) &&
           ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
         int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);
         int64_t step = periodNs * every;
@@ -480,7 +483,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       // limiter): none for 30 s, doubling each time that happens again, up
       // to 10 min. A skip with no request for 3 s after it starts that over.
       bool drain = ng2::video::DrainRequested();  // (always taken: none left over)
-      if (drain && REXCVAR_GET(vsync) && (presentMode == 1 || presentMode == 2)) {
+      if (drain && REXCVAR_GET(vsync) && (presentMode == 1 || presentMode == 2 || presentMode == 3)) {
         int64_t t = ng2::video::DisplayClockNow();
         bool quick = lastDrainNs && t - lastDrainNs < 3'000'000'000;
         if (lastDrainNs && !quick) {

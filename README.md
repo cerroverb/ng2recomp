@@ -250,6 +250,17 @@ for each button; a key in two lists presses both, as the game's two-button moves
 - Overlays and frame limiters that hook the game's presents (MSI Afterburner with RivaTuner, and the
   like) can upset frame pacing: if the game looks choppy at a steady 60 fps, close them completely
   (not only minimized) and try again.
+- Frame Interpolation (experimental):
+  - Render targets the game keeps from frame to frame without clearing them, and what shaders write
+    to memory (memexport), show the previous frame's state in the pictures made between frames.
+  - Cherry petals in the opening scene: a second clump appears next to the real one in the pictures
+    between.
+  - Ryu's shadow sometimes blinks.
+  - Moments the game only shows at 60 or less (cuts, partial frames, the death screen) feel worse
+    next to the smoother pictures around them than they would at a steady 60.
+  - Overlays drawn over the game in exclusive full screen (the AMD overlay, Windows notifications)
+    cause some judder while they're up.
+  - Windowed and Borderless have been tested much less than Window Mode Fullscreen.
 - Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
   from other systems, and from real Windows PCs especially, are welcome.
 

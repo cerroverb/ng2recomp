@@ -93,6 +93,7 @@ constexpr uint32_t kPlaceholderDraw = 0x83705CE8;
 
 std::unordered_map<uint32_t, int> g_itemBucket;  // render pass thread
 int g_drawBucket = -1;
+bool g_in2DPass = false;  // render thread: in the 2D pass (HUD, menus)
 uint32_t g_drawItem = 0;
 
 // Where a HUD item stays when the screen is wider (or taller): -1 at the
@@ -331,6 +332,10 @@ uint64_t Pair(float high, float low) {
 
 namespace ng2::aspect {
 
+bool In2DPass() {
+  return g_in2DPass;
+}
+
 namespace {
 bool g_constantWritable = false;
 }  // namespace
@@ -472,7 +477,9 @@ REX_HOOK_RAW(sub_83660FC8) {
 REX_EXTERN(__imp__sub_8368E2E8);
 REX_HOOK_RAW(sub_8368E2E8) {
   ScanBuckets();
+  g_in2DPass = true;
   __imp__sub_8368E2E8(ctx, base);
+  g_in2DPass = false;
   g_drawBucket = -1;
   LogBoxes();
 }
