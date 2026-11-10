@@ -4583,6 +4583,9 @@ void SwitchInterp() {
   WaitInterpBuild();
   WaitForGPU();
   ResetInterp(wanted);
+  if (!wanted) {
+    ReleaseInterpResources();  // (memory given back: nothing of it is used off)
+  }
   UpdateExclusiveMode();  // (with interpolation only: made again below)
   if (g_frame >= FrameSlots()) {
     g_frame = 0;
