@@ -4591,6 +4591,8 @@ void SwitchInterp() {
     g_frame = 0;
   }
   g_swapChain->setTextureCount(SwapChainImages());
+  // (with it, an acquire lets the presenter thread's presents through)
+  g_swapChain->setAcquireInShortWaits(wanted);
   g_swapChainFramebuffers.clear();
   g_swapChainValid = g_swapChain->resize();
   g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
@@ -6742,6 +6744,7 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
+  g_swapChain->setAcquireInShortWaits(InterpEnabled());  // (see SwitchInterp)
   if (UpdateExclusiveMode()) {
     g_swapChain->resize();  // (made again with it)
   }

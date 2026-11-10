@@ -1,7 +1,7 @@
-From 17875c956dae27ec82bb94eb3bfc37cd498985ca Mon Sep 17 00:00:00 2001
+From f7d0d67f281c6bac02af2610876129c437ce4db1 Mon Sep 17 00:00:00 2001
 From: Huntez <osigor5464@gmail.com>
 Date: Sun, 8 Nov 2026 20:43:24 +0100
-Subject: [PATCH] Swapchain: full screen exclusive set by the caller
+Subject: [PATCH 20/21] Swapchain: full screen exclusive set by the caller
  (setFullScreenExclusive), whether it is held (isFullScreenExclusive)
 
 NG2_EXCLUSIVE is no longer read here: the caller decides, and the mode is
@@ -17,7 +17,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 29 insertions(+), 11 deletions(-)
 
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index deac583..557cd94 100644
+index 8219457..b826fcc 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
 @@ -118,6 +118,11 @@ namespace plume {
@@ -30,10 +30,10 @@ index deac583..557cd94 100644
 +        // Whether the swapchain holds the display now (taken, and not lost since).
 +        virtual bool isFullScreenExclusive() const { return false; }
          virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
-         virtual RenderWindow getWindow() const = 0;
-         virtual bool isEmpty() const = 0;
+         // Acquires in short waits, the swapchain's lock let go between them (for a
+         // caller that presents from another thread); off: one wait, as before.
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index ce2c416..d28b8eb 100644
+index a423b5d..424436f 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -103,15 +103,10 @@ namespace plume {
@@ -54,7 +54,7 @@ index ce2c416..d28b8eb 100644
  
      static uint32_t roundUp(uint32_t value, uint32_t powerOf2Alignment) {
          return (value + powerOf2Alignment - 1) & ~(powerOf2Alignment - 1);
-@@ -2424,11 +2419,11 @@ namespace plume {
+@@ -2426,11 +2421,11 @@ namespace plume {
          }
          
  #   if defined(_WIN64)
@@ -68,7 +68,7 @@ index ce2c416..d28b8eb 100644
                  fprintf(stderr, "plume: full screen exclusive: yes, on a later try\n");
              } else if (exclusiveRetry % 1800 == 0) {
                  fprintf(stderr, "plume: full screen exclusive: still no (0x%X)\n", got);
-@@ -2532,7 +2527,10 @@ namespace plume {
+@@ -2534,7 +2529,10 @@ namespace plume {
  #   if defined(_WIN64)
          VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo = {};
          VkSurfaceFullScreenExclusiveWin32InfoEXT exclusiveWin32 = {};
@@ -80,7 +80,7 @@ index ce2c416..d28b8eb 100644
          if (exclusive) {
              exclusiveWin32.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
              exclusiveWin32.hmonitor = MonitorFromWindow(HWND(renderWindow), MONITOR_DEFAULTTONEAREST);
-@@ -2653,6 +2651,18 @@ namespace plume {
+@@ -2655,6 +2653,18 @@ namespace plume {
          return createdPresentMode == VK_PRESENT_MODE_FIFO_KHR;
      }
  
@@ -100,7 +100,7 @@ index ce2c416..d28b8eb 100644
          return width;
      }
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 6049e48..7aeb579 100644
+index ba6b5ba..a82b852 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -226,7 +226,8 @@ namespace plume {
@@ -111,9 +111,9 @@ index 6049e48..7aeb579 100644
 +        int exclusiveMode = 0;  // (VK_EXT_full_screen_exclusive: setFullScreenExclusive)
 +        std::atomic<bool> exclusiveHeld{false};
          uint32_t exclusiveRetry = 0;
+         std::atomic<bool> acquireShortWaits{false};  // (setAcquireInShortWaits)
          VulkanCommandQueue *commandQueue = nullptr;
-         VkSurfaceKHR surface = VK_NULL_HANDLE;
-@@ -263,6 +264,8 @@ namespace plume {
+@@ -264,6 +265,8 @@ namespace plume {
          bool needsResize() const override;
          void setVsyncEnabled(bool vsyncEnabled) override;
          bool isVsyncEnabled() const override;
@@ -123,5 +123,5 @@ index 6049e48..7aeb579 100644
          uint32_t getWidth() const override;
          uint32_t getHeight() const override;
 -- 
-2.54.0
+2.56.0
 

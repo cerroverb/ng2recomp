@@ -1,7 +1,7 @@
-From a13e3cc308516f90b36801c5a5a5440d72f3afe1 Mon Sep 17 00:00:00 2001
+From d013b1180b595956b8bf8236fdf61603cc0b42be Mon Sep 17 00:00:00 2001
 From: Huntez <osigor5464@gmail.com>
 Date: Sat, 7 Nov 2026 19:54:55 +0100
-Subject: [PATCH 18/18] Swapchain: setTextureCount, the images asked for from
+Subject: [PATCH 19/21] Swapchain: setTextureCount, the images asked for from
  the next resize
 
 Lets the app change how many images the swapchain has (frame interpolation
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 7 insertions(+)
 
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index c1e3754..deac583 100644
+index f55fd79..8219457 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
 @@ -116,6 +116,8 @@ namespace plume {
@@ -25,13 +25,13 @@ index c1e3754..deac583 100644
 +        // Images asked for from the next resize (the surface's limits still apply).
 +        virtual void setTextureCount(uint32_t count) { (void)count; }
          virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
-         virtual RenderWindow getWindow() const = 0;
-         virtual bool isEmpty() const = 0;
+         // Acquires in short waits, the swapchain's lock let go between them (for a
+         // caller that presents from another thread); off: one wait, as before.
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 0dbf1f3..ce2c416 100644
+index 42ea2bb..a423b5d 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
-@@ -2608,6 +2608,10 @@ namespace plume {
+@@ -2610,6 +2610,10 @@ namespace plume {
          return true;
      }
  
@@ -43,17 +43,17 @@ index 0dbf1f3..ce2c416 100644
          uint32_t windowWidth, windowHeight;
          getWindowSize(windowWidth, windowHeight);
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 83b8ddb..6049e48 100644
+index 2f97b72..ba6b5ba 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -268,6 +268,7 @@ namespace plume {
+@@ -269,6 +269,7 @@ namespace plume {
          uint32_t getHeight() const override;
          RenderTexture *getTexture(uint32_t textureIndex) override;
          uint32_t getTextureCount() const override;
 +        void setTextureCount(uint32_t count) override;
          bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
+         void setAcquireInShortWaits(bool shortWaits) override;
          RenderWindow getWindow() const override;
-         bool isEmpty() const override;
 -- 
-2.54.0
+2.56.0
 
