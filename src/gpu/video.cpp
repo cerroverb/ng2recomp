@@ -1926,6 +1926,13 @@ struct PictureFence {
   }
 };
 
+// Each frame slot's pictures between: their acquire semaphores, lists and
+// fences (the render thread's; released in DestroyHostDevice, before the
+// device).
+std::unique_ptr<RenderCommandSemaphore> g_interpAcquire[NUM_FRAMES][kInterpMaxPictures - 1];
+std::unique_ptr<RenderCommandList> g_interpLists[NUM_FRAMES][kInterpMaxPictures - 1];
+PictureFence g_interpFences[NUM_FRAMES][kInterpMaxPictures - 1];
+
 class Presenter {
  public:
   struct Item {
@@ -1940,13 +1947,26 @@ class Presenter {
   };
 
   ~Presenter() {
+    Stop();
+  }
+
+  // The thread stopped and joined (DestroyHostDevice, after WaitForGPU: nothing
+  // queued is left); a later Push starts it again.
+  void Stop() {
     if (thread_.joinable()) {
       {
         std::lock_guard lock(mutex_);
         stop_ = true;
       }
       cv_.notify_all();
-      thread_.detach();
+      idle_.notify_all();
+      thread_.join();
+      std::lock_guard lock(mutex_);
+      stop_ = false;
+      queue_.clear();
+      busy_ = 0;
+      busyTimed_ = false;
+      lastId_ = 0;
     }
   }
 
@@ -4522,6 +4542,35 @@ uint32_t SwapChainImages() {
   return 8u;
 }
 
+// What interpolation keeps on the GPU from frame to frame: the carried
+// render targets' copies, the pictures' upload memory, their lists (with the
+// GPU, the render thread and the presenter idle: switched off, or the device
+// going).
+void ReleaseInterpResources() {
+  g_carriedCopies.clear();
+  g_carriedRetired.clear();
+  for (auto& allocator : g_interpUploads) {
+    allocator.chunks.clear();
+    allocator.Reset();
+  }
+  for (auto& lists : g_interpLists) {
+    for (auto& list : lists) {
+      list.reset();
+    }
+  }
+  for (auto& semaphores : g_interpAcquire) {
+    for (auto& semaphore : semaphores) {
+      semaphore.reset();
+    }
+  }
+  for (auto& fences : g_interpFences) {
+    for (auto& fence : fences) {
+      fence.fence.reset();
+      fence.state = 0;
+    }
+  }
+}
+
 // Frame Interpolation switched in the menu: between frames, with the GPU and
 // the build idle; the swapchain made again with its images (8 with it, 3
 // without: FIFO's queue of 7 would be the latency of a frame that outruns
@@ -5889,7 +5938,6 @@ void Present(HostTexture* frontBuffer) {
         g_presenter.Hurry();
       }
     };
-    static std::unique_ptr<RenderCommandSemaphore> interpAcquire[NUM_FRAMES][kMaxPictures - 1];
     uint32_t indices[kMaxPictures] = {};
     uint32_t pictures = 0;
     uint32_t frameIndex = 0;
@@ -5900,8 +5948,6 @@ void Present(HostTexture* frontBuffer) {
     // each texture's and buffer's layout and stages on the object itself:
     // lists recorded at once raced on them, for wrong barriers), before
     // waiting for the presenter to have room.
-    static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
-    static PictureFence interpFences[NUM_FRAMES][kMaxPictures - 1];
     size_t recorded = 0;
     if (g_swapChainValid && interp) {
       recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
@@ -5909,12 +5955,12 @@ void Present(HostTexture* frontBuffer) {
       auto record = [&](size_t k) {
         layouts.BeforeRecord();
         if (k == 0) {
-          SaveCarried(interpLists[frame][k].get(), carried);
-          layouts.BackToStart(interpLists[frame][k].get());  // (SaveCarried leaves them as the frame ends)
+          SaveCarried(g_interpLists[frame][k].get(), carried);
+          layouts.BackToStart(g_interpLists[frame][k].get());  // (SaveCarried leaves them as the frame ends)
         }
         g_replayConstants = &interp->phases[k];
         g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
-        frameLog->RunKeep(interpLists[frame][k].get());
+        frameLog->RunKeep(g_interpLists[frame][k].get());
         g_replayConstants = nullptr;
         g_replayCopies = nullptr;
         if (k == 0) {
@@ -5922,13 +5968,13 @@ void Present(HostTexture* frontBuffer) {
         }
       };
       for (size_t k = 0; k < recorded; k++) {
-        if (!interpAcquire[frame][k]) {
-          interpAcquire[frame][k] = g_device->createCommandSemaphore();
-          interpLists[frame][k] = g_queue->createCommandList();
-          interpFences[frame][k].fence = g_device->createCommandFence();
+        if (!g_interpAcquire[frame][k]) {
+          g_interpAcquire[frame][k] = g_device->createCommandSemaphore();
+          g_interpLists[frame][k] = g_queue->createCommandList();
+          g_interpFences[frame][k].fence = g_device->createCommandFence();
         }
-        interpFences[frame][k].Wait();  // (its last drawing done: the list is free)
-        interpLists[frame][k]->begin();
+        g_interpFences[frame][k].Wait();  // (its last drawing done: the list is free)
+        g_interpLists[frame][k]->begin();
       }
       for (size_t k = 0; k < recorded; k++) {
         record(k);
@@ -5977,9 +6023,9 @@ void Present(HostTexture* frontBuffer) {
       }
       size_t k = 0;
       for (; k < recorded; k++) {
-        auto& semaphore = interpAcquire[frame][k];
-        auto& interpList = interpLists[frame][k];
-        auto& fence = interpFences[frame][k];
+        auto& semaphore = g_interpAcquire[frame][k];
+        auto& interpList = g_interpLists[frame][k];
+        auto& fence = g_interpFences[frame][k];
         uint32_t index = 0;
         int64_t acquireStart = SteadyNs();
         hurryIfShort(pictures);
@@ -6005,12 +6051,12 @@ void Present(HostTexture* frontBuffer) {
         pictures++;
       }
       for (; k < recorded; k++) {
-        interpLists[frame][k]->end();  // (recorded, not shown: no image)
+        g_interpLists[frame][k]->end();  // (recorded, not shown: no image)
       }
       layouts.AtEnd();
     } else if (recorded) {
       for (size_t k = 0; k < recorded; k++) {
-        interpLists[frame][k]->end();
+        g_interpLists[frame][k]->end();
       }
     }
     if (g_swapChainValid && !ownHidden) {
@@ -7136,6 +7182,7 @@ void DestroyHostDevice() {
       g_renderThread.Stop();
     }
   }
+  g_presenter.Stop();  // (its presents use the swapchain and queue)
   StopPipelineWorkers();
   g_pipelines.clear();
   g_guestShaders.clear();
@@ -7151,6 +7198,7 @@ void DestroyHostDevice() {
   for (auto& allocator : g_uploads) {
     allocator.chunks.clear();
   }
+  ReleaseInterpResources();
   g_guestMemory.reset();
   g_frameRanges.clear();
   std::free(g_guestMemoryShadow);
