@@ -2274,10 +2274,19 @@ void BeginFrame() {
 
 void SwitchInterp();
 
-// The most pictures a frame: what the swapchain's images leave (after each
-// resize, which may change their count).
+// The images a frame may hold at once (its pictures and its own) before any
+// is presented: an acquire is only sure to return while no more than the
+// count less the surface's minimum are held (gamescope: 3 of 8 the minimum).
+uint32_t SpareImages() {
+  uint32_t count = g_swapChain->getTextureCount();
+  uint32_t least = g_swapChain->getMinTextureCount();
+  return count >= least ? count - least + 1 : 0;
+}
+
+// The most pictures a frame, its own counted: what the swapchain's images
+// leave (after each resize, which may change their count).
 void SetInterpPictureCap() {
-  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
+  g_interpPictureCap = std::max(1u, std::min(kInterpMaxPictures, SpareImages()));
 }
 
 // Exclusive full screen (the swapchain takes the display, its presents
@@ -5931,8 +5940,21 @@ void Present(HostTexture* frontBuffer) {
     constexpr uint32_t kMaxPictures = kInterpMaxPictures;
     // A slow screen's partial frame: the last picture again, not shown (the
     // last full frame's pictures are still being shown by the clock).
-    const bool hide = interp && interp->partial && (interp->slow || interp->paced);
-    const bool ownHidden = hide || (interp && interp->paced && !interp->ownShown);
+    // Too few images for a picture besides the frame's own: shown alone, as
+    // with interpolation off (an acquire would wait for an image that only a
+    // present behind it frees).
+    const uint32_t spare = SpareImages();
+    const bool starved = spare < 2;
+    if (interp && starved) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        REXLOG_WARN("video: interp: the swapchain has {} images ({} its least): no pictures between",
+                    g_swapChain->getTextureCount(), g_swapChain->getMinTextureCount());
+      }
+    }
+    const bool hide = !starved && interp && interp->partial && (interp->slow || interp->paced);
+    const bool ownHidden = hide || (!starved && interp && interp->paced && !interp->ownShown);
     // The pictures waiting for their time hurried out only when an acquire
     // could otherwise wait for an image that only their present frees: the
     // images not yet presented and those taken this frame near all the
@@ -5964,7 +5986,8 @@ void Present(HostTexture* frontBuffer) {
     // waiting for the presenter to have room.
     size_t recorded = 0;
     if (g_swapChainValid && interp) {
-      recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
+      // (with the frame's own image, no more than the swapchain spares)
+      recorded = std::min<size_t>({interp->phases.size(), kMaxPictures - 1, size_t(spare > 1 ? spare - 1 : 0)});
       int64_t replayStart = SteadyNs();
       auto record = [&](size_t k) {
         layouts.BeforeRecord();
@@ -6112,7 +6135,7 @@ void Present(HostTexture* frontBuffer) {
       }
       FrameSubmitted();
       static uint64_t presents = 0;
-      if (InterpEnabled() && interp && interp->paced) {
+      if (InterpEnabled() && interp && interp->paced && !starved) {
         // Each at its time on the display's grid.
         int64_t readyNs = SteadyNs();
         int64_t lag = readyNs - interp->presentNs;
@@ -6133,7 +6156,7 @@ void Present(HostTexture* frontBuffer) {
                       double(g_interpReadyLagNs.load()) / 1e6);
           late = shownPaced = 0;
         }
-      } else if (InterpEnabled() && interp) {
+      } else if (InterpEnabled() && interp && !starved) {
         // One at a time, a part of the frame interval apart (Presenter); a
         // slow screen's evenly over the time since its last full frame, the
         // first at once.

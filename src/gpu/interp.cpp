@@ -927,7 +927,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         wanted = std::max<int64_t>(1, std::llround(refreshes / double(per)));
         frames->spacingNs = per * refresh;
       }
-      steps = uint32_t(std::clamp<int64_t>(wanted, steps + 1, std::max<int64_t>(cap, steps + 1)) - 1);
+      // (no more than the cap: the images a frame may hold, its own counted)
+      steps = uint32_t(std::clamp<int64_t>(wanted, std::min<int64_t>(steps + 1, cap), cap) - 1);
       frames->slow = true;
       frames->spanNs = span;
       static uint32_t logged = 0;
