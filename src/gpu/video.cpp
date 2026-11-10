@@ -1598,10 +1598,14 @@ class RenderThread {
         queue_.pop_front();
         busy_ = true;
       }
-      auto runStart = std::chrono::steady_clock::now();
+      // (timed for NG2_PROFILE's log only)
+      const bool timed = g_profile.enabled;
+      auto runStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       batch->RunAll();
-      g_renderBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - runStart).count();
+      if (timed) {
+        g_renderBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - runStart).count();
+      }
       {
         std::lock_guard lock(mutex_);
         free_.push_back(std::move(batch));
@@ -4980,7 +4984,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // Which mesh this is (NG2_INTERP): its vertex and index data and range, the
   // same a frame on whatever the camera did (0: inline data, not known).
   uint64_t interpMesh = 0;
-  if (!inlineData) {
+  if (!inlineData && InterpEnabled()) {
     interpMesh = (uint64_t(startVertex) << 32 | count) * 0x9E3779B97F4A7C15ull ^ startIndex;
     if (indexed) {
       if (uint32_t indexBuffer = guest::Load32(device + 0x308C)) {
@@ -6068,7 +6072,9 @@ void Present(HostTexture* frontBuffer) {
       hurryIfShort(pictures);
       int64_t acquireStart = SteadyNs();
       g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
-      NoteAcquire(SteadyNs() - acquireStart);
+      if (InterpEnabled()) {
+        NoteAcquire(SteadyNs() - acquireStart);
+      }
       g_blockedNs = SteadyNs() - acquireStart;  // (the present's wait is added below)
       parts.acquire += SteadyNs() - acquireStart;
     }
