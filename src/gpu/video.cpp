@@ -2277,6 +2277,12 @@ void BeginFrame() {
 
 void SwitchInterp();
 
+// The most pictures a frame: what the swapchain's images leave (after each
+// resize, which may change their count).
+void SetInterpPictureCap() {
+  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
+}
+
 // Exclusive full screen (the swapchain takes the display, its presents
 // flipped by it instead of composed by DWM, which spoils the pictures'
 // pacing): only for frame interpolation, in Window Mode Fullscreen
@@ -2321,6 +2327,7 @@ RenderCommandList* CommandList() {
       g_resizeRequested.store(false);
       g_swapChainFramebuffers.clear();
       g_swapChainValid = g_swapChain->resize();
+      SetInterpPictureCap();
     }
     WaitForFrame(g_frame);
     ReadGpuTiming(g_frame);
@@ -4599,7 +4606,7 @@ void SwitchInterp() {
   g_swapChain->setAcquireInShortWaits(wanted);
   g_swapChainFramebuffers.clear();
   g_swapChainValid = g_swapChain->resize();
-  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
+  SetInterpPictureCap();
   REXLOG_INFO("video: frame interpolation {} ({} swapchain images)", wanted ? "on" : "off",
               g_swapChain->getTextureCount());
 }
@@ -5812,6 +5819,7 @@ void Present(HostTexture* frontBuffer) {
       WaitForGPU();
       g_swapChainFramebuffers.clear();
       g_swapChainValid = g_swapChain->resize();
+      SetInterpPictureCap();
       list->begin();
     }
 
@@ -6754,7 +6762,7 @@ bool CreateHostDevice() {
   if (UpdateExclusiveMode()) {
     g_swapChain->resize();  // (made again with it)
   }
-  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
+  SetInterpPictureCap();
   g_presentDrainCheck.store(g_swapChain != nullptr);
   // NG2_TEST_DXGI_CLOCK=1 (Windows): the DXGI display clock even with present_wait.
   static const bool forceDxgi = [] {
