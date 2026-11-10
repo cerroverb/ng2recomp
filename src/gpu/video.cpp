@@ -140,6 +140,10 @@ namespace reg = rex::graphics::reg;
 namespace ng2::video {
 
 void RequestDisplayRate();  // (the display clock, below)
+// The game's vblank count (0x84C55B50, its time) at each present: frames that
+// saw none or two and more, for the display log line (frames shown evenly can
+// still move unevenly when the game's ticks per frame vary).
+std::atomic<uint32_t> g_framesNoTick{0}, g_framesManyTicks{0};
 
 namespace {
 
