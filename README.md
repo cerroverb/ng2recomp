@@ -250,6 +250,9 @@ for each button; a key in two lists presses both, as the game's two-button moves
 - Overlays and frame limiters that hook the game's presents (MSI Afterburner with RivaTuner, and the
   like) can upset frame pacing: if the game looks choppy at a steady 60 fps, close them completely
   (not only minimized) and try again.
+- Frame Interpolation (experimental): render targets the game keeps from frame to frame without
+  clearing them, and what shaders write to memory (memexport), show the previous frame's state in the
+  pictures made between frames.
 - Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
   from other systems, and from real Windows PCs especially, are welcome.
 
