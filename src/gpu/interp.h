@@ -83,8 +83,8 @@ struct InterpUpload {
   uint64_t address;
 };
 
-// Frame interpolation's threads: the build of a frame's pictures, its palettes
-// and constants, the recording of the pictures. A few made once, at the first
+// Frame interpolation's threads: the build of a frame's pictures, their palettes
+// and constants (the render thread records the pictures). A few made once, at the first
 // job, instead of a thread for each job each frame. Never destroyed (left
 // to run at exit, as the other workers: a job may be waiting for the GPU).
 class WorkerPool {

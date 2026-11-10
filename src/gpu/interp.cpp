@@ -139,14 +139,9 @@ bool InterpEnabled() {
   return on != 0;
 }
 
-namespace {
 // Pictures between two frames where the display's refresh isn't known or
 // paced by: 2 (180 Hz for the game's 60).
-constexpr uint32_t InterpSteps() {
-  return 2u;
-}
-
-}  // namespace
+constexpr uint32_t kInterpSteps = 2;
 
 int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
                           const uint64_t (&mask)[4], const uint32_t* psConstants,
@@ -851,7 +846,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   if (!partial && !g.previous.empty() && submitted && matched * 2 >= submitted) {
     frames = std::make_shared<InterpFrames>();
     frames->presentNs = presentNs;
-    uint32_t steps = InterpSteps();
+    uint32_t steps = kInterpSteps;
     int64_t refresh = InterpRefreshNs();
     if (refresh > 0 && refresh < 16'000'000) {
       // The time this frame stands for: from the last frame to it (a slow
@@ -1451,7 +1446,6 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         continue;
       }
       auto& now = g.palettes[i];
-      auto& then = g.previousPalettes[pairs[i]];
       if (job.jumped) {
         g.palettesJumped++;
         job.skip = true;
