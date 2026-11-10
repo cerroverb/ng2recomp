@@ -1106,6 +1106,10 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
       return RenderFormat::R32_FLOAT;
     case xenos::TextureFormat::k_32_32_FLOAT:
       return RenderFormat::R32G32_FLOAT;
+    case xenos::TextureFormat::k_5_6_5:
+      // (the game over screen keeps the last picture of play in one, #88:
+      // without a host texture its resolves were lost and it read black)
+      return RenderFormat::B5G6R5_UNORM;
     default:
       return RenderFormat::UNKNOWN;
   }
