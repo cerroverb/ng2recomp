@@ -17,9 +17,14 @@ import lzma
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import urllib.request
+
+if sys.version_info < (3, 11):
+    sys.exit("fetch-sysroot.py needs Python 3.11 or newer (hashlib.file_digest)")
+socket.setdefaulttimeout(60)  # (a stalled download fails instead of hanging)
 
 ARCHIVE = "https://ports.ubuntu.com/ubuntu-ports"
 # Later suites replace the packages of earlier ones (noble-updates carries the security fixes too).
@@ -42,8 +47,12 @@ def sha256(path):
 
 def package_lists(download_dir, suite):
     release = fetch(f"{ARCHIVE}/dists/{suite}/InRelease", os.path.join(download_dir, f"InRelease-{suite}"))
-    signed = subprocess.run(["gpgv", "--quiet", "--keyring", KEYRING, "--output", "-", release],
-                            check=True, capture_output=True, text=True).stdout
+    verified = subprocess.run(["gpgv", "--quiet", "--keyring", KEYRING, "--output", "-", release],
+                              capture_output=True, text=True)
+    if verified.returncode != 0:
+        os.remove(release)  # (fetched again next time, not failed on for good)
+        sys.exit(f"InRelease of {suite} failed its signature check:\n{verified.stderr}")
+    signed = verified.stdout
     sums = {name: digest for digest, name in re.findall(r"^ ([0-9a-f]{64}) +\d+ (\S+)$", signed, re.M)}
     for component in COMPONENTS:
         name = f"{component}/binary-arm64/Packages.xz"

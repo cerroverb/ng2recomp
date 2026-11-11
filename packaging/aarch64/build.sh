@@ -35,9 +35,15 @@ ffmpeg_url=https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.2.tar.gz
 ffmpeg_sha256=6e374ed621e48faa40639307dff48ba6fe574a509977956d2cce9669b7cc27e9
 ffmpeg_src=$deps/FFmpeg-n9.0.2
 if [ ! -f "$ffmpeg_src/.sha256" ] || [ "$(cat "$ffmpeg_src/.sha256")" != "$ffmpeg_sha256" ]; then
-    [ -s "$deps/$ffmpeg.tar.gz" ] || curl -fL -o "$deps/$ffmpeg.tar.gz" "$ffmpeg_url" ||
-        { echo "FFmpeg's source is gone from $ffmpeg_url: put $ffmpeg.tar.gz in $deps." >&2; exit 1; }
-    echo "$ffmpeg_sha256  $deps/$ffmpeg.tar.gz" | sha256sum -c --quiet
+    # (downloaded to .part and renamed once complete; a tarball that fails the check is deleted,
+    # so the next run downloads it again)
+    if [ ! -s "$deps/$ffmpeg.tar.gz" ]; then
+        curl -fL -o "$deps/$ffmpeg.tar.gz.part" "$ffmpeg_url" ||
+            { echo "FFmpeg's source is gone from $ffmpeg_url: put $ffmpeg.tar.gz in $deps." >&2; exit 1; }
+        mv "$deps/$ffmpeg.tar.gz.part" "$deps/$ffmpeg.tar.gz"
+    fi
+    echo "$ffmpeg_sha256  $deps/$ffmpeg.tar.gz" | sha256sum -c --quiet ||
+        { rm -f "$deps/$ffmpeg.tar.gz"; echo "$ffmpeg.tar.gz didn't match its SHA-256: deleted, run again." >&2; exit 1; }
     rm -rf "$ffmpeg_src" && bsdtar -xf "$deps/$ffmpeg.tar.gz" -C "$deps"
     echo "$ffmpeg_sha256" > "$ffmpeg_src/.sha256"
 fi

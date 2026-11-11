@@ -24,10 +24,10 @@ The native renderer (`src/gpu/video.cpp`) follows the Vulkan renderer of
 
 ## From the system
 
-These come from the system, except FFmpeg, which the AppImage and the Windows build carry:
+These come from the system, except FFmpeg, which the AppImage, the Windows build and the 64-bit ARM Linux build carry:
 
 | Library | License |
 |---|---|
-| FFmpeg (libavformat, libavcodec, libavutil, libswresample, libswscale) | LGPL-2.1-or-later. The AppImage bundles an LGPL build of FFmpeg 9.0.2 (source: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz, configured as in `packaging/appimage/Dockerfile`) and the Windows build ships BtbN's LGPL shared build (`packaging/windows/build.sh`); a build from source uses the system's |
+| FFmpeg (libavformat, libavcodec, libavutil, libswresample, libswscale) | LGPL-2.1-or-later. The AppImage bundles an LGPL build of FFmpeg 9.0.2 (source: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz, configured as in `packaging/appimage/Dockerfile`), the Windows build ships BtbN's LGPL shared build (`packaging/windows/build.sh`), and the 64-bit ARM Linux build bundles its own LGPL build of FFmpeg 9.0.2 (source: https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.2.tar.gz, SHA-256 6e374ed621e48faa40639307dff48ba6fe574a509977956d2cce9669b7cc27e9, configured as in `packaging/aarch64/build.sh`); a build from source uses the system's |
 | zstd (the embedded shader cache) | BSD-3-Clause |
 | The Vulkan loader | Apache-2.0 |
