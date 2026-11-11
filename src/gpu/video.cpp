@@ -163,6 +163,15 @@ void RequestDisplayRate();  // (the display clock, below)
 // saw none or two and more, for the display log line (frames shown evenly can
 // still move unevenly when the game's ticks per frame vary).
 std::atomic<uint32_t> g_framesNoTick{0}, g_framesManyTicks{0};
+// Pictures presented, the game's frames and interpolation's between them
+// (the FPS counter's rate with interpolation on).
+std::atomic<uint64_t> g_picturesPresented{0};
+uint64_t PicturesPresented() {
+  return g_picturesPresented.load(std::memory_order_relaxed);
+}
+bool InterpolationOn() {
+  return InterpEnabled();
+}
 
 namespace {
 
@@ -1868,8 +1877,12 @@ void NoteFrameWait(int64_t ns) {
 }
 
 void ApplyResolveReadbacks(uint32_t frame);
+bool ResolveReadbacksQueued(uint32_t frame);
 
-void WaitForFrame(uint32_t frame) {
+// noteWait: under gamescope, the wait counts toward a drain request
+// (NoteFrameWait). Not the read-back wait at the end of Present: earlier in
+// the frame, it is longer in a GPU-heavy scene without the game being ahead.
+void WaitForFrame(uint32_t frame, bool noteWait = true) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
     int64_t waitStart = SteadyNs();
@@ -1884,7 +1897,7 @@ void WaitForFrame(uint32_t frame) {
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
     ApplyResolveReadbacks(frame);
-    if (UnderGamescope()) {
+    if (UnderGamescope() && noteWait) {
       NoteFrameWait(SteadyNs() - waitStart);
     }
   }
@@ -2104,6 +2117,8 @@ class Presenter {
       int64_t presentStart = SteadyNs();
       if (!g_swapChain->present(item.index, &item.semaphore, 1)) {
         failed = true;
+      } else {
+        g_picturesPresented.fetch_add(1, std::memory_order_relaxed);
       }
       lastId_ = g_swapChain->getPresentId();
       if (item.inputNs) {
@@ -2121,7 +2136,11 @@ class Presenter {
       if (item.timed) {
         static int64_t lastNs = 0, lateSum = 0, lateMax = 0, gapMin = INT64_MAX, gapMax = 0;
         static uint32_t count = 0, gaps = 0, short4 = 0, long15 = 0;
-        int64_t late = presentStart - item.atNs;
+        // (one hurried out, its time dropped: not late, counted apart; its
+        // time 0 made the average hours late)
+        static uint32_t hurried = 0;
+        int64_t late = item.atNs ? presentStart - item.atNs : 0;
+        hurried += item.atNs == 0;
         lateSum += late, lateMax = std::max(lateMax, late);
         if (lastNs && presentStart - lastNs < 100'000'000) {
           int64_t gap = presentStart - lastNs;
@@ -2132,11 +2151,11 @@ class Presenter {
         lastNs = presentStart;
         if (++count == 120) {
           REXLOG_INFO("video: interp: slow screen presents: {:.2f} ms late on average (max {:.1f}); "
-                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}",
+                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}; {} hurried out",
                       double(lateSum) / 120e6, double(lateMax) / 1e6, double(gapMin) / 1e6, double(gapMax) / 1e6,
-                      short4, long15, gaps);
+                      short4, long15, gaps, hurried);
           lateSum = lateMax = gapMax = 0, gapMin = INT64_MAX;
-          count = gaps = short4 = long15 = 0;
+          count = gaps = short4 = long15 = hurried = 0;
         }
       }
       int64_t took = SteadyNs() - presentStart;
@@ -6295,6 +6314,9 @@ void Present(HostTexture* frontBuffer) {
         EvenOutPresent();
         int64_t presentStart = SteadyNs();
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
+        if (g_swapChainValid) {
+          g_picturesPresented.fetch_add(1, std::memory_order_relaxed);
+        }
         // A full FIFO queue blocks the acquire (AMD, Mesa) or the present
         // (NVIDIA): either counts.
         if (g_blockedNs + SteadyNs() - presentStart >= 1'500'000) {
@@ -6347,6 +6369,30 @@ void Present(HostTexture* frontBuffer) {
   }
   g_frame = (g_frame + 1) % FrameSlots();
   g_frameCount++;
+  // The frame before this one waited for here, when it read back resolves:
+  // they are in guest memory before the game's next frame starts, every frame
+  // alike. Applied only at the slot's next use (that frame's first draw, which
+  // the game's logic may run before or after), the game read last frame's
+  // values some frames and older ones others: the brightness it reads back
+  // wavered (the shop's door and paper panels flickering, #21 and others), and
+  // so did what it reads for objects' animation (chests, #87). The GPU is one
+  // frame behind at most then, where it was two.
+  // Not with frame interpolation (three slots): the previous frame's job there
+  // includes its pictures and their room in the presenter, and waiting for it
+  // cost the game frames (54.8 fps at worst against 60 in a Chapter 1 fight at
+  // 120 Hz). NG2_READBACK_SYNC=0 leaves them to the slot's next use, as before
+  // 0.5.65; =1 waits with interpolation too.
+  static const int readbackSync = [] {
+    const char* v = std::getenv("NG2_READBACK_SYNC");
+    return v && *v == '0' ? 0 : v && *v == '1' ? 2 : 1;
+  }();
+  if (readbackSync == 2 || (readbackSync == 1 && !InterpEnabled())) {
+    uint32_t slots = FrameSlots();
+    uint32_t previous = (g_frame + slots - 2) % slots;  // (g_frame is the next frame's slot now)
+    if (g_commandListPending[previous] && ResolveReadbacksQueued(previous)) {
+      WaitForFrame(previous, false);  // (not toward a drain request)
+    }
+  }
 }
 
 // Setup -----------------------------------------------------------------------
@@ -7275,6 +7321,11 @@ void WriteResolveReadback(const ResolveReadbackItem& item, const uint8_t* data) 
   if (auto it = g_resolvedMemory.find(item.address); it != g_resolvedMemory.end()) {
     it->second.hash = ResolvedMemoryHash(item.address, it->second.size);
   }
+}
+
+// Resolves of that frame slot waiting to be read back (its fence not yet waited for).
+bool ResolveReadbacksQueued(uint32_t frame) {
+  return !g_resolveReadbacks[frame].items.empty();
 }
 
 // After the frame's fence: its read-back resolves into guest memory.

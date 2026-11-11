@@ -246,6 +246,13 @@ REX_HOOK_RAW(sub_822F0EF8) {
   // Averaged over half a second, so it can be read.
   if (g_seconds >= 0.5 || g_shown.empty()) {
     double frameTime = g_frames ? g_seconds / g_frames : 0.0;
+    // With interpolation, the pictures shown (its and the game's frames).
+    static uint64_t lastPictures = 0;
+    uint64_t pictures = ng2::video::PicturesPresented();
+    if (ng2::video::InterpolationOn() && lastPictures && pictures > lastPictures && g_seconds > 0.0) {
+      frameTime = g_seconds / double(pictures - lastPictures);
+    }
+    lastPictures = pictures;
     std::string text = frameTime > 0.0 ? fmt::format("{:.0f} FPS  {:.1f} ms", 1.0 / frameTime,
                                                      frameTime * 1000.0)
                                        : std::string("-- FPS");

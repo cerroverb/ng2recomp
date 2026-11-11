@@ -10,6 +10,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/input/device_assignment.h>
 #include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 #include <rex/system.h>
@@ -105,16 +106,25 @@ class Ng2App : public rex::ReXApp {
       config.audio_factory = REX_AUDIO_BACKEND(ng2::SdlOrSilentAudioSystem);
     }
 
+    // Every controller is player one (the game has one player, and only player
+    // one is signed in): a pad seen twice (Steam Input's copy of it, #89) or a
+    // second pad (a handheld's own and an external one) pressing Start made the
+    // game take player two and wait for that player's profile for ever ("NOW
+    // LOADING"). NG2_PLAYER_SLOTS=1 gives each controller its own player again.
     // NG2_PAD_SCRIPT / NG2_PAD_LIVE: a scripted controller for player one.
-    if (std::getenv("NG2_PAD_SCRIPT") || std::getenv("NG2_PAD_LIVE")) {
-      config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
-        auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+    config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+      auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+      if (std::getenv("NG2_PAD_SCRIPT") || std::getenv("NG2_PAD_LIVE")) {
         if (auto script = ng2::ScriptInputDriver::FromEnvironment()) {
           input->AddDriver(std::move(script));
         }
-        return input;
-      };
-    }
+      }
+      const char* slots = std::getenv("NG2_PLAYER_SLOTS");
+      if (!(slots && slots[0] == '1')) {
+        input->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());
+      }
+      return input;
+    };
   }
 
   void OnPostSetup() override {
