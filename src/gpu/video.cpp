@@ -163,6 +163,15 @@ void RequestDisplayRate();  // (the display clock, below)
 // saw none or two and more, for the display log line (frames shown evenly can
 // still move unevenly when the game's ticks per frame vary).
 std::atomic<uint32_t> g_framesNoTick{0}, g_framesManyTicks{0};
+// Pictures presented, the game's frames and interpolation's between them
+// (the FPS counter's rate with interpolation on).
+std::atomic<uint64_t> g_picturesPresented{0};
+uint64_t PicturesPresented() {
+  return g_picturesPresented.load(std::memory_order_relaxed);
+}
+bool InterpolationOn() {
+  return InterpEnabled();
+}
 
 namespace {
 
@@ -2136,11 +2145,11 @@ class Presenter {
         lastNs = presentStart;
         if (++count == 120) {
           REXLOG_INFO("video: interp: slow screen presents: {:.2f} ms late on average (max {:.1f}); "
-                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}",
+                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}; {} hurried out",
                       double(lateSum) / 120e6, double(lateMax) / 1e6, double(gapMin) / 1e6, double(gapMax) / 1e6,
-                      short4, long15, gaps);
+                      short4, long15, gaps, hurried);
           lateSum = lateMax = gapMax = 0, gapMin = INT64_MAX;
-          count = gaps = short4 = long15 = 0;
+          count = gaps = short4 = long15 = hurried = 0;
         }
       }
       int64_t took = SteadyNs() - presentStart;

@@ -86,4 +86,9 @@ void NoteFrameTaken();
 // NG2_TRACE_STACKS=1: the guest call chain of the draw about to be made, for its trace line.
 void NoteDrawStack(const std::string& stack);
 
+// The FPS counter: pictures presented so far, and whether interpolation makes
+// pictures between the game's frames (then the counter shows their rate).
+uint64_t PicturesPresented();
+bool InterpolationOn();
+
 }  // namespace ng2::video
