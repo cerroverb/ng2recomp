@@ -6965,8 +6965,10 @@ bool CreateHostDevice() {
   }
 #endif
   SDL_AddEventWatch(WatchTraceKey, nullptr);
-  REXLOG_INFO("video: wait for the screen (Input Latency Low): {}",
-              g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)");
+  // (whether the GPU can do Input Latency Low, not the setting: logged as both, #78)
+  REXLOG_INFO("video: Input Latency Low supported (waits for the screen): {}; set to {}",
+              g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)",
+              REXCVAR_GET(input_latency) == 1 ? "Low" : "Standard");
   REXLOG_INFO("video: vertex shaders round toward zero: {}",
               RoundTowardZero()                          ? "yes"
               : g_device->getCapabilities().roundingModeRTZ ? "no (NG2_RTZ=0)"
