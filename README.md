@@ -337,6 +337,18 @@ The Windows build is cross-compiled from Linux after the native one: `packaging/
 also needs its `contrib/D3D12MemoryAllocator` submodule there). It builds the SDK for Windows, fetches
 FFmpeg's Windows build, and packs `out/windows/NinjaGaiden2-windows-x64.zip`.
 
+The 64-bit ARM Linux build is cross-compiled the same way, after the native one:
+`packaging/aarch64/build.sh` fetches FFmpeg 9.0.2's source and an Ubuntu 24.04 arm64 sysroot,
+builds the SDK, a small FFmpeg and the game, and puts them in `out/aarch64-dist`. Besides clang,
+lld and the LLVM tools it needs curl, bsdtar, Python 3.11 or newer, gpgv and the Ubuntu archive
+keyring in `/usr/share/keyrings` (`ubuntu-keyring` on Arch, `ubu-keyring` on Fedora). The device
+needs glibc 2.39 or newer (Ubuntu 24.04 and later; Armada on the AYN Odin 3 Ultra runs it).
+
+That build has no installer: copy `out/aarch64-dist` to the device, put the extracted game in
+`game_files/` inside it with Title Update 3's `default.xexp` next to `default.xex` (as in the
+build steps above) and DLC in `game_files/dlc/`, and run `./ng2`. Settings, saves and the log
+(`ng2.log`) go where the AppImage keeps them (the Linux column above; no portable mode).
+
 How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
 [docs/menus.md](docs/menus.md) (the menus), [docs/shaders.md](docs/shaders.md). How to contribute:
 [CONTRIBUTING.md](CONTRIBUTING.md); the layout, tools and test rules, also for coding agents:

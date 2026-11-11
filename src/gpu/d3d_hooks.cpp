@@ -439,7 +439,13 @@ REX_HOOK_RAW(sub_83774800) {
     if (spins >= 4096) {
       std::this_thread::yield();
     } else {
+#if defined(__x86_64__) || defined(_M_X64)
       __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+      // ISB SY: yield is close to a no-op on most ARM cores; this waits for
+      // the pipeline to drain (Rust's core::hint::spin_loop on aarch64).
+      __builtin_arm_isb(15);
+#endif
     }
   }
 }

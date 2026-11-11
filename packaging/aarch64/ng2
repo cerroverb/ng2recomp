@@ -1,0 +1,47 @@
+#!/bin/sh
+# Ninja Gaiden II launcher for the 64-bit ARM Linux build: the game_files folder next to it (so a
+# Steam shortcut needs no launch options) or NG2_GAME_DIR, settings, saves and the log where the
+# AppImage keeps them (packaging/appimage/AppRun), then the game. Extra arguments go to the game.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/ng2-recomp
+data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/ng2-recomp
+game=${NG2_GAME_DIR:-$here/game_files}
+mkdir -p "$config_dir" "$data_dir"
+
+error() {
+  printf 'Ninja Gaiden II: %s\n' "$1" >&2
+  exit 1
+}
+
+# What earlier ARM builds wrote, moved once: settings and the pipeline list from next to the
+# program, saves from the SDK's default folder. (A move that fails, a read-only install folder,
+# leaves them where they are.)
+for file in ng2.toml ng2-pipelines.bin; do
+  if [ -f "$here/$file" ] && [ ! -e "$config_dir/$file" ]; then
+    mv "$here/$file" "$config_dir/$file" 2>/dev/null || true
+  fi
+done
+old_saves=${XDG_DATA_HOME:-$HOME/.local/share}/ng2
+if [ -d "$old_saves" ] && [ ! -e "$data_dir/user" ]; then
+  mv "$old_saves" "$data_dir/user" 2>/dev/null || true
+fi
+mkdir -p "$data_dir/user"
+
+# The game and Title Update 3, as the AppImage checks them (no dialogs here: the update goes in
+# the game folder by hand).
+[ -f "$game/default.xex" ] || error "No default.xex in $game (put the game there, or set NG2_GAME_DIR)."
+tu3_sha1=e9df578781355d9a25e1c0adba8fbb859333456a  # the World disc's (media ID 69F555CB)
+tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062  # what earlier builds ran: set aside
+if [ -f "$game/default.xexp" ] && [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ]; then
+  mv "$game/default.xexp" "$game/default.xexp.tu2" 2>/dev/null || true
+fi
+[ -f "$game/default.xexp" ] ||
+  error "Title Update 3 is missing: put its default.xexp (from TU_1A461UL_000000G000000.00000000000O4) in $game."
+[ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu3_sha1" ] ||
+  error "$game/default.xexp isn't Title Update 3 for the World release (TU_1A461UL_000000G000000.00000000000O4)."
+
+export NG2_CONFIG=${NG2_CONFIG:-$config_dir/ng2.toml}
+exec "$here/ng2.bin" --game_data_root="$game" --user_data_root="$data_dir/user" \
+  --log_file="$data_dir/ng2.log" "$@"
