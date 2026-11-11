@@ -1,0 +1,30 @@
+From 31e7122730fd4cd2021bd67de0c90701ee058db5 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Wed, 11 Nov 2026 11:33:20 +0000
+Subject: [PATCH] Part ids: every component of TEXCOORD6 snapped to whole
+ numbers without barycentrics (#20)
+
+---
+ XenosRecomp/shader_recompiler.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 15ee3b3..e55fc74 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1696,7 +1696,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     uint32_t(interpolator.reg));
+                 out += "#else\n";
+                 println("\tfloat4 r{} = iTexCoord6;", uint32_t(interpolator.reg));
+-                println("\tr{0}.y = abs(r{0}.y - round(r{0}.y)) < 0.001 ? round(r{0}.y) : r{0}.y;", uint32_t(interpolator.reg));
++                // Every component: x is 1.0 at the vertices of a part that can be
++                // cut off, and the shaders test 1.0 > x before comparing the id;
++                // interpolated to 0.99999994 it cut pixels out of whole limbs
++                // (#20, GPUs without barycentrics).
++                println("\tr{0} = select(abs(r{0} - round(r{0})) < 0.001, round(r{0}), r{0});", uint32_t(interpolator.reg));
+                 out += "#endif\n";
+             }
+             else
+-- 
+2.56.0
+
