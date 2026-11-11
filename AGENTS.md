@@ -119,6 +119,9 @@ devices, and none of the player's settings or saves.
 - `NG2_TEST_TOGGLE_LOG=1`: logs draws whose shader constants switch between two sets of values from
   frame to frame (once each, with what differs: constants, vertex data, the textures sampled, render
   state). `NG2_TEST_WAIT_GPU=1`: the CPU waits for the GPU at each present.
+- `NG2_READBACK_SYNC=0`: read-back resolves applied at the frame slot's next use again instead of at
+  the end of the next present (the game's brightness and object animation read them: flicker,
+  chest jitter); `=1` also with frame interpolation, where it is off by default (it cost frames).
 - `NG2_TEST_STALE_LOG=1`: once a second, the resolved textures whose guest memory was found changed
   since (read from guest memory instead of the GPU's copy); `NG2_TEST_NO_STALE=1` always uses the GPU's
   copy.

@@ -1868,8 +1868,12 @@ void NoteFrameWait(int64_t ns) {
 }
 
 void ApplyResolveReadbacks(uint32_t frame);
+bool ResolveReadbacksQueued(uint32_t frame);
 
-void WaitForFrame(uint32_t frame) {
+// noteWait: under gamescope, the wait counts toward a drain request
+// (NoteFrameWait). Not the read-back wait at the end of Present: earlier in
+// the frame, it is longer in a GPU-heavy scene without the game being ahead.
+void WaitForFrame(uint32_t frame, bool noteWait = true) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
     int64_t waitStart = SteadyNs();
@@ -1884,7 +1888,7 @@ void WaitForFrame(uint32_t frame) {
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
     ApplyResolveReadbacks(frame);
-    if (UnderGamescope()) {
+    if (UnderGamescope() && noteWait) {
       NoteFrameWait(SteadyNs() - waitStart);
     }
   }
@@ -6347,6 +6351,30 @@ void Present(HostTexture* frontBuffer) {
   }
   g_frame = (g_frame + 1) % FrameSlots();
   g_frameCount++;
+  // The frame before this one waited for here, when it read back resolves:
+  // they are in guest memory before the game's next frame starts, every frame
+  // alike. Applied only at the slot's next use (that frame's first draw, which
+  // the game's logic may run before or after), the game read last frame's
+  // values some frames and older ones others: the brightness it reads back
+  // wavered (the shop's door and paper panels flickering, #21 and others), and
+  // so did what it reads for objects' animation (chests, #87). The GPU is one
+  // frame behind at most then, where it was two.
+  // Not with frame interpolation (three slots): the previous frame's job there
+  // includes its pictures and their room in the presenter, and waiting for it
+  // cost the game frames (54.8 fps at worst against 60 in a Chapter 1 fight at
+  // 120 Hz). NG2_READBACK_SYNC=0 leaves them to the slot's next use, as before
+  // 0.5.65; =1 waits with interpolation too.
+  static const int readbackSync = [] {
+    const char* v = std::getenv("NG2_READBACK_SYNC");
+    return v && *v == '0' ? 0 : v && *v == '1' ? 2 : 1;
+  }();
+  if (readbackSync == 2 || (readbackSync == 1 && !InterpEnabled())) {
+    uint32_t slots = FrameSlots();
+    uint32_t previous = (g_frame + slots - 2) % slots;  // (g_frame is the next frame's slot now)
+    if (g_commandListPending[previous] && ResolveReadbacksQueued(previous)) {
+      WaitForFrame(previous, false);  // (not toward a drain request)
+    }
+  }
 }
 
 // Setup -----------------------------------------------------------------------
@@ -7275,6 +7303,11 @@ void WriteResolveReadback(const ResolveReadbackItem& item, const uint8_t* data) 
   if (auto it = g_resolvedMemory.find(item.address); it != g_resolvedMemory.end()) {
     it->second.hash = ResolvedMemoryHash(item.address, it->second.size);
   }
+}
+
+// Resolves of that frame slot waiting to be read back (its fence not yet waited for).
+bool ResolveReadbacksQueued(uint32_t frame) {
+  return !g_resolveReadbacks[frame].items.empty();
 }
 
 // After the frame's fence: its read-back resolves into guest memory.
