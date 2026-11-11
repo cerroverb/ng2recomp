@@ -1,0 +1,109 @@
+From c5d6aada175cd022d6fd587f8ee07355492735d4 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Wed, 11 Nov 2026 18:10:49 +0000
+Subject: [PATCH] Crash logs: the guest calls behind a bad call or an access
+ violation
+
+A call to an address with no function, and a guest access violation, now
+log the guest's return addresses (the last call's, then up the stack's
+back chain) so a crash report names the code. The walk stays within the
+stack's heap on aligned frames: it runs in the access violation handler,
+where a bad read ends the process.
+---
+ include/rex/system/function_dispatcher.h |  4 +++
+ src/system/function_dispatcher.cpp       | 41 ++++++++++++++++++++++++
+ src/system/xmemory.cpp                   |  5 +++
+ 3 files changed, 50 insertions(+)
+
+diff --git a/include/rex/system/function_dispatcher.h b/include/rex/system/function_dispatcher.h
+index 916f3d6..ba3f369 100644
+--- a/include/rex/system/function_dispatcher.h
++++ b/include/rex/system/function_dispatcher.h
+@@ -156,4 +156,8 @@ class FunctionDispatcher : public IModuleRegistrar {
+   mutable std::recursive_mutex dispatch_mutex_;
+ };
+ 
++// The guest's return addresses, innermost first (the last call's, then up the
++// stack's back chain), for crash logs.
++std::string GuestCallChain(PPCContext& ctx);
++
+ }  // namespace rex::runtime
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..6a277b6 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -34,7 +34,48 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
++// Where the bad call came from: the caller's return address, then up the
++// stack's back chain (each function saves its LR 8 bytes below its caller's
++// frame), and the argument registers, so a crash report names the code.
++std::string GuestCallChain(PPCContext& ctx) {
++  std::string chain = fmt::format("{:08X}", uint32_t(ctx.lr));
++  Runtime* runtime = Runtime::instance();
++  memory::Memory* mem = runtime ? runtime->memory() : nullptr;
++  if (!mem) {
++    return chain;
++  }
++  // Only within the stack's own heap, word-aligned: the walk may run in the
++  // access violation handler, where reading a bad address ends the process.
++  const memory::BaseHeap* stackHeap = mem->LookupHeap(ctx.r1.u32);
++  if (!stackHeap || (stackHeap->heap_type() != memory::HeapType::kGuestVirtual &&
++                     stackHeap->heap_type() != memory::HeapType::kGuestXex)) {
++    return chain;
++  }
++  auto readable = [&](uint32_t address) {
++    uint32_t protect = 0;
++    auto* heap = mem->LookupHeap(address);
++    return heap == stackHeap && !(address & 3) && heap->QueryProtect(address, &protect) &&
++           (protect & memory::kMemoryProtectRead);
++  };
++  auto load32 = [&](uint32_t address) {
++    return rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(address));
++  };
++  uint32_t sp = ctx.r1.u32;
++  for (int depth = 0; depth < 16 && readable(sp); depth++) {
++    uint32_t next = load32(sp);
++    if (!next || (next & 7) || next <= sp || next - sp > 0x100000 || !readable(next - 8)) {
++      break;
++    }
++    chain += fmt::format(" {:08X}", load32(next - 8));
++    sp = next;
++  }
++  return chain;
++}
++
+ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
++  REXCPU_ERROR("Bad call from {} (r3 {:08X} r4 {:08X} r5 {:08X} r11 {:08X} r12 {:08X})",
++               GuestCallChain(ctx), ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r11.u32,
++               ctx.r12.u32);
+   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+             ctx.last_indirect_target);
+ }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..bde22b3 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -27,6 +27,7 @@
+ #include <rex/stream.h>
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/mmio_handler.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xmemory.h>
+ #include <rex/thread.h>
+ 
+@@ -547,6 +548,10 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+         rex::thread::current_thread_id());
++    if (auto* thread_state = runtime::ThreadState::Get()) {
++      REXSYS_ERROR("Guest calls at the access violation: {}",
++                   runtime::GuestCallChain(*thread_state->context()));
++    }
+     return false;
+   }
+ 
+-- 
+2.56.0
+

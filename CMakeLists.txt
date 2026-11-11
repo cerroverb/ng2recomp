@@ -52,6 +52,7 @@ set(NG2_SOURCES
     src/mods.cpp
     src/stderr_log.cpp
     src/gameplay.cpp
+    src/game_fixes.cpp
     src/aspect.cpp
     src/windows_setup.cpp
 )
