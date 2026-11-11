@@ -320,6 +320,7 @@ std::unique_ptr<RenderDescriptorSet> g_samplerDescriptorSet;
 std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
 std::unique_ptr<RenderSampler> g_linearClampSampler;
 HostTexture g_nullTextures[DESCRIPTOR_FIRST_FREE];
+bool g_nullTexturesReady = false;  // cleared and in SHADER_READ (the first frame's list)
 std::unique_ptr<RenderTextureView> g_nullTextureViews[DESCRIPTOR_FIRST_FREE];
 DescriptorAllocator g_descriptors;
 
@@ -2194,6 +2195,7 @@ void WaitForGPU() {
 }
 
 RenderCommandList* CommandList();
+void PrepareNullTextures();
 
 // GPU timing (NG2_PROFILE): a mark's index in this frame's pool, or none.
 uint32_t AllocGpuMark(GpuMark kind) {
@@ -2386,6 +2388,7 @@ RenderCommandList* CommandList() {
     }
     g_recording = true;
     BeginGpuTiming(g_frame);
+    PrepareNullTextures();
   }
   return RenderThreadEnabled() ? static_cast<RenderCommandList*>(&g_queuedCommandList)
                                : g_commandLists[g_frame].get();
@@ -2807,6 +2810,36 @@ Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignmen
 Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   return AllocateFrom(g_uploads[g_frame], size, alignment);
 }
+
+// The blank textures behind unbound slots, cleared to 0 and moved to
+// SHADER_READ once, in the first frame's list (#18): their descriptors say
+// SHADER_READ, and they were sampled in their creation layout (undefined),
+// which AMD and NVIDIA read as anything (the view's swizzle makes it 0) but
+// Intel's compressed images need not.
+void PrepareNullTextures() {
+  if (g_nullTexturesReady) {
+    return;
+  }
+  g_nullTexturesReady = true;
+  Upload zeros = Allocate(256, 256);
+  std::memset(zeros.data, 0, 256);
+  for (uint32_t i = 0; i < DESCRIPTOR_FIRST_FREE; i++) {
+    HostTexture& texture = g_nullTextures[i];
+    if (!texture.texture) {
+      continue;
+    }
+    Transition(texture, RenderTextureLayout::COPY_DEST);
+    uint32_t layers = i == DESCRIPTOR_NULL_CUBE ? 6 : 1;
+    for (uint32_t layer = 0; layer < layers; layer++) {
+      CommandList()->copyTextureRegion(
+          RenderTextureCopyLocation::Subresource(texture.texture.get(), 0, layer),
+          RenderTextureCopyLocation::PlacedFootprint(zeros.buffer, RenderFormat::R8_UNORM, 1, 1, 1,
+                                                     256, zeros.offset));
+    }
+    Transition(texture, RenderTextureLayout::SHADER_READ);
+  }
+}
+
 
 // A copy into g_guestMemory. Recorded in the frame's command list it ends the
 // render pass (Vulkan allows no copy inside one) and takes two barriers, and
@@ -6523,6 +6556,8 @@ void CreatePipelines() {
       viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
     }
     g_nullTextures[i].texture = g_device->createTexture(desc);
+    g_nullTextures[i].layout = RenderTextureLayout::UNKNOWN;
+    g_nullTexturesReady = false;
     if (!g_nullTextures[i].texture) {
       REXLOG_ERROR("video: can't make a 1-pixel texture: no video memory");
       std::_Exit(1);
