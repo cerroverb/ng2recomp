@@ -122,6 +122,8 @@ devices, and none of the player's settings or saves.
 - `NG2_READBACK_SYNC=0`: read-back resolves applied at the frame slot's next use again instead of at
   the end of the next present (the game's brightness and object animation read them: flicker,
   chest jitter); `=1` also with frame interpolation, where it is off by default (it cost frames).
+- `NG2_PLAYER_SLOTS=1`: each controller its own player again; by default every controller is player
+  one (only player one is signed in, #89).
 - `NG2_TEST_STALE_LOG=1`: once a second, the resolved textures whose guest memory was found changed
   since (read from guest memory instead of the GPU's copy); `NG2_TEST_NO_STALE=1` always uses the GPU's
   copy.
