@@ -1,0 +1,23 @@
+#!/bin/sh
+# Ninja Gaiden II launcher for the 64-bit ARM Linux build: the game_files folder next to it (so a
+# Steam shortcut needs no launch options), settings, saves and the log where the AppImage keeps
+# them (packaging/appimage/AppRun), then the game. Extra arguments go to the game.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/ng2-recomp
+data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/ng2-recomp
+mkdir -p "$config_dir" "$data_dir"
+
+# What earlier ARM builds wrote, moved once: settings and the pipeline list from next to the
+# program, saves from the SDK's default folder.
+for file in ng2.toml ng2-pipelines.bin; do
+  if [ -f "$here/$file" ] && [ ! -e "$config_dir/$file" ]; then mv "$here/$file" "$config_dir/$file"; fi
+done
+old_saves=${XDG_DATA_HOME:-$HOME/.local/share}/ng2
+if [ -d "$old_saves" ] && [ ! -e "$data_dir/user" ]; then mv "$old_saves" "$data_dir/user"; fi
+mkdir -p "$data_dir/user"
+
+export NG2_CONFIG=${NG2_CONFIG:-$config_dir/ng2.toml}
+exec "$here/ng2.bin" --game_data_root="$here/game_files" --user_data_root="$data_dir/user" \
+  --log_file="$data_dir/ng2.log" "$@"

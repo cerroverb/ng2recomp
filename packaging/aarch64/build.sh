@@ -11,8 +11,8 @@
 # (cmake/toolchains/linux-aarch64-clang.cmake) and collects the program and the libraries it
 # needs that a system may lack in out/aarch64-dist.
 #
-# Needs: thirdparty/ffmpeg-n9.0.2 (github.com/FFmpeg/FFmpeg, tag n9.0.2), cmake, ninja, clang,
-# lld, llvm-ar, gpgv and the Ubuntu archive keyring (/usr/share/keyrings, for the sysroot).
+# Needs: cmake, ninja, clang, lld, llvm-ar, curl, bsdtar, Python 3.11+, gpgv and the Ubuntu archive
+# keyring (/usr/share/keyrings/ubuntu-archive-keyring.gpg, for the sysroot).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -20,17 +20,32 @@ repo=$(cd "$here/../.." && pwd)
 toolchain=$repo/cmake/toolchains/linux-aarch64-clang.cmake
 sdk=$repo/thirdparty/rexglue-sdk
 sysroot=$repo/out/aarch64-sysroot
-ffmpeg_src=$repo/thirdparty/ffmpeg-n9.0.2
+deps=$repo/out/aarch64-deps
 logs=$repo/out/logs
 dist=$repo/out/aarch64-dist
 jobs=${JOBS:-$(nproc)}
-mkdir -p "$logs"
+mkdir -p "$logs" "$deps"
 
 [ -f "$repo/out/build/linux-amd64-release/shaders/ng2_shader_cache.cpp" ] ||
     { echo "No native build: build out/build/linux-amd64-release first (README)." >&2; exit 1; }
+# FFmpeg 9.0.2's source, the version the AppImage builds (packaging/appimage/Dockerfile), as
+# FFmpeg's GitHub tag, checked against its SHA-256 before anything is built.
+ffmpeg=ffmpeg-n9.0.2
+ffmpeg_url=https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.2.tar.gz
+ffmpeg_sha256=6e374ed621e48faa40639307dff48ba6fe574a509977956d2cce9669b7cc27e9
+ffmpeg_src=$deps/FFmpeg-n9.0.2
+if [ ! -f "$ffmpeg_src/.sha256" ] || [ "$(cat "$ffmpeg_src/.sha256")" != "$ffmpeg_sha256" ]; then
+    [ -s "$deps/$ffmpeg.tar.gz" ] || curl -fL -o "$deps/$ffmpeg.tar.gz" "$ffmpeg_url" ||
+        { echo "FFmpeg's source is gone from $ffmpeg_url: put $ffmpeg.tar.gz in $deps." >&2; exit 1; }
+    echo "$ffmpeg_sha256  $deps/$ffmpeg.tar.gz" | sha256sum -c --quiet
+    rm -rf "$ffmpeg_src" && bsdtar -xf "$deps/$ffmpeg.tar.gz" -C "$deps"
+    echo "$ffmpeg_sha256" > "$ffmpeg_src/.sha256"
+fi
+
 # The sysroot: what the SDK's own linux-arm64 build installs (its _build-platform.yaml) and the
 # AppImage's Dockerfile, as Ubuntu 24.04 arm64 packages.
-[ -f "$sysroot/usr/lib/aarch64-linux-gnu/libc.so.6" ] ||
+# (fetch-sysroot.py renames it into place once complete.)
+[ -d "$sysroot" ] ||
     python3 -I "$here/fetch-sysroot.py" "$repo/out/noble-dl" "$sysroot" \
         libc6-dev libstdc++-13-dev libgcc-13-dev linux-libc-dev libzstd-dev \
         libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxrandr-dev libxcursor-dev \
@@ -77,16 +92,15 @@ cmake -S "$repo" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
     ${NG2_CMAKE_ARGS:-} >"$logs/ng2-arm64-configure.log"
 cmake --build "$build" -j"$jobs" --target ng2 >"$logs/ng2-arm64-build.log"
 
-# The program (ng2.bin) with a start script that gives it the game_files folder next to it, so a
-# Steam shortcut to ng2 needs no launch options; the SDK's runtime and GPU plugin (the build
-# stages them next to it) and FFmpeg ($ORIGIN rpath), the pipeline seed and the licences.
+# The program (ng2.bin) with its start script (packaging/aarch64/ng2: the game_files folder next
+# to it, settings, saves and the log where the AppImage keeps them); the SDK's runtime and GPU
+# plugin (the build stages them next to it) and FFmpeg ($ORIGIN rpath), the pipeline seed and the
+# licences.
 # Vulkan, the GPU driver, Wayland and the sound server are the system's.
 rm -rf "${dist:?}"
 mkdir -p "$dist/licenses"
 llvm-strip -o "$dist/ng2.bin" "$build/ng2"
-printf '%s\n' '#!/bin/sh' 'here=$(dirname "$(readlink -f "$0")")' \
-    'exec "$here/ng2.bin" --game_data_root="$here/game_files" "$@"' > "$dist/ng2"
-chmod +x "$dist/ng2"
+install -m 755 "$here/ng2" "$dist/ng2"
 for lib in "$build"/lib*.so*; do cp -P "$lib" "$dist/"; done
 for lib in avformat avcodec avutil swresample swscale; do
     cp -P "$sysroot/usr/lib/lib$lib.so."* "$dist/"

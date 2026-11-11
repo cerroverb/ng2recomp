@@ -7,6 +7,8 @@
 #
 #   python3 -I packaging/aarch64/fetch-sysroot.py <download dir> <sysroot> <package>...
 #
+# Needs Python 3.11+ (hashlib.file_digest), bsdtar and gpgv.
+#
 # The chain of checks: each suite's InRelease is verified with gpgv against the Ubuntu archive
 # keyring (Arch's ubuntu-keyring package), the package lists against the SHA-256 sums in it,
 # and every package against the SHA-256 sum in the lists.
@@ -14,6 +16,7 @@ import hashlib
 import lzma
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -98,13 +101,19 @@ def main():
         queue.extend(alternatives(fields.get("Pre-Depends", "")))
         queue.extend(alternatives(fields.get("Depends", "")))
 
-    # Ubuntu's merged /usr, made first so packages that still ship files in /lib land in /usr/lib
-    # (-P: bsdtar otherwise refuses to unpack through a link).
-    os.makedirs(sysroot, exist_ok=True)
+    # Unpacked next to the sysroot and renamed into place at the end, so a run that stops leaves
+    # no sysroot that looks complete (the next run starts it again).
+    work = sysroot + ".part"
+    if os.path.lexists(work):
+        shutil.rmtree(work)
+    # Ubuntu's merged /usr: what packages still ship in /bin, /sbin and /lib is unpacked into
+    # /usr (bsdtar -s), so nothing is written through a link; the links are made for the paths
+    # the linker scripts name (libc.so: /lib/aarch64-linux-gnu/...).
+    merged = []
     for top in ("bin", "sbin", "lib"):
-        os.makedirs(os.path.join(sysroot, "usr", top), exist_ok=True)
-        if not os.path.lexists(os.path.join(sysroot, top)):
-            os.symlink(f"usr/{top}", os.path.join(sysroot, top))
+        merged += ["-s", rf"|^\./{top}/|./usr/{top}/|", "-s", rf"|^\./{top}$|./usr/{top}|"]
+        os.makedirs(os.path.join(work, "usr", top))
+        os.symlink(f"usr/{top}", os.path.join(work, top))
     for name in sorted(chosen):
         fields = chosen[name]
         path = fetch(f"{ARCHIVE}/{fields['Filename']}",
@@ -115,7 +124,7 @@ def main():
         members = subprocess.run(["bsdtar", "-tf", path], check=True, capture_output=True,
                                  text=True).stdout.split()
         data = next(member for member in members if member.startswith("data.tar"))
-        unpack = subprocess.Popen(["bsdtar", "-xPf", "-", "-C", sysroot], stdin=subprocess.PIPE)
+        unpack = subprocess.Popen(["bsdtar", "-xf", "-", "-C", work, *merged], stdin=subprocess.PIPE)
         subprocess.run(["bsdtar", "-xOf", path, data], check=True, stdout=unpack.stdin)
         unpack.stdin.close()
         if unpack.wait():
@@ -123,13 +132,14 @@ def main():
         print(name, fields["Version"])
 
     # Absolute links made relative, so they stay inside the sysroot.
-    for root, dirs, files in os.walk(sysroot):
+    for root, dirs, files in os.walk(work):
         for entry in dirs + files:
             link = os.path.join(root, entry)
             if os.path.islink(link) and os.readlink(link).startswith("/"):
-                target = os.path.join(sysroot, os.readlink(link).lstrip("/"))
+                target = os.path.join(work, os.readlink(link).lstrip("/"))
                 os.remove(link)
                 os.symlink(os.path.relpath(target, root), link)
+    os.rename(work, sysroot)
 
 
 main()
