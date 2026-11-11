@@ -1,6 +1,6 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
-// Fixes for the game's own bugs that its timing on the console hid.
+// Fixes for the game's own bugs that the console hid.
 //
 // Stale object scripts (#94): an object's setup and cleanup run lists of
 // commands through seven interpreters (sub_8248FD20 ... sub_8248FFC0, one
@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -124,3 +125,24 @@ REX_HOOK_RAW(sub_8248FE70) { RunCommands(ctx, base, 12, 0x8248FEBC); }
 REX_HOOK_RAW(sub_8248FEE0) { RunCommands(ctx, base, 16, 0x8248FF2C); }
 REX_HOOK_RAW(sub_8248FF50) { RunCommands(ctx, base, 20, 0x8248FF9C); }
 REX_HOOK_RAW(sub_8248FFC0) { RunCommands(ctx, base, 24, 0x8249000C); }
+
+// Objects faded out for good (#61, Chapter 6's church window): objects between
+// the camera and Ryu are faded out and back in (sub_823182A8 each frame, the
+// test sub_823D1BB0: the camera against the object's collision shapes). For a
+// shape it has no case for (the window's box, 0x91000004), the test goes on
+// with locals only a capsule sets (the path flags at +273/+274 of its 848-byte
+// frame and the capsule's ends at +240/+256), read unwritten from the stack.
+// What the console left there passed; here it was a stack address, the
+// distance came out NaN and counted as the camera inside, so the window stayed
+// faded out (until a main weapon change left other values there). The frame is
+// cleared first, with the bone at +273 set to none (255; 0 would place the
+// shape at bone 0, or read a matrix at address 0 for an object without
+// bones): unset, the shape is a point at the object's origin, faded only with
+// the camera on it. The save area (the top 208 bytes) is left alone.
+REX_EXTERN(__imp__sub_823D1BB0);
+REX_HOOK_RAW(sub_823D1BB0) {
+  uint8_t* frame = ng2::guest::Virtual(ctx.r1.u32 - 848);
+  std::memset(frame, 0, 848 - 208);
+  frame[273] = 0xFF;
+  __imp__sub_823D1BB0(ctx, base);
+}
