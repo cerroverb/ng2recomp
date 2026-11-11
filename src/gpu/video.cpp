@@ -2117,6 +2117,8 @@ class Presenter {
       int64_t presentStart = SteadyNs();
       if (!g_swapChain->present(item.index, &item.semaphore, 1)) {
         failed = true;
+      } else {
+        g_picturesPresented.fetch_add(1, std::memory_order_relaxed);
       }
       lastId_ = g_swapChain->getPresentId();
       if (item.inputNs) {
@@ -2134,7 +2136,11 @@ class Presenter {
       if (item.timed) {
         static int64_t lastNs = 0, lateSum = 0, lateMax = 0, gapMin = INT64_MAX, gapMax = 0;
         static uint32_t count = 0, gaps = 0, short4 = 0, long15 = 0;
-        int64_t late = presentStart - item.atNs;
+        // (one hurried out, its time dropped: not late, counted apart; its
+        // time 0 made the average hours late)
+        static uint32_t hurried = 0;
+        int64_t late = item.atNs ? presentStart - item.atNs : 0;
+        hurried += item.atNs == 0;
         lateSum += late, lateMax = std::max(lateMax, late);
         if (lastNs && presentStart - lastNs < 100'000'000) {
           int64_t gap = presentStart - lastNs;
@@ -6308,6 +6314,9 @@ void Present(HostTexture* frontBuffer) {
         EvenOutPresent();
         int64_t presentStart = SteadyNs();
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
+        if (g_swapChainValid) {
+          g_picturesPresented.fetch_add(1, std::memory_order_relaxed);
+        }
         // A full FIFO queue blocks the acquire (AMD, Mesa) or the present
         // (NVIDIA): either counts.
         if (g_blockedNs + SteadyNs() - presentStart >= 1'500'000) {
