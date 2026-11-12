@@ -372,6 +372,26 @@ static void NoteBarrierWait(std::chrono::steady_clock::duration waited) {
 // only cleared by a completed barrier and only set again by its own thread
 // after that. Byte accesses only: the mask needn't be 8-byte aligned, and an
 // 8-byte lock across a cache line would be a split lock.
+// XAudio2's engine setup (sub_83774040: r4 -> its parameters, byte 2 the
+// processor mask, a worker thread per bit; 0 means 0x10, one worker on
+// hardware thread 4). NG2 asks for 0x30, two workers that meet at the barrier
+// below every pass; on a busy 4-core PC one is nearly always late and the
+// sound runs dry (#39). NG2_AUDIO_ONE_THREAD=1: one worker does the passes.
+REX_EXTERN(__imp__sub_83774040);
+REX_HOOK_RAW(sub_83774040) {
+  static const bool one = [] {
+    const char* v = std::getenv("NG2_AUDIO_ONE_THREAD");
+    return v && v[0] == '1';
+  }();
+  uint8_t* mask = ng2::guest::Virtual(ctx.r4.u32 + 2);
+  REXLOG_INFO("audio: XAudio2 processor mask {:#04x}{}", *mask,
+              one ? ", one worker instead (NG2_AUDIO_ONE_THREAD)" : "");
+  if (one) {
+    *mask = 0x10;
+  }
+  __imp__sub_83774040(ctx, base);
+}
+
 REX_EXTERN(__imp__sub_83774800);
 REX_HOOK_RAW(sub_83774800) {
   // NG2_GAME_AUDIO_BARRIER=1: the game's own barrier (for comparisons).
