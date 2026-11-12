@@ -275,6 +275,7 @@ folder, zipped. For a crash or a freeze, attach the log (`ng2.log`, above).
 - More gameplay settings
 - More visual settings
 - Rebindable controls in RECOMP SETTINGS (for now the keys are set in `ng2.toml`)
+- An Android port
 
 ## Building from source
 
