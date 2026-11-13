@@ -357,6 +357,9 @@ struct Profile {
   }();
   uint64_t nanoseconds[size_t(Stage::kCount)] = {};
   uint64_t comparedBytes = 0, uploadedBytes = 0, frames = 0;
+  // (the end of frame's second look at the frame's ranges; bytes compared by
+  // ranges unchanged for over a second but checked every frame)
+  uint64_t finishNs = 0, finishBytes = 0, quietBytes = 0;
   uint64_t textureLookups = 0, hashedBytes = 0, texturesMade = 0, textureMadeBytes = 0;
   // GPU time (timestamps): whole frames, their resolves and their present pass.
   uint64_t gpuNs = 0, gpuResolveNs = 0, gpuPresentNs = 0, gpuFrames = 0;
@@ -647,9 +650,12 @@ void ReportProfile() {
   for (size_t i = 0; i < size_t(Stage::kCount); i++) {
     line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
   }
-  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB; textures {} "
+  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB ({:.1f} MB quiet for 1 s), "
+              "end of frame {:.1f} MB in {:.1f} ms, uploaded {:.1f} MB; textures {} "
               "looked up, {:.1f} MB hashed, {} made {:.1f} MB",
               g_profile.frames, line, g_profile.comparedBytes / 1048576.0,
+              g_profile.quietBytes / 1048576.0, g_profile.finishBytes / 1048576.0,
+              g_profile.finishNs / 1e6,
               g_profile.uploadedBytes / 1048576.0, g_profile.textureLookups,
               g_profile.hashedBytes / 1048576.0, g_profile.texturesMade,
               g_profile.textureMadeBytes / 1048576.0);
@@ -737,6 +743,7 @@ struct GuestMemoryRange {
   // Found written between its draws while checked once a frame: checked at every draw until
   // it stays unchanged for a while.
   bool dynamic = false;
+  uint8_t finishTurn = 0;  // (FinishGuestMemory's 1 in 8)
 };
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
 constexpr uint64_t kRangeStableFrames = 600;
@@ -2969,6 +2976,9 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   const uint8_t* source = guest::Physical(address);
   uint8_t* shadow = g_guestMemoryShadow + address;
   g_profile.comparedBytes += size;
+  if (!first && g_frameCount - range.changedFrame > 60) {
+    g_profile.quietBytes += size;
+  }
   // Upload only the span between the first and last block that differ.
   uint32_t begin = 0, end = size;
   if (!first) {
@@ -3005,10 +3015,26 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
 // End of frame, before submitting: fills the late ranges' copies and finds
 // the ranges written after their draws.
 void FinishGuestMemory() {
+  uint64_t startTicks = g_profile.enabled ? TimerTicks() : 0;
   // Find the ranges written after their draws first, against the shadow
   // before the late copies below change it.
   for (auto& frameRange : g_frameRanges) {
     auto& range = *frameRange.range;
+    // Unchanged for over a second: looked at here every 8th time it comes
+    // by (its own count, started from a hash of its address so each frame
+    // takes a share; stable ranges come by only every 4th frame). Nearly all
+    // the bytes here were such ranges, and this second comparison of them
+    // was most of the present stage on CPUs without a large cache (#78). One
+    // the game starts writing after its draws is still copied at its next
+    // draw, which marks it changed and so looked at here every frame again:
+    // found late a few frames later than before.
+    if (!frameRange.lateCopy && g_frameCount - range.changedFrame > 60 &&
+        (range.finishTurn++ + (frameRange.address * 0x9E3779B1u >> 29)) % 8 != 0) {
+      continue;
+    }
+    if (!frameRange.lateCopy) {
+      g_profile.finishBytes += frameRange.size;
+    }
     if (frameRange.lateCopy ||
         std::memcmp(guest::Physical(frameRange.address),
                     g_guestMemoryShadow + frameRange.address, frameRange.size) == 0) {
@@ -3038,6 +3064,9 @@ void FinishGuestMemory() {
   g_frameReads.clear();
   g_frameReadKeys.clear();
   g_frameMemExport = false;
+  if (g_profile.enabled) {
+    g_profile.finishNs += TicksToNs(TimerTicks() - startTicks);
+  }
 }
 
 // Shaders ---------------------------------------------------------------------
