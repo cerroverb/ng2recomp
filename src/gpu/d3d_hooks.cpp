@@ -17,6 +17,21 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#pragma comment(lib, "synchronization.lib")
+#elif defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <ctime>
+#endif
 #include <rex/hook.h>
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
@@ -392,6 +407,48 @@ REX_HOOK_RAW(sub_83774040) {
   __imp__sub_83774040(ctx, base);
 }
 
+// Threads asleep in the barrier below: a store wakes anyone only when there
+// are some (a wake with nobody asleep can still be a system call under Wine).
+// Both sides are sequentially consistent, so either the store sees the count
+// or the sleeper's check sees the store.
+static std::atomic<uint32_t> g_barrierSleepers{0};
+
+// Sleeps while *byte holds value, for up to timeout_us (or until woken by
+// BarrierWake on that byte, or spuriously: callers check again). The OS's own
+// wait, not std::atomic_ref::wait: that has no time limit (a byte changed by
+// any other code would leave a thread asleep for good, where the old loop kept
+// polling) and needs a newer libstdc++ than older systems carry.
+static void BarrierSleep(uint8_t* byte, uint8_t value, uint32_t timeout_us) {
+#if defined(_WIN32)
+  WaitOnAddress(byte, &value, 1, std::max<DWORD>(1, timeout_us / 1000));
+#elif defined(__linux__)
+  // A futex is a 4-byte word: the one holding the byte. A change to another
+  // byte of it before the kernel compares just returns at once.
+  uintptr_t at = reinterpret_cast<uintptr_t>(byte);
+  auto* word = reinterpret_cast<uint32_t*>(at & ~uintptr_t(3));
+  uint32_t current = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+  if (uint8_t(current >> ((at & 3) * 8)) != value) {
+    return;
+  }
+  timespec timeout{0, long(timeout_us) * 1000};
+  syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, current, &timeout, nullptr, 0);
+#else
+  (void)byte, (void)value, (void)timeout_us;
+  std::this_thread::yield();
+#endif
+}
+
+static void BarrierWake(uint8_t* byte) {
+#if defined(_WIN32)
+  WakeByAddressAll(byte);
+#elif defined(__linux__)
+  auto* word = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(byte) & ~uintptr_t(3));
+  syscall(SYS_futex, word, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#else
+  (void)byte;
+#endif
+}
+
 REX_EXTERN(__imp__sub_83774800);
 REX_HOOK_RAW(sub_83774800) {
   // NG2_GAME_AUDIO_BARRIER=1: the game's own barrier (for comparisons).
@@ -414,7 +471,18 @@ REX_HOOK_RAW(sub_83774800) {
   }
   uint8_t* mask = ng2::guest::Virtual(ctx.r4.u32);
   auto load = [&](uint32_t i) { return __atomic_load_n(mask + i, __ATOMIC_ACQUIRE); };
-  auto store = [&](uint32_t i, uint8_t v) { __atomic_store_n(mask + i, v, __ATOMIC_SEQ_CST); };
+  // Every store wakes whoever sleeps on that byte (below).
+  auto store = [&](uint32_t i, uint8_t v) {
+    __atomic_store_n(mask + i, v, __ATOMIC_SEQ_CST);
+    if (g_barrierSleepers.load(std::memory_order_seq_cst) != 0) {
+      BarrierWake(mask + i);
+    }
+  };
+  auto sleep_while = [&](uint32_t i, uint8_t value) {
+    g_barrierSleepers.fetch_add(1, std::memory_order_seq_cst);
+    BarrierSleep(mask + i, value, 2000);  // (2 ms: then looks again)
+    g_barrierSleepers.fetch_sub(1, std::memory_order_seq_cst);
+  };
   // Who takes part, read once as the game does: one byte per processor.
   bool expected[6];
   int clearer = -1;
@@ -425,20 +493,41 @@ REX_HOOK_RAW(sub_83774800) {
     }
   }
   store(cpu, 1);
-  // Timed from the first yield on (a few hundred microseconds in): a normal
-  // pass never gets there.
+  // Spins for a set time, then sleeps until the byte it waits on changes (2 ms
+  // at a time, looking again in between):
+  // spinning and yielding through a slow pass took about a third of both
+  // workers' time, which a 4-core PC needs for the passes themselves (#39).
+  // Time, not a count: a pause is about 10 cycles on older Intel CPUs and over
+  // 100 on newer ones. NG2_BARRIER_SPIN_US overrides it (for comparisons);
+  // NG2_BARRIER_YIELD=1 yields instead of sleeping, as before.
+  static const auto spin_time = std::chrono::microseconds([] {
+    const char* v = std::getenv("NG2_BARRIER_SPIN_US");
+    return v ? std::atoi(v) : 30;
+  }());
+  static const bool yield_only = [] {
+    const char* v = std::getenv("NG2_BARRIER_YIELD");
+    return v && v[0] == '1';
+  }();
+  const auto spin_start = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point slow_since{};
+  const auto slow = [&] { return slow_since != std::chrono::steady_clock::time_point{}; };
   for (uint32_t spins = 0;; spins++) {
     if (load(cpu) == 0) {
-      if (spins > 4096) {
+      if (slow()) {
         NoteBarrierWait(std::chrono::steady_clock::now() - slow_since);
       }
       return;  // completed
     }
+    // (for the clearer, an expected byte still clear: what it waits on)
+    int missing = -1;
     if (int(cpu) == clearer) {
       bool whole = true;
       for (uint32_t i = 0; i < 6; i++) {
-        whole &= (load(i) != 0) == expected[i];
+        bool set = load(i) != 0;
+        whole &= set == expected[i];
+        if (expected[i] && !set && missing < 0) {
+          missing = int(i);
+        }
       }
       if (whole) {
         for (uint32_t i = 0; i < 8; i++) {
@@ -447,17 +536,31 @@ REX_HOOK_RAW(sub_83774800) {
           }
         }
         store(cpu, 0);
-        if (spins > 4096) {
+        if (slow()) {
           NoteBarrierWait(std::chrono::steady_clock::now() - slow_since);
         }
         return;
       }
     }
-    if (spins == 4096) {
-      slow_since = std::chrono::steady_clock::now();
+    if (!slow() && (spins & 63) == 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - spin_start >= spin_time) {
+        slow_since = now;
+      }
     }
-    if (spins >= 4096) {
-      std::this_thread::yield();
+    if (slow()) {
+      // Sleeps while the byte holds the value read: own byte still set (a
+      // waiter), or the missing one still clear (the clearer). The store
+      // that changes it wakes it; one already made returns at once.
+      if (yield_only) {
+        std::this_thread::yield();
+      } else if (int(cpu) != clearer) {
+        sleep_while(cpu, 1);
+      } else if (missing >= 0) {
+        sleep_while(uint32_t(missing), 0);
+      } else {
+        std::this_thread::yield();  // (a byte set that shouldn't be: as before)
+      }
     } else {
 #if defined(__x86_64__) || defined(_M_X64)
       __builtin_ia32_pause();
