@@ -1,0 +1,42 @@
+From 3c7d9730185711f841b5b362bbd553350b5fea39 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Fri, 13 Nov 2026 03:53:30 +0000
+Subject: [PATCH] Byte swaps with run-time shift amounts: Intel's compiler
+ folds swap-then-mask wrongly (#18)
+
+---
+ XenosRecomp/shader_common.h | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 2479cf0..d953c86 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -297,15 +297,17 @@ float computeMipLevel(float2 pixelCoord)
+     return max(0.0, 0.5 * log2(deltaMaxSqr));
+ }
+ 
++// Byte i of the result is byte (i ^ x) of v: 8in16 swaps bytes in halves
++// (x = 1), 16in32 swaps halves (x = 2), 8in32 reverses (x = 3). Written with
++// shift amounts picked at run time rather than as the usual shift-and-or byte
++// swap: Intel's Windows shader compiler turns "byte swap, then keep the low
++// byte" into the low byte of the unswapped value, so vertex colours came out
++// with alpha in blue (a blue sky, blue slider tracks, yellow fading text, #18).
+ uint memExportSwap32(uint v, uint endian)
+ {
+-    if (endian == 1)
+-        return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+-    if (endian == 3)
+-        return (v << 16) | (v >> 16);
+-    if (endian == 2 || endian == 4 || endian == 5)
+-        return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+-    return v;
++    uint x = endian == 1 ? 1u : (endian == 3 ? 2u : (endian == 2 || endian == 4 || endian == 5 ? 3u : 0u));
++    uint4 bytes = (v >> ((uint4(0, 1, 2, 3) ^ x) * 8u)) & 0xFFu;
++    return bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
+ }
+ 
+ uint4 memExportSwap(uint4 v, uint endian)
+-- 
+2.56.1
+
