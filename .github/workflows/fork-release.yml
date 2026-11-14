@@ -128,7 +128,8 @@ jobs:
           cp "$RUNNER_TEMP/assets/game_files/default.xex" "$RUNNER_TEMP/assets/game_files/default.xexp" game_files/
 
       - name: Packages
-        # (as packaging/appimage/Dockerfile, plus bsdtar for packaging/aarch64/fetch-sysroot.py)
+        # (as packaging/appimage/Dockerfile, plus bsdtar for packaging/aarch64/fetch-sysroot.py and FFmpeg's
+        # headers, which the native configure asks for)
         run: |
           wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
           sudo bash "$RUNNER_TEMP/llvm.sh" "$LLVM"
@@ -137,7 +138,8 @@ jobs:
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
             libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl-dev \
             libgbm-dev libdrm-dev libvulkan-dev libpulse-dev libpipewire-0.3-dev libasound2-dev libdbus-1-dev \
-            libudev-dev libzstd-dev libx11-xcb-dev libxcb1-dev
+            libudev-dev libzstd-dev libx11-xcb-dev libxcb1-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libswscale-dev
           for tool in clang clang++ ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-strip; do
             sudo ln -sf /usr/bin/$tool-$LLVM /usr/local/bin/$tool
           done
