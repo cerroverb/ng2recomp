@@ -1,0 +1,211 @@
+name: ARM release
+
+# When gamboozino/ng2recomp has a release newer than this fork's latest, merge its tag into aarch64-linux, build
+# it for 64-bit ARM Linux (packaging/aarch64/build.sh, cross-compiled after the native code generation and shader
+# translation, which run on x86-64 only) and publish NinjaGaiden2-linux-arm64.tar.gz as release <tag>.<revision>.
+# Ported from cerroverb/MHGURecomp-aarch64's fork-release.yml and ng2recomp-release/arm-release.sh.
+# The game's default.xex and Title Update 3's default.xexp come from the private repo cerroverb/ng2-private-assets
+# (secret ASSETS_DEPLOY_KEY). A merge conflict is resolved by Claude Code when the secret CLAUDE_CODE_OAUTH_TOKEN
+# is set; otherwise the run fails.
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Fork-only update of the same upstream release: 2, 3, ... (1: a new upstream release)"
+        default: "1"
+      publish:
+        description: "Push the merge and publish the release (off: build only)"
+        type: boolean
+        default: true
+      draft:
+        description: "Publish as a draft"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: gamboozino/ng2recomp
+  BRANCH: aarch64-linux
+  LLVM: "22"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      up: ${{ steps.v.outputs.up }}
+      go: ${{ steps.v.outputs.go }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision || '1' }}
+          PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          up=$(gh api repos/$UPSTREAM/releases/latest --jq .tag_name)
+          ours=$(gh api repos/$GITHUB_REPOSITORY/releases/latest --jq .tag_name 2>/dev/null || echo none)
+          echo "upstream $up, this fork $ours"
+          go=true
+          if [ "${ours%.*}" = "$up" ] && [ "$REVISION" = 1 ] && [ "$PUBLISH" = true ]; then go=false; echo "up to date"; fi
+          echo "up=$up" >> "$GITHUB_OUTPUT"; echo "go=$go" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check
+    if: needs.check.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      UP: ${{ needs.check.outputs.up }}
+      REVISION: ${{ inputs.revision || '1' }}
+      PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+      DRAFT: ${{ inputs.draft || false }}
+      HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Merge the upstream release
+        id: merge
+        run: |
+          git config --global user.name cerroverb
+          git config --global user.email 84094990+cerroverb@users.noreply.github.com
+          git fetch -q --tags "https://github.com/$UPSTREAM.git"
+          if git merge-base --is-ancestor "$UP" HEAD; then echo "$UP is already merged"; exit 0; fi
+          if git merge -q --no-edit -m "Merge $UP" "$UP"; then exit 0; fi
+          files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          echo "conflicts in: $files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          [ "$HAS_CLAUDE" = true ] || { echo "::error::Merge conflict in $files and no CLAUDE_CODE_OAUTH_TOKEN"; exit 1; }
+
+      - name: Resolve the conflicts (Claude Code)
+        if: steps.merge.outputs.files != ''
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This repository is a fork of gamboozino/ng2recomp, stopped in a merge of upstream tag ${{ env.UP }} with conflicts in: ${{ steps.merge.outputs.files }}
+            Resolve only those conflicts with the Edit tool. Keep every platform-specific change of this fork and every upstream change: read both sides with git log and git show to learn why each exists. If upstream restructured the code, carry the fork's change over into the new structure. Add no new behaviour, and change nothing outside the conflicts. Keep each file's line endings exactly. Remove all conflict markers. Do not stage or commit. If a conflict cannot be resolved with confidence, leave its markers in place and say why.
+          claude_args: >-
+            --allowedTools "Read,Edit,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git status:*),Bash(git blame:*)"
+            --disallowedTools "Bash(git push:*),Bash(git commit:*),Bash(git add:*),Bash(curl:*),Bash(gh:*)"
+
+      - name: Check and commit the resolved merge
+        if: steps.merge.outputs.files != ''
+        env:
+          FILES: ${{ steps.merge.outputs.files }}
+        run: |
+          left=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+          [ "$left" = "$FILES" ] || { echo "::error::Unexpected files in conflict: $left"; exit 1; }
+          if grep -nE '^(<<<<<<<|=======$|>>>>>>>)' $FILES; then echo "::error::Conflict markers left"; exit 1; fi
+          git add $FILES && git commit -q --no-edit
+
+      - name: Disk space
+        # (the runner's preinstalled Android SDK, .NET and GHC: the build needs about 10 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Private build inputs
+        env:
+          KEY: ${{ secrets.ASSETS_DEPLOY_KEY }}
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/assets_key"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/assets_key"
+          GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/assets_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+            git clone -q --depth 1 git@github.com:cerroverb/ng2-private-assets.git "$RUNNER_TEMP/assets"
+          rm -f "$RUNNER_TEMP/assets_key"
+          mkdir -p game_files
+          cp "$RUNNER_TEMP/assets/game_files/default.xex" "$RUNNER_TEMP/assets/game_files/default.xexp" game_files/
+
+      - name: Packages
+        # (as packaging/appimage/Dockerfile, plus bsdtar for packaging/aarch64/fetch-sysroot.py)
+        run: |
+          wget -qO "$RUNNER_TEMP/llvm.sh" https://apt.llvm.org/llvm.sh
+          sudo bash "$RUNNER_TEMP/llvm.sh" "$LLVM"
+          sudo apt-get install -y -q clang-$LLVM lld-$LLVM llvm-$LLVM cmake ninja-build python3 pkg-config nasm make \
+            libarchive-tools gpgv ubuntu-keyring xz-utils libstdc++-13-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl-dev \
+            libgbm-dev libdrm-dev libvulkan-dev libpulse-dev libpipewire-0.3-dev libasound2-dev libdbus-1-dev \
+            libudev-dev libzstd-dev libx11-xcb-dev libxcb1-dev
+          for tool in clang clang++ ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-strip; do
+            sudo ln -sf /usr/bin/$tool-$LLVM /usr/local/bin/$tool
+          done
+          clang --version | head -1
+
+      - name: SDK, XenosRecomp and plume at the pinned versions, with the port's patches
+        # (the pins as the README's build steps name them)
+        run: |
+          pin() { sed -n "s/.*$1 && git checkout \([^ ]*\) .*/\1/p" README.md | head -1; }
+          get() {  # <dir> <url> <pin> <patch dir> [submodules...]
+            local dir=$1 url=$2 rev=$3 patches=$4; shift 4
+            [ -n "$rev" ] || { echo "::error::no pin for $dir in the README"; exit 1; }
+            git clone -q "$url" "$dir" && git -C "$dir" checkout -q --detach "$rev"
+            git -C "$dir" submodule update -q --init --recursive "$@"
+            git -C "$dir" am -q "$patches"/*.patch
+          }
+          get thirdparty/rexglue-sdk https://github.com/rexglue/rexglue-sdk "$(pin rexglue-sdk)" patches/rexglue-sdk
+          get thirdparty/XenosRecomp https://github.com/hedge-dev/XenosRecomp "$(pin XenosRecomp)" patches/xenosrecomp
+          get thirdparty/plume https://github.com/renderbag/plume "$(pin plume)" patches/plume \
+            contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
+
+      - name: Native SDK, code generation and shaders
+        # (README build steps 1 and 4: the code generator's output and the shader cache the ARM build uses)
+        run: |
+          (cd thirdparty/rexglue-sdk && cmake --preset linux-amd64 &&
+           cmake --build out/build/linux-amd64 --config Release --target install -j"$(nproc)")
+          native=out/build/linux-amd64-release
+          cmake --preset linux-amd64-release -DCMAKE_PREFIX_PATH="$PWD/thirdparty/rexglue-sdk/out/install/linux-amd64" \
+            -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF
+          cmake --build $native --target ng2_codegen
+          cmake --build $native -j"$(nproc)" --target "$PWD/$native/shaders/ng2_shader_cache.cpp"
+          rm -rf thirdparty/rexglue-sdk/out/build/linux-amd64
+
+      - name: Build for aarch64
+        run: |
+          JOBS=$(nproc) packaging/aarch64/build.sh || { tail -n 60 out/logs/*arm64*.log out/logs/ffmpeg*.log; exit 1; }
+          file out/aarch64-dist/ng2.bin | grep -q 'ARM aarch64' || { echo "::error::ng2.bin is not an aarch64 program"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/dist"
+          cp -a out/aarch64-dist "$RUNNER_TEMP/dist/NinjaGaiden2-arm64"
+          tar -C "$RUNNER_TEMP/dist" -czf "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz" NinjaGaiden2-arm64
+          ls -l "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz"
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: out/logs
+          if-no-files-found: ignore
+
+      - name: Publish
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$UP.$REVISION
+          file=$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz
+          git push -q origin "HEAD:$BRANCH"
+          git rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
+            git tag -a "$tag" -m "Ninja Gaiden II Recompiled $UP for 64-bit ARM Linux"
+          git push -q origin "refs/tags/$tag"
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Ninja Gaiden II Recompiled $UP for 64-bit ARM Linux, built from upstream $UPSTREAM $UP.
+
+          Unpack it, put your extracted game in NinjaGaiden2-arm64/game_files with Title Update 3's default.xexp next to default.xex, DLC in game_files/dlc, and run ng2. No game data is included. Needs glibc 2.38+ and Vulkan 1.3.
+          EOF
+          gh release create "$tag" "$file" --verify-tag --title "Ninja Gaiden II Recompiled $tag for 64-bit ARM Linux" \
+            --notes-file "$RUNNER_TEMP/notes.md" $([ "$DRAFT" = true ] && echo --draft)
+          digest=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$tag\") | .assets[0].digest")
+          [ "$digest" = "sha256:$(sha256sum "$file" | cut -d' ' -f1)" ] || { echo "::error::uploaded digest $digest differs"; exit 1; }
+          echo "published $tag" >> "$GITHUB_STEP_SUMMARY"
