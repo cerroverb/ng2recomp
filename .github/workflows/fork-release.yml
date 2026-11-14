@@ -152,7 +152,7 @@ jobs:
             [ -n "$rev" ] || { echo "::error::no pin for $dir in the README"; exit 1; }
             git clone -q "$url" "$dir" && git -C "$dir" checkout -q --detach "$rev"
             git -C "$dir" submodule update -q --init --recursive "$@"
-            git -C "$dir" am -q "$patches"/*.patch
+            git -C "$dir" am -q "$GITHUB_WORKSPACE/$patches"/*.patch
           }
           get thirdparty/rexglue-sdk https://github.com/rexglue/rexglue-sdk "$(pin rexglue-sdk)" patches/rexglue-sdk
           get thirdparty/XenosRecomp https://github.com/hedge-dev/XenosRecomp "$(pin XenosRecomp)" patches/xenosrecomp
