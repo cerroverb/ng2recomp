@@ -31,6 +31,14 @@
 // Hi-Res Font: the font's glyphs are rasterised at twice their size and
 // their metrics halved (read at start: glyphs already made keep their size).
 //
+// Shadows Hi-Res (Graphics page): the game keeps two shadow maps, 1024x1024
+// and 512x512 (both made at start, sub_82332240), and each frame
+// sub_823347E8 asks for the 512 one (0x83C110EC = 2; 1 is the 1024 one)
+// when none of its 160 entries (sub_82334F18) wants the big one, which is
+// how it is in a fight. The main loop (sub_822F0CA8) takes the request once a
+// frame. With Hi-Res a request for 512 is turned into one for 1024. (The
+// option is Master Edition's "Hi-res Shadows", by alicenotmech.)
+//
 // Cheats: All Weapons and Ninpo puts every weapon and ninpo (Level 1 or 3)
 // and full ammo in the save's inventory (save +0x30: 128 slots of id, count,
 // flags) at a new game and at each stage's start; All Crystal Skulls counts
@@ -56,6 +64,7 @@ REXCVAR_DEFINE_BOOL(auto_chapter_screen, false, "Extras",
 REXCVAR_DEFINE_INT32(hud_mode, 0, "Extras", "0: shown, 1: fades out when not fighting, 2: hidden");
 REXCVAR_DEFINE_BOOL(post_effects, true, "Extras", "The blur and white flashes (off: none)");
 REXCVAR_DEFINE_BOOL(smooth_hud, false, "Extras", "The HUD's and menus' pictures always filtered");
+REXCVAR_DEFINE_INT32(shadows, 0, "Video", "0: the game's (512x512 in fights), 1: hi-res (1024x1024 always)");
 REXCVAR_DEFINE_BOOL(hires_font, false, "Extras",
                     "Text drawn from glyphs twice the size (from the next start)");
 REXCVAR_DEFINE_INT32(cheat_all_weapons, 0, "Cheats",
@@ -353,6 +362,22 @@ REX_EXTERN(__imp__sub_8363CD80);
 REX_HOOK_RAW(sub_8363CD80) {
   if (!!REXCVAR_GET(post_effects)) {
     __imp__sub_8363CD80(ctx, base);
+  }
+}
+// Shadows Hi-Res: the frame's request for the small shadow map (2) becomes
+// one for the big one (1), and with the small one in use and nothing asked
+// (stage setup's request taken while a script runs, which skips the game's
+// own), the big one is asked for.
+constexpr uint32_t kShadowMapRequest = 0x83C110EC;
+constexpr uint32_t kShadowMapIndex = 0x83C11048;  // 0: the big map, 1: the small one
+REX_EXTERN(__imp__sub_823347E8);
+REX_HOOK_RAW(sub_823347E8) {
+  __imp__sub_823347E8(ctx, base);
+  if (REXCVAR_GET(shadows) == 1) {
+    uint32_t request = ng2::guest::Load32(kShadowMapRequest);
+    if (request == 2 || (request == 0 && ng2::guest::Load32(kShadowMapIndex) == 1)) {
+      Store32(kShadowMapRequest, 1);
+    }
   }
 }
 bool Ng2PostBlur() {

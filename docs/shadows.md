@@ -1,7 +1,7 @@
 # Shadows (notes)
 
 How the game's character and room shadows work, what was measured for #92 and #31, and
-the "Shadows" option (Graphics page, `shadow_fit`). Addresses are Title Update 3.
+the "Shadows" option (Graphics page, `shadows`). Addresses are Title Update 3.
 
 ## The game's shadow map
 
@@ -9,7 +9,7 @@ the "Shadows" option (Graphics page, `shadow_fit`). Addresses are Title Update 3
   48 degrees above the horizon, [0.656, -0.746, 0.11]). Because the light is oblique, the
   shadow of a character in the air lands to one side of them: that is the game's own look.
 - Each frame the render thread (`sub_822F16D0`) runs the shadow pass `sub_8231C948`. It
-  draws the casters into a 512x512 depth map (format 33), which two passes blur (pixel shaders
+  draws the casters into a 1024x1024 or 512x512 depth map (format 33; see below), which two passes blur (pixel shaders
   1A99B35E, 1B603BC7) into variance moments (R16G16_SNORM). Receivers sample it at sampler 14
   (VSM: var = M2 - M1^2 + ShadowData.x, p = var / (var + d^2)).
 - The area the map covers is fitted each frame to the casters the game draws. It eases
@@ -57,50 +57,40 @@ Matrices are row vectors, one row per register, translation in the fourth.
 Shaders: the room casters' vertex shader is 14EA8C03; the character casters' are C3A47167,
 B69ABEF0 and FF6D3E3A. The first shadow draw of a frame is a character's.
 
-## Shadows "Steady"
+## Two shadow maps, and Shadows "Hi-Res"
 
-`ShadowFitCorrect` in src/gpu/video.cpp: Graphics page, `shadow_fit` 1.
+The game keeps two shadow maps, 1024x1024 and 512x512 (both made at start, `sub_82332240`), and
+uses the big one out of fights and the small one in them:
+- Each frame `sub_823347E8` goes through 160 entries (24 bytes each from `0x84C3DC60`), asking
+  `sub_82334F18` about each one. If any wants the big map it asks for it (`0x83C110EC` = 1), and
+  otherwise for the small one (2). It leaves the request alone while a script runs (the running
+  script's skip argument, the short at `0x84A69AD4`, is -1, 1 or 2).
+- Stage setup (`sub_83655FE0`, `sub_836584F8`, `sub_83672B38`) asks too.
+- The main loop (`sub_822F0CA8`) takes the request once a frame: the index at `0x83C11048`
+  (0 the big map, 1 the small one) picks the surfaces for that frame.
 
-Each frame it reads the game's light matrix from c29 at the first shadow-pass draw. In its
-place it uses a fixed area on Ryu:
-- 2 units half-width by default (`NG2_TEST_SHADOW_SIZE` tries another). The blur is a few
-  texels whatever the area, so a smaller area gives sharper, larger-looking shadows; the game's
-  is about 6 to 10 in Mission 1.
-- centred a unit above his feet (his position is the global `0x83CD8A80`; on his body, since
-  the light is oblique), on whole texels so still shadows don't shimmer.
+In Chapter 1's opening the map is 1024x1024 until the first fight, then 512x512. So in a fight
+the shadows are blurrier for two reasons: half the texels, over a larger area.
 
-The depth range stays the game's. Every caster and receiver matrix gets the same change in x
-and y:
+"Shadows" on the Graphics page (`shadows`), Hi-Res: after `sub_823347E8` a request for the small
+map is turned into one for the big one, and the big one is asked for whenever the small one
+is in use and nothing else is asked (src/extras.cpp), so fights keep 1024x1024. Mission 1 with
+it stays on the big map throughout, with the same pictures otherwise. alicenotmech's Master
+Edition mod for Xenia Edge has the same option ("Hi-res Shadows").
 
-    x' = x * scale + w * offset
+An earlier option, "Steady" (0.6.1), gave the map a fixed area on Ryu by correcting every caster
+and receiver matrix. It kept Ryu's shadow sharp, but enemies away from him lost theirs, and it
+only knew the 512x512 map. Hi-Res replaced it. The code is in commit 5031bf6.
 
-Characters further than about 2 units from Ryu across the light lose their shadows.
+## A patch posted in #92
 
-Steady isn't used, and the game's area is followed instead, when:
-- a script cutscene runs (the running script's skip argument at `0x84A69AD4` is non-zero;
-  unskippable ones have 0, so Steady still applies in them);
-- Ryu isn't inside the game's own area;
-- the game's area is already as tight as Steady's.
+A Xenia patch posted in #92 writes `0x60000000` to `0x8213F640`, `0x8214A8C0` and `0x8214A8C4`.
+On Title Update 3 all three are inside shaders:
+- `0x8213F640` is the last word of the header of the lit vertex shader for floors and walls (at
+  `0x8213F200`). The shader's converted code is the same with it.
+- The other two are in the skinned one (at `0x8214A2A0`). They change its fog band choice
+  (`FogNearMiddleFar`), not its shadow matrix.
 
-Moving in and out of Steady:
-- Into Steady: the centre goes to Ryu at once (where the map sits barely shows), and the size
-  eases to Steady's (20% of the gap a frame growing, 12% shrinking). Once within 1%, it is
-  Steady's exactly.
-- The game's area: its edges are followed, outward at 20% of the gap a frame and inward at 12%.
-- Taken at once: a new light (another room), a gap over 30 frames, or an area wanted more than
-  two half-sizes away.
-
-Edge effects: casters crossing the box edge are cut at it. The receivers' sampler clamps to a
-border, so the ground beyond reads the border, not the edge texels.
-
-Correctness: casters and receivers keep matching. On a real frame the corrected receiver
-equals the corrected caster times the bias to 1.5e-6.
-
-Which draws get corrected:
-- Casters: shadow-pass draws (no colour target, 512x512 depth) whose c29-c32 hold the matrix
-  the update read.
-- Receivers: draws whose shader declares ShadowMat_*. They keep the last correction until the
-  next shadow pass.
-
-An earlier version only eased the game's area. In Mission 1 it cut one-frame jumps over 5%
-from 52 to 1, but the shadows still shrank with enemies around.
+This port converts the game's shaders when it is built, so a patched shader isn't found ("not in
+the shader cache") and the patch does nothing here. Measured with it written into memory, the
+shadow map's area changed frame by frame exactly as without it.

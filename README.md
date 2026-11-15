@@ -29,7 +29,7 @@ is supported and optional: it can be added on the first start or later.
   PlayStation and Nintendo prompts, following the controller in use
 - Options from alicenotmech's Master Edition, in the port's own versions: skip the death screen,
   chapter cards that go on by themselves, a HUD that fades out when not fighting (or hidden),
-  no post-effects, smoother HUD and menus, a sharper font
+  no post-effects, smoother HUD and menus, a sharper font, hi-res shadows in fights
 - Skip intro and skip any cutscene; cheats: infinite health and ninpo, unlock difficulties and
   costumes, all weapons and ninpo, all crystal skulls, max health and ninpo
 - Low input latency and frame pacing on the display's own refreshes (options)
@@ -152,8 +152,8 @@ each defaults to the game's own behaviour.
 
 - **Graphics**: Render Scale (1x–8x, with the resolution it draws at, as "2x 2240x1168");
   Anti-Aliasing (off, or 2x MSAA as on the console, 4x, 8x); Texture Filtering (the game's, or
-  4x–16x anisotropic); Shadows (the game's, or Steady: a fixed area on Ryu, so shadows stay
-  sharp with enemies around); Bloom (on, reduced, off); Post-Effects (off: no blur, no white
+  4x–16x anisotropic); Shadows (the game's, or Hi-Res: the 1024x1024 shadow map in fights
+  too, where the game drops to 512x512); Bloom (on, reduced, off); Post-Effects (off: no blur, no white
   flashes)
 - **Display**: Window Mode (windowed, borderless, fullscreen) and Window Size; Aspect Ratio (16:9,
   16:10, 21:9, 32:9, 4:3); V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back

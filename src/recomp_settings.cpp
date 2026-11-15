@@ -215,8 +215,8 @@ constexpr Setting kSettings[] = {
     // (Short: a longer choice is squeezed narrow to fit.)
     {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate", u"2x"}, 4,
      "frame_interpolation", Kind::kLevel},
-    // The shadow map's area fixed on Ryu (gpu/video.cpp, ShadowFitCorrect).
-    {u"Shadows", {u"Original", u"Steady"}, 2, "shadow_fit", Kind::kLevel},
+    // The 1024x1024 shadow map in fights too (extras.cpp).
+    {u"Shadows", {u"Original", u"Hi-Res"}, 2, "shadows", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
