@@ -1,12 +1,17 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
-// Two of the game's busy-waits, which on the 360 had hardware threads to
-// themselves and here hold whole cores: on a 4-core handheld they take CPU
-// time from the threads they wait for.
+// Three of the game's busy-waits, which on the 360 had hardware threads to
+// themselves and here hold whole cores: on a 4-core PC they take CPU time
+// from the threads they wait for.
 //
 // The main loop (sub_822F34C0) hands each frame to the render thread, then
 // spins until the render thread has taken it (lwz r11 of 0x84C53430 until
 // it reads 0): nearly all of the main thread's time on a fast PC.
+//
+// The render thread (sub_822F16D0) spins the other way, until the main loop
+// has handed it the next frame (0x84C53430, then 0x84C53434, set): nearly a
+// whole core whenever the main loop is the slower one, the usual case on a
+// busy 4-core PC, where it starved the audio threads (#39).
 //
 // The render thread's frame limiter (sub_822F0BF8) spins until the vblank
 // count (0x84C55B50, from the vblank interrupt) is the word at 0x84C5342C
@@ -23,7 +28,7 @@
 // counts from that end, so a frame takes the interval unless its own work
 // took longer than that (where the console would also run late).
 //
-// Both back off: a few pause instructions, then yields, then short sleeps (yields on
+// All three back off: a few pause instructions, then yields, then short sleeps (yields on
 // Windows, whose sleeps are whole milliseconds).
 
 #include <chrono>
@@ -77,6 +82,11 @@ void Ng2FrameHandoffWait(PPCRegister& r11) {
   } else {
     ng2::video::NoteFrameTaken();  // (NG2_LATENCY_LOG)
   }
+}
+
+// At each loop's quit-flag check, reached only while the word is still 0.
+void Ng2FrameWait() {
+  Backoff();
 }
 
 void Ng2VblankWait() {

@@ -48,6 +48,17 @@ address = 0x822F3580
 name = "Ng2FrameHandoffWait"
 registers = ["r11"]
 
+# The render thread's waits for the main loop's next frame (src/frame_wait.cpp): for the
+# handoff word (0x84C53430) to be set, then for the word after it, each at the loop's check
+# of the quit flag, reached only while still waiting.
+[[midasm_hook]]
+address = 0x822F1858
+name = "Ng2FrameWait"
+
+[[midasm_hook]]
+address = 0x822F1874
+name = "Ng2FrameWait"
+
 # The render thread's wait for the vblank count to move on (src/frame_wait.cpp), at the
 # loop's low-priority hint (and r1,r1,r1), reached only while still waiting.
 [[midasm_hook]]

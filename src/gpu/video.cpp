@@ -132,6 +132,11 @@ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
 // Extras' Texture LOD Bias: the game's own mip bias (-1.5 on most textures),
 // or 0 or -1 for every texture (less shimmer at higher render scales).
 REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1");
+// Graphics' Shadows: the game's shadow map covers Ryu and the enemies it draws,
+// refitted each frame, so the shadows shrink with enemies around and jump in
+// size when one comes into view or leaves it (as on the console). Steady keeps
+// a fixed area on Ryu instead (ShadowFitCorrect).
+REXCVAR_DEFINE_INT32(shadow_fit, 0, "Video", "0: the game's, 1: steady");
 // Input Latency: Low waits, before drawing a frame, until the last one is
 // on screen (VK_KHR_present_wait), so no finished frame queues for the
 // display (FIFO's three images let two): about one or two refreshes less
@@ -792,6 +797,11 @@ struct GuestShader {
   std::vector<std::pair<uint8_t, uint8_t>> elements;
   // Pixel shaders: color outputs written (bit n = oCn).
   uint32_t colorOutputs = 0;
+  // Vertex shaders: the float registers of the light's matrices in the shader's
+  // constant table (-1: none), for Shadows "Steady" (ShadowFitCorrect).
+  int16_t viewProj = -1;       // "ViewProj": the light's in the shadow pass
+  int16_t worldViewProj = -1;  // "WorldViewProj": the same with the object's world
+  int16_t shadowMat = -1;      // "ShadowMat_LPB"/"ShadowMat_WLPB": a receiver's
 };
 std::unordered_map<uint32_t, std::unique_ptr<GuestShader>> g_guestShaders;
 std::unique_ptr<uint8_t[]> g_spirvCache;
@@ -934,6 +944,16 @@ int64_t g_traceFrames = 0, g_traceLeft = 0;
 // F7's first frame: each draw's vertex shader constants (256 x 16 bytes, as
 // the guest has them: big-endian), in draw order, beside its draw lines.
 FILE* g_traceConstants = nullptr;
+// NG2_TRACE_ALL_CONSTANTS=1: every traced frame's, and the pixel shader
+// constants (224 x 16 bytes) into ps-constants-<n>.bin too.
+FILE* g_tracePsConstants = nullptr;
+bool TraceAllConstants() {
+  static const bool all = [] {
+    const char* v = std::getenv("NG2_TRACE_ALL_CONSTANTS");
+    return v && *v == '1';
+  }();
+  return all;
+}
 thread_local std::string g_drawStack;  // NG2_TRACE_STACKS: the last draw's guest call chain
 
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
@@ -1164,6 +1184,9 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
       return RenderFormat::R8G8B8A8_UNORM;
     case xenos::TextureFormat::k_2_10_10_10:
+    // (the lens flare's sun test resolves its 1x1 counts into these: without
+    // a host texture they were dropped and the flare read stale memory, #95)
+    case xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16:
     case xenos::TextureFormat::k_16_16_16_16:
       return RenderFormat::R16G16B16A16_UNORM;
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
@@ -4916,6 +4939,212 @@ void FlushPendingDraw() {
   SubmitDraw(pending.record);
 }
 
+// Shadows "Steady" (shadow_fit 1). The game draws its shadow casters into a
+// 512x512 map with the light's orthographic matrix ("ViewProj" in the shadow
+// pass; "WorldViewProj" with an object's world), and its receivers find their
+// place in the map with the same matrix and a bias to texture space
+// ("ShadowMat_LPB"/"ShadowMat_WLPB"). The light's direction is fixed; the area
+// the map covers is fitted to what the game draws each frame and jumps when a
+// character comes into view or leaves it, and the more it covers, the blurrier
+// and smaller every shadow looks. Here the map covers a fixed area on Ryu
+// instead (the game's, eased, in cutscenes or when he isn't in it), and every
+// matrix of the light gets the same change in x and y, so casters and
+// receivers agree. The depth range stays the game's.
+struct ShadowFit {
+  bool valid = false;
+  uint64_t frame = 0;     // of the last update (the shadow pass's first draw)
+  uint32_t light[16] = {};  // the game's matrix then, as the guest's words
+  float axis[2][3] = {};
+  float low[2] = {}, high[2] = {};  // the eased area's edges along the axes
+  float scale[2] = {1.0f, 1.0f}, offset[2] = {};  // clip x' = x * scale + offset * w
+  bool steady = false;  // the area is Steady's on Ryu (else the game's, or on its way)
+  bool passCorrected = false;  // the last shadow pass's casters were changed
+};
+ShadowFit g_shadowFit;
+// Steady's area: half its width along each light axis, in world units (the
+// game's is about 6 to 10 in Mission 1, larger with enemies around). The blur
+// is a few texels whatever the area, so a smaller area gives sharper, larger
+// looking shadows, and fewer characters inside it. NG2_TEST_SHADOW_SIZE=<units>
+// tries another.
+float SteadyHalfSize() {
+  static const float size = [] {
+    const char* v = std::getenv("NG2_TEST_SHADOW_SIZE");
+    float f = v ? float(std::atof(v)) : 0.0f;
+    return f >= 1.0f && f <= 50.0f ? f : 2.0f;
+  }();
+  return size;
+}
+// The running script's skip argument (gameplay.cpp): non-zero in a cutscene.
+constexpr uint32_t kScriptSkip = 0x84A69AD4;
+// Ryu's position (x, y, z floats, the game's global).
+constexpr uint32_t kPlayerPosition = 0x83CD8A80;
+
+// At the shadow pass's first draw of a frame: the light's matrix (row vectors,
+// one row per register) in c29-c32, set before the pass's first draw.
+void ShadowFitUpdate(uint32_t device) {
+  ShadowFit& fit = g_shadowFit;
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x780 + 29 * 16));
+  if (fit.valid && fit.frame == g_frameCount) {
+    return;
+  }
+  auto m = [&](int row, int column) {
+    return std::bit_cast<float>(rex::byte_swap(words[row * 4 + column]));
+  };
+  // Orthographic (w column 0, 0, 0, 1) and finite, or it isn't the sun's.
+  if (m(0, 3) != 0.0f || m(1, 3) != 0.0f || m(2, 3) != 0.0f || m(3, 3) != 1.0f) {
+    return;
+  }
+  float halfSize[2], centre[2], axis[2][3];
+  for (int j = 0; j < 2; j++) {
+    float c[3] = {m(0, j), m(1, j), m(2, j)};
+    float length = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    if (!(length > 1e-6f) || !std::isfinite(length) || !std::isfinite(m(3, j))) {
+      return;
+    }
+    halfSize[j] = 1.0f / length;
+    for (int k = 0; k < 3; k++) {
+      axis[j][k] = c[k] * halfSize[j];
+    }
+    // clip = (dot(p, axis) - centre) / halfSize
+    centre[j] = -m(3, j) * halfSize[j];
+  }
+  // Starts again on a new light (another room), a long gap, or an area far
+  // from the last or more than 4x the size: those aren't eased.
+  // Steady: a fixed area on Ryu (centred a unit above his feet, on his body:
+  // the light is oblique), on whole texels so still shadows don't shimmer as
+  // he moves. The game's area instead when he isn't in it, when it is already
+  // as tight, or in cutscenes (their cast is spread wider than gameplay).
+  float player[3];
+  for (int k = 0; k < 3; k++) {
+    player[k] = guest::LoadFloat(kPlayerPosition + k * 4);
+  }
+  player[1] += 1.0f;  // (y is up)
+  const float steadyHalf = SteadyHalfSize();
+  bool steady = guest::Load16(kScriptSkip) == 0;
+  float steadyCentre[2];
+  for (int j = 0; j < 2; j++) {
+    float along = player[0] * axis[j][0] + player[1] * axis[j][1] + player[2] * axis[j][2];
+    steady = steady && std::isfinite(along) && std::fabs(along - centre[j]) <= halfSize[j] &&
+             halfSize[j] > steadyHalf;
+    float texel = 2.0f * steadyHalf / 512.0f;
+    steadyCentre[j] = std::round(along / texel) * texel;
+  }
+  // Starts again (taken at once) on a new light (another room), after a long
+  // gap, or when the area wanted is far from the last.
+  bool restart = !fit.valid || g_frameCount - fit.frame > 30;
+  for (int j = 0; j < 2 && !restart; j++) {
+    float dot = axis[j][0] * fit.axis[j][0] + axis[j][1] * fit.axis[j][1] +
+                axis[j][2] * fit.axis[j][2];
+    float easedHalf = 0.5f * (fit.high[j] - fit.low[j]);
+    float wanted = steady ? steadyCentre[j] : centre[j];
+    float moved = std::fabs(wanted - 0.5f * (fit.high[j] + fit.low[j]));
+    restart = dot < 0.999f || moved > 2.0f * std::max(easedHalf, steady ? steadyHalf : halfSize[j]);
+  }
+  uint64_t frames = std::clamp<uint64_t>(g_frameCount - fit.frame, 1, 30);
+  float out = 1.0f - std::pow(1.0f - 0.2f, float(frames));
+  float in = 1.0f - std::pow(1.0f - 0.12f, float(frames));
+  bool reached = true;
+  for (int j = 0; j < 2; j++) {
+    if (restart) {
+      float half = steady ? steadyHalf : halfSize[j];
+      float middle = steady ? steadyCentre[j] : centre[j];
+      fit.low[j] = middle - half;
+      fit.high[j] = middle + half;
+    } else if (steady) {
+      // On Ryu: the centre follows him exactly (where the map sits barely
+      // shows; its size does), the size eases to Steady's and then stays.
+      float half = fit.steady ? steadyHalf : 0.5f * (fit.high[j] - fit.low[j]);
+      if (!fit.steady) {
+        half += (steadyHalf - half) * (steadyHalf > half ? out : in);
+        if (std::fabs(half - steadyHalf) <= 0.01f * steadyHalf) {
+          half = steadyHalf;
+        }
+      }
+      reached = reached && half == steadyHalf;
+      fit.low[j] = steadyCentre[j] - half;
+      fit.high[j] = steadyCentre[j] + half;
+    } else {
+      // The game's: each edge follows its, outward fast (a caster coming into
+      // view is in the map within a few frames, and a moving area isn't cut on
+      // its leading side), inward slowly (a caster leaving: the shadows sharpen
+      // over about a quarter of a second instead of in one frame).
+      float low = centre[j] - halfSize[j], high = centre[j] + halfSize[j];
+      fit.low[j] += (low - fit.low[j]) * (low < fit.low[j] ? out : in);
+      fit.high[j] += (high - fit.high[j]) * (high > fit.high[j] ? out : in);
+    }
+    std::copy_n(axis[j], 3, fit.axis[j]);
+    float easedHalf = 0.5f * (fit.high[j] - fit.low[j]);
+    float easedCentre = 0.5f * (fit.high[j] + fit.low[j]);
+    // the game's clip to the eased one
+    fit.scale[j] = halfSize[j] / easedHalf;
+    fit.offset[j] = (centre[j] - easedCentre) / easedHalf;
+  }
+  fit.steady = steady && (restart || reached);
+  std::copy_n(words, 16, fit.light);
+  fit.valid = true;
+  fit.frame = g_frameCount;
+}
+
+// A 4x4 matrix in guest registers (big-endian words, row vectors) changed in
+// x and y: column j' = column j * scale + column w * offset.
+void ShadowFitApply(uint32_t* words, int16_t reg, const float (&scale)[2],
+                    const float (&offset)[2]) {
+  for (int row = 0; row < 4; row++) {
+    uint32_t* r = words + (reg + row) * 4;
+    float w = std::bit_cast<float>(rex::byte_swap(r[3]));
+    for (int j = 0; j < 2; j++) {
+      float v = std::bit_cast<float>(rex::byte_swap(r[j]));
+      r[j] = rex::byte_swap(std::bit_cast<uint32_t>(v * scale[j] + w * offset[j]));
+    }
+  }
+}
+
+// The draw's vertex shader constants with Shadows "Steady"'s change, in
+// `copy`; nullptr when the draw needs none (the guest's are used).
+const uint32_t* ShadowFitCorrect(uint32_t device, const GuestShader& vs, bool shadowPass,
+                                 std::array<uint32_t, 256 * 4>& copy) {
+  if (REXCVAR_GET(shadow_fit) != 1) {
+    g_shadowFit.valid = false;
+    return nullptr;
+  }
+  ShadowFit& fit = g_shadowFit;
+  // A caster: in the shadow pass with the sun's matrix in c29-c32 (another
+  // pass into a 512x512 depth map, with another matrix, is left alone).
+  bool caster = false;
+  if (shadowPass && (vs.viewProj >= 0 || vs.worldViewProj >= 0)) {
+    ShadowFitUpdate(device);
+    caster = fit.valid && fit.frame == g_frameCount &&
+             std::memcmp(guest::Virtual(device + 0x780 + 29 * 16), fit.light,
+                         sizeof(fit.light)) == 0;
+    // (the receivers only follow a map whose casters were changed: this frame's
+    // pass when its update took)
+    fit.passCorrected = fit.valid && fit.frame == g_frameCount;
+  }
+  // A receiver: the last map's correction until the next (the map it samples
+  // is that one, even if the game draws no new one for a while).
+  bool receiver = !shadowPass && vs.shadowMat >= 0 && fit.valid && fit.passCorrected;
+  if (!caster && !receiver) {
+    return nullptr;
+  }
+  std::memcpy(copy.data(), guest::Virtual(device + 0x780), sizeof(copy));
+  if (caster) {
+    for (int16_t reg : {vs.viewProj, vs.worldViewProj}) {
+      if (reg >= 0) {
+        ShadowFitApply(copy.data(), reg, fit.scale, fit.offset);
+      }
+    }
+  } else {
+    // In texture space: u = x * 0.5 + c, v = y * -0.5 + c, c half the map
+    // and half a texel (the game's bias).
+    constexpr float c = 0.5f + 0.5f / 512.0f;
+    float scale[2] = {fit.scale[0], fit.scale[1]};
+    float offset[2] = {(1.0f - fit.scale[0]) * c + 0.5f * fit.offset[0],
+                       (1.0f - fit.scale[1]) * c - 0.5f * fit.offset[1]};
+    ShadowFitApply(copy.data(), vs.shadowMat, scale, offset);
+  }
+  return copy.data();
+}
+
 // Captures a draw from the device state; records it now, or keeps it for
 // FlushPendingDraw when the data comes inline.
 void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
@@ -5221,9 +5450,19 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   Upload vsConstants = Allocate(256 * 16);
   if (g_traceConstants) {
     std::fwrite(guest::Virtual(device + 0x780), 1, 256 * 16, g_traceConstants);
+    if (g_tracePsConstants) {
+      std::fwrite(guest::Virtual(device + 0x1780), 1, 224 * 16, g_tracePsConstants);
+    }
   }
   Upload psConstants = Allocate(224 * 16);
   const uint32_t* vsSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x780));
+  // (the shadow map: 512x512, depth only)
+  std::array<uint32_t, 256 * 4> shadowFitCopy;
+  bool shadowPass = !target && depth && depth->width == 512 * depth->scale &&
+                    depth->height == 512 * depth->scale;
+  if (const uint32_t* corrected = ShadowFitCorrect(device, *vs, shadowPass, shadowFitCopy)) {
+    vsSource = corrected;
+  }
   const uint32_t* psSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x1780));
   // Only the registers the shader reads (the rest of the block is never read).
   auto copyConstants = [](uint8_t* out, const uint32_t* source, const uint64_t (&mask)[4],
@@ -5642,12 +5881,15 @@ void WriteTracePicture() {
 
 // F7's memory: every readable mapping inside guest memory, as records of
 // <guest address u32><size u32><bytes>, zstd-compressed, for finding what the
-// game held in the traced frame.
+// game held in the traced frame. The mappings come from /proc/self/maps on
+// Linux and VirtualQuery on Windows.
 void WriteTraceMemory(const std::string& path) {
   uintptr_t low = reinterpret_cast<uintptr_t>(guest::Virtual(0));
   uintptr_t high = low + 0x100000000ull;
-  FILE* maps = std::fopen("/proc/self/maps", "r");
   FILE* file = std::fopen(path.c_str(), "wb");
+  if (!file) {
+    return;
+  }
   ZSTD_CCtx* zstd = ZSTD_createCCtx();
   ZSTD_CCtx_setParameter(zstd, ZSTD_c_compressionLevel, 1);
   std::vector<uint8_t> out(ZSTD_CStreamOutSize());
@@ -5660,27 +5902,46 @@ void WriteTraceMemory(const std::string& path) {
       std::fwrite(out.data(), 1, o.pos, file);
     } while (!ZSTD_isError(left) && (in.pos < in.size || (end == ZSTD_e_end && left)));
   };
-  char line[512];
-  while (maps && file && std::fgets(line, sizeof(line), maps)) {
-    unsigned long a = 0, b = 0;
-    char perms[8] = {};
-    if (std::sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3 || perms[0] != 'r') {
-      continue;
-    }
+  // One readable range [a, b), clipped to guest memory, in records of up to 16 MB.
+  auto range = [&](uintptr_t a, uintptr_t b) {
     uintptr_t start = std::max<uintptr_t>(a, low), end = std::min<uintptr_t>(b, high);
     for (uintptr_t at = start; at < end; at += 0x1000000) {
       uint32_t header[2] = {uint32_t(at - low), uint32_t(std::min<uintptr_t>(end - at, 0x1000000))};
       write(header, sizeof(header), ZSTD_e_continue);
       write(reinterpret_cast<const void*>(at), header[1], ZSTD_e_continue);
     }
+  };
+#if defined(_WIN32)
+  for (uintptr_t at = low; at < high;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info))) {
+      break;
+    }
+    uintptr_t end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    bool readable = info.State == MEM_COMMIT && !(info.Protect & PAGE_GUARD) && (info.Protect & kReadable);
+    if (readable) {
+      range(at, end);
+    }
+    at = std::max(end, at + 0x1000);
   }
-  if (file) {
-    write(nullptr, 0, ZSTD_e_end);
-    std::fclose(file);
+#else
+  FILE* maps = std::fopen("/proc/self/maps", "r");
+  char line[512];
+  while (maps && std::fgets(line, sizeof(line), maps)) {
+    unsigned long a = 0, b = 0;
+    char perms[8] = {};
+    if (std::sscanf(line, "%lx-%lx %7s", &a, &b, perms) == 3 && perms[0] == 'r') {
+      range(a, b);
+    }
   }
   if (maps) {
     std::fclose(maps);
   }
+#endif
+  write(nullptr, 0, ZSTD_e_end);
+  std::fclose(file);
   ZSTD_freeCCtx(zstd);
 }
 
@@ -5713,8 +5974,11 @@ void TraceFrame(HostTexture* frontBuffer) {
     if (g_traceFile && !std::getenv("NG2_TRACE_NOMEMORY") && !TracePicturesOnly()) {
       WriteTraceMemory(fmt::format("{}/memory-{}.zst", g_traceDir, g_frameCount));
       g_traceConstants = std::fopen(fmt::format("{}/vs-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
+      if (TraceAllConstants()) {
+        g_tracePsConstants = std::fopen(fmt::format("{}/ps-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
+      }
     }
-  } else if (g_traceConstants) {
+  } else if (g_traceConstants && !TraceAllConstants()) {
     std::fclose(g_traceConstants);  // the first frame's only
     g_traceConstants = nullptr;
   }
@@ -5755,6 +6019,12 @@ void TraceFrame(HostTexture* frontBuffer) {
   if (!opened && --g_traceLeft <= 0) {
     std::fclose(g_traceFile);
     g_traceFile = nullptr;
+    for (FILE** f : {&g_traceConstants, &g_tracePsConstants}) {
+      if (*f) {
+        std::fclose(*f);
+        *f = nullptr;
+      }
+    }
     REXLOG_INFO("video: trace done: {}", g_traceDir);
   }
 }
@@ -7122,6 +7392,8 @@ struct ResolveReadbackItem {
   RenderFormat format = RenderFormat::UNKNOWN;
   const RenderBuffer* buffer = nullptr;
   uint64_t offset = 0;  // into the buffer
+  bool toGuest = true;    // written into guest memory (else only dumped)
+  std::string dumpPath;   // F7 trace: the host texels written raw to this file
 };
 struct ResolveReadback {
   std::unique_ptr<RenderBuffer> buffer;
@@ -7291,28 +7563,45 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
     return;
   }
   uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
-  if (!width || !height || width > kReadbackSide || height > kReadbackSide) {
+  // An F7 trace also writes the small resolves (up to 512x512: a shadow map, a reflection,
+  // a ripple map) as the GPU holds them, into its folder.
+  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= 512 &&
+              height <= 512;
+  bool toGuest = width && height && width <= kReadbackSide && height <= kReadbackSide;
+  if (!toGuest && !dump) {
     return;
   }
   TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
   // (a texel at least the endian swap's word: the swap is done per texel)
   uint32_t swapWord = fetch.endianness == xenos::Endian::k8in16 ? 2
                       : fetch.endianness == xenos::Endian::kNone ? 1 : 4;
-  if (info.format == RenderFormat::UNKNOWN || info.blockSize != 1 ||
-      info.bytesPerBlock != RenderFormatSize(dest.format) || info.bytesPerBlock > 16 ||
-      info.bytesPerBlock < swapWord) {
+  if (toGuest && (info.format == RenderFormat::UNKNOWN || info.blockSize != 1 ||
+                  info.bytesPerBlock != RenderFormatSize(dest.format) || info.bytesPerBlock > 16 ||
+                  info.bytesPerBlock < swapWord)) {
     static std::unordered_set<uint32_t> reported;
     if (reported.insert(uint32_t(fetch.format)).second) {
       REXLOG_INFO("video: resolves to texture format {} aren't read back for the CPU",
                   uint32_t(fetch.format));
     }
-    return;
+    toGuest = false;
+    if (!dump) {
+      return;
+    }
+  }
+  if (!toGuest) {
+    info.bytesPerBlock = RenderFormatSize(dest.format);
   }
   ResolveReadback& r = g_resolveReadbacks[g_frame];
   uint32_t rowWidth = (dest.width + 63) & ~63u;
   uint64_t size = uint64_t(rowWidth) * dest.height * info.bytesPerBlock;
-  if (size > (1u << 20)) {
-    return;  // (at a high render scale: the game's own values aren't that big)
+  if (toGuest && size > (1u << 20)) {
+    toGuest = false;  // (as without a trace: too big to be one the game reads back)
+    if (!dump) {
+      return;
+    }
+  }
+  if (size > (16u << 20)) {
+    return;  // (a trace's dump: up to 16 MB)
   }
   uint64_t offset = (r.used + 511) & ~511ull;
   if (!r.buffer || offset + size > r.capacity) {
@@ -7339,8 +7628,17 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
   item.address = address, item.fetch = fetch, item.info = info;
   item.width = width, item.height = height, item.scale = dest.scale, item.rowWidth = rowWidth;
   item.format = dest.format, item.buffer = r.buffer.get(), item.offset = offset;
+  item.toGuest = toGuest;
+  if (dump) {
+    static uint32_t n = 0;
+    item.dumpPath = fmt::format("{}/resolve-{}-{:03}-{:08x}-{}x{}-host{}.raw", g_traceDir, g_frameCount,
+                                n++, address, dest.width, dest.height, uint32_t(dest.format));
+  }
   r.items.push_back(item);
   r.used = offset + size;
+  if (!toGuest) {
+    return;
+  }
   static std::unordered_set<uint64_t> logged;
   if (logged.insert(uint64_t(address) << 32 | width << 16 | height).second) {
     REXLOG_INFO("video: resolve {}x{} texture format {} at {:#x} read back for the CPU", width,
@@ -7408,8 +7706,18 @@ void ApplyResolveReadbacks(uint32_t frame) {
         mapped = item.buffer;
         data = static_cast<const uint8_t*>(const_cast<RenderBuffer*>(mapped)->map());
       }
-      if (data) {
+      if (data && item.toGuest) {
         WriteResolveReadback(item, data);
+      }
+      if (data && !item.dumpPath.empty()) {
+        if (FILE* f = std::fopen(item.dumpPath.c_str(), "wb")) {
+          uint32_t bytes = RenderFormatSize(item.format);
+          for (uint32_t y = 0; y < item.height * item.scale; y++) {
+            std::fwrite(data + item.offset + uint64_t(y) * item.rowWidth * bytes, bytes,
+                        item.width * item.scale, f);
+          }
+          std::fclose(f);
+        }
       }
     }
     if (data) {
@@ -7739,6 +8047,57 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
   }
 }
 
+// The registers of the light's matrices in a vertex shader's constant table
+// (D3DXSHADER_CONSTANTTABLE in the container's header: size 0x1C, its
+// constants' records at +0x1C, 20 bytes each: name offset, register set (2:
+// float4), register, register count).
+void ReadShadowRegisters(GuestShader& shader, uint32_t container, uint32_t headerSize) {
+  headerSize = std::min<uint32_t>(headerSize, 0x4000);
+  for (uint32_t at = container; at + 0x1C <= container + headerSize; at += 4) {
+    if (guest::Load32(at) != 0x1C || guest::Load32(at + 16) != 0x1C) {
+      continue;
+    }
+    uint32_t count = guest::Load32(at + 12);
+    uint32_t room = container + headerSize - at;  // to the header's end
+    if (count == 0 || count > 256 || 0x1C + count * 20 > room) {
+      continue;
+    }
+    bool valid = true;
+    for (uint32_t i = 0; i < count && valid; i++) {
+      uint32_t record = at + 0x1C + i * 20;
+      uint32_t nameOffset = guest::Load32(record);
+      if (nameOffset == 0 || nameOffset >= room) {
+        valid = false;
+        break;
+      }
+      const char* name = reinterpret_cast<const char*>(guest::Virtual(at + nameOffset));
+      size_t most = std::min<size_t>(64, room - nameOffset);
+      size_t length = strnlen(name, most);
+      if (length == 0 || length == most) {
+        valid = false;
+        break;
+      }
+      uint16_t set = guest::Load16(record + 4), reg = guest::Load16(record + 6),
+               regs = guest::Load16(record + 8);
+      if (set != 2 || regs != 4 || reg > 252) {
+        continue;
+      }
+      std::string_view n(name, length);
+      if (n == "ViewProj") {
+        shader.viewProj = int16_t(reg);
+      } else if (n == "WorldViewProj") {
+        shader.worldViewProj = int16_t(reg);
+      } else if (n == "ShadowMat_LPB" || n == "ShadowMat_WLPB") {
+        shader.shadowMat = int16_t(reg);
+      }
+    }
+    if (valid) {
+      return;
+    }
+    shader.viewProj = shader.worldViewProj = shader.shadowMat = -1;
+  }
+}
+
 void RunCreateShader(uint32_t object, uint32_t container, bool pixel) {
   std::lock_guard lock(g_mutex);
   if (!g_device || !object || !container) {
@@ -7765,6 +8124,7 @@ void RunCreateShader(uint32_t object, uint32_t container, bool pixel) {
       uint32_t element = guest::Load32(header + 36 + (base + i) * 4);
       shader->elements.emplace_back(uint8_t((element >> 12) & 0xF), uint8_t((element >> 16) & 0xF));
     }
+    ReadShadowRegisters(*shader, container, guest::Load32(container + 4));
   }
   g_guestShaders[object] = std::move(shader);
 }

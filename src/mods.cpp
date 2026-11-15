@@ -236,8 +236,42 @@ bool ReadManifest(Mod& mod) {
 
 }  // namespace
 
+// game-files.txt in the mods folder: every game file's path, the names a mod's
+// files/ uses (written once; delete it to have it written again).
+static void WriteFileList(const fs::path& folder) {
+  std::error_code ec;
+  const fs::path list = folder / "game-files.txt";
+  if (fs::exists(list, ec)) return;
+  std::vector<std::string> names = ReadNames();
+  if (names.size() != kFileCount) return;
+  fs::create_directories(folder, ec);
+  std::string text =
+      "# The game's files, by the path a mod uses: a mod's files/<path> replaces the file.\n"
+      "# (the Mission Mode DLC's are the last ones; written by the game, delete to remake)\n";
+  for (std::string name : names) {
+    std::replace(name.begin(), name.end(), '\\', '/');
+    text += name;
+    text += '\n';
+  }
+  const fs::path temp = folder / "game-files.txt.tmp";
+  bool ok = false;
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    out.write(text.data(), std::streamsize(text.size()));
+    out.close();
+    ok = bool(out);
+  }
+  if (ok) fs::rename(temp, list, ec);
+  if (!ok || ec) {
+    fs::remove(temp, ec);
+  } else {
+    REXLOG_INFO("mods: the game's file paths written to {}", rex::path_to_utf8(list));
+  }
+}
+
 void Activate(const fs::path& folder, const fs::path& gameRoot, const fs::path& cacheDir) {
   g.logLoads = REXCVAR_GET(log_file_loads);
+  WriteFileList(folder);
   std::error_code ec;
   std::vector<Mod> mods;
   if (fs::is_directory(folder, ec)) {

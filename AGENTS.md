@@ -113,7 +113,9 @@ devices, and none of the player's settings or saves.
 - `NG2_TRACE_PICTURES=<n>`: a trace picture every n frames (10; 0: none). `NG2_TRACE_PICTURES_ONLY=1`:
   F7 takes the pictures alone, no draws or memory (a trace's own stall can hide what it's after).
   `NG2_TRACE_STACKS=1`: each traced draw with its guest call chain. Traced draws carry their shader
-  constants ("consts").
+  constants ("consts"). `NG2_TRACE_ALL_CONSTANTS=1`: every traced frame's vertex and pixel shader
+  constants as the guest has them (`vs-constants-<n>.bin`, `ps-constants-<n>.bin`, a record per
+  draw); small resolves up to 512x512 (the shadow map) are written as the GPU holds them.
 - `NG2_DEBUG_SKIP=<vs hash prefix>[:<count>],...`: those draws aren't made; with
   `NG2_DEBUG_SKIP_BLINK=1` only 3 s of every 6 (to see what a part of the picture is).
 - `NG2_TEST_TOGGLE_LOG=1`: logs draws whose shader constants switch between two sets of values from

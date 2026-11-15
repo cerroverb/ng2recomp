@@ -215,6 +215,8 @@ constexpr Setting kSettings[] = {
     // (Short: a longer choice is squeezed narrow to fit.)
     {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate", u"2x"}, 4,
      "frame_interpolation", Kind::kLevel},
+    // The shadow map's area fixed on Ryu (gpu/video.cpp, ShadowFitCorrect).
+    {u"Shadows", {u"Original", u"Steady"}, 2, "shadow_fit", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -265,7 +267,7 @@ constexpr PageRow Row(uint32_t setting) {
 }
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{Row(0), Row(3), Row(1), Row(21), Row(2), Row(20)}},
+     {{Row(0), Row(3), Row(1), Row(30), Row(2), Row(20)}},
      6},
     {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
     // (its name in the game's third category name, which holds 7 letters)
@@ -277,7 +279,7 @@ constexpr Page kPages[] = {
      6},
     // The Audio Settings page (5, builder sub_836D54F8, which stores its
     // page number at +12; Restore Defaults at +0x1380).
-    {u"Extras", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(17), Row(18)}}, 4},
+    {u"Extras", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(17), Row(18), Row(21)}}, 5},
     // Shown on the Copyright Information page (6: what the category list
     // shows for its sixth category; builder sub_836D57B8), run as page 11
     // (the Options loop runs page 6 inline, 11 through sub_823E7C40); no

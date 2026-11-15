@@ -152,8 +152,9 @@ each defaults to the game's own behaviour.
 
 - **Graphics**: Render Scale (1x–8x, with the resolution it draws at, as "2x 2240x1168");
   Anti-Aliasing (off, or 2x MSAA as on the console, 4x, 8x); Texture Filtering (the game's, or
-  4x–16x anisotropic); Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render
-  scales); Bloom (on, reduced, off); Post-Effects (off: no blur, no white flashes)
+  4x–16x anisotropic); Shadows (the game's, or Steady: a fixed area on Ryu, so shadows stay
+  sharp with enemies around); Bloom (on, reduced, off); Post-Effects (off: no blur, no white
+  flashes)
 - **Display**: Window Mode (windowed, borderless, fullscreen) and Window Size; Aspect Ratio (16:9,
   16:10, 21:9, 32:9, 4:3); V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
   to FIFO); Frame Pacing (Timer, the game's own 60 Hz clock, or Auto: the game's frames on the
@@ -173,7 +174,8 @@ each defaults to the game's own behaviour.
   always filtered); Show FPS; Button Prompts (Auto follows the device in use; Xbox, PlayStation,
   Nintendo, Keyboard); Mouse Sensitivity
 - **Extras**: Skip Intro; Skip Cutscenes (any, watched or not); Skip Death Screen (straight to the
-  game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves)
+  game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves);
+  Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render scales)
 - **Gameplay**: Input Latency (Low: no finished frame waits for the screen; needs
   VK_KHR_present_wait; in the Steam Deck's Game Mode, and any game run through gamescope, it acts as
   Standard, as Low made frames come in pairs there); Unlock Difficulties (every path in New Game and Mission Mode, at once
@@ -219,7 +221,9 @@ was. `mod.toml` is optional:
 
 Mods are read at start, in their folders' name order: when two replace the same file, the first
 one's is used. The log (`ng2.log`) lists each mod and the files it brings. To find which file to
-replace, set `log_file_loads = true` in `ng2.toml`: the log then names every file the game loads.
+replace, look in `game-files.txt` in the mods folder (every file's path, written by the game at its
+first start), or set `log_file_loads = true` in `ng2.toml`: the log then names every file the game
+loads.
 
 ## Controls
 
