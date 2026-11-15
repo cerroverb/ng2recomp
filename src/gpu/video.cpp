@@ -2484,7 +2484,13 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   auto& slot = g_surfaces[key];
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
-    host->scale = g_resolutionScale;
+    // Tiny targets at 1x whatever the render scale: they hold counts, not
+    // pictures. The lens flare's sun test (#95) adds a point per texel of its
+    // 80x45 test into 1x1 targets and the next pass reads their texel back:
+    // scaled, a point lit one of the N x N host pixels (at an even scale the
+    // one before the centre) and the read took another, so the sun counted
+    // as hidden and the flare never showed above 1x.
+    host->scale = key.width <= 4 && key.height <= 4 ? 1 : g_resolutionScale;
     host->width = key.width * host->scale;
     host->height = key.height * host->scale;
     host->samples = SampleCount(key.msaa);
@@ -4970,8 +4976,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
   // A framebuffer's attachments may differ in size (the area is the
   // smallest); samples must match.
+  // (or scales: a tiny target is drawn at 1x, see GetSurface)
   if (target && depth && (depth->width < target->width || depth->height < target->height ||
-                          target->samples != depth->samples)) {
+                          target->samples != depth->samples || target->scale != depth->scale)) {
     depth = nullptr;
   }
 

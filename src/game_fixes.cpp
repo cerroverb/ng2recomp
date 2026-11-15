@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include <rex/hook.h>
@@ -145,4 +146,55 @@ REX_HOOK_RAW(sub_823D1BB0) {
   std::memset(frame, 0, 848 - 208);
   frame[273] = 0xFF;
   __imp__sub_823D1BB0(ctx, base);
+}
+
+// Chapter 6's flickering columns and spires (#59) and walls Ryu walked through
+// (#60): rooms 77 and 78 overlap,
+// and room 77's model has plain stand-ins for the columns and spires room 78
+// has in detail, in the same place. With both loaded both are drawn, and they
+// fight over the depth (the flicker). A room model's parts are drawn by
+// sub_8232C370 (r4 the part: +72 its room model + 4, +76 its mesh); with room
+// 78 in one of the four room slots (0x85640EBC, 0x8CB0 apart: +0 the model,
+// +20 the room id), room 77's stand-in meshes (22, 25, 30, 32, 33, 34, 35)
+// aren't drawn (with them gone, the walls stop letting Ryu through too:
+// what he walked into was a stand-in).
+namespace {
+constexpr uint32_t kRoomSlots = 0x85640EBC;
+constexpr uint32_t kRoomSlotStride = 0x8CB0;
+constexpr uint32_t kRoomSlotCount = 4;
+
+bool HiddenStandIn(uint32_t part) {
+  // (part is readable: the original reads it at once)
+  uint32_t mesh = Load32(part + 76);
+  constexpr uint32_t kStandIns = (1u << 0) | (1u << 3) | (1u << 8) | (1u << 10) | (1u << 11) |
+                                 (1u << 12) | (1u << 13);  // meshes 22 + bit
+  if (mesh < 22 || mesh > 35 || !(kStandIns & (1u << (mesh - 22)))) {
+    return false;
+  }
+  bool detailed = false, standIn = false;
+  for (uint32_t k = 0; k < kRoomSlotCount; k++) {
+    uint32_t slot = kRoomSlots + k * kRoomSlotStride;
+    uint16_t room = ng2::guest::Load16(slot + 20);
+    detailed |= room == 78;
+    standIn |= room == 77 && Load32(slot) == Load32(part + 72) - 4;
+  }
+  return detailed && standIn;
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_8232C370);
+REX_HOOK_RAW(sub_8232C370) {
+  // NG2_STANDIN_FIX=0: drawn as the game does (to compare).
+  static const bool on = [] {
+    const char* v = std::getenv("NG2_STANDIN_FIX");
+    return !(v && std::strcmp(v, "0") == 0);
+  }();
+  if (on && HiddenStandIn(ctx.r4.u32)) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      REXLOG_INFO("game fixes: room 77's stand-in columns hidden (room 78 loaded)");
+    }
+    return;
+  }
+  __imp__sub_8232C370(ctx, base);
 }
