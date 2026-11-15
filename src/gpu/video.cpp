@@ -2484,13 +2484,19 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   auto& slot = g_surfaces[key];
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
-    // Tiny targets at 1x whatever the render scale: they hold counts, not
-    // pictures. The lens flare's sun test (#95) adds a point per texel of its
-    // 80x45 test into 1x1 targets and the next pass reads their texel back:
-    // scaled, a point lit one of the N x N host pixels (at an even scale the
-    // one before the centre) and the read took another, so the sun counted
-    // as hidden and the flare never showed above 1x.
-    host->scale = key.width <= 4 && key.height <= 4 ? 1 : g_resolutionScale;
+    // Small targets at 1x whatever the render scale: they hold counts or
+    // blurred copies, not pictures. The lens flare's sun test (#95) adds a
+    // point per texel of its 80x45 test into 1x1 targets and the next pass
+    // reads their texel back: scaled, a point lit one of the N x N host pixels
+    // (at an even scale the one before the centre) and the read took another,
+    // so the sun counted as hidden and the flare never showed above 1x. The
+    // bloom chain (280x146, 282x148, 186x97, 186x146, then 64x64 down to 1x1)
+    // samples with offsets made for its guest size: scaled, its taps landed
+    // on a grid (#118). Xenia Edge's draw_resolution_scale_threshold keeps targets
+    // up to 320 wide at 1x for the same reason; the height limit leaves the
+    // tall 280x584 and 320x720 ones scaled. The game's own 256x128 pass with
+    // depth has a 256x128 depth target, so both stay at the same scale.
+    host->scale = key.width <= 320 && key.height <= 320 ? 1 : g_resolutionScale;
     host->width = key.width * host->scale;
     host->height = key.height * host->scale;
     host->samples = SampleCount(key.msaa);
@@ -4182,7 +4188,7 @@ static_assert(offsetof(SharedConstants, debugColor) == 1744);
 // is in depth units, about 2^-24 each on the host's float buffer near 1; the
 // scale is in 1/16 subpixels.
 void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primitive,
-                   float& constant, float& slope) {
+                   uint32_t resolutionScale, float& constant, float& slope) {
   float scale = 0.0f, offset = 0.0f;
   auto type = xenos::PrimitiveType(primitive);
   bool polygonal = type != xenos::PrimitiveType::kPointList &&
@@ -4206,9 +4212,9 @@ void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primi
   // The pipeline takes whole units: rounded away from zero, as Xenia's
   // GetD3D10IntegerPolygonOffset (more bias is better than none).
   constant = std::copysign(std::ceil(std::abs(offset) * float(1u << 24)), offset);
-  // Per host pixel the depth slope is smaller by the render scale (Xenia
-  // multiplies by its resolution scale too).
-  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit * float(g_resolutionScale);
+  // Per host pixel the depth slope is smaller by the target's scale (Xenia
+  // multiplies by its resolution scale too; small targets are drawn at 1x).
+  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit * float(resolutionScale);
 }
 
 struct PipelineKey {
@@ -5454,7 +5460,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.depthControl = Register(device, 0x2200);
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
-  PolygonOffset(device, mode, primitive, key.depthBias, key.slopeDepthBias);
+  PolygonOffset(device, mode, primitive, sizeSource->scale, key.depthBias, key.slopeDepthBias);
   key.alphaTest = colorControl.alpha_test_enable;
   key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
   // =all colors the skinned draws only (bones in fetch slot 94): other
