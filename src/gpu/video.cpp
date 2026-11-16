@@ -141,8 +141,8 @@ REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_K
 // again, part of the way from the last frame's), one for each refresh of the
 // display, or each second one; switched live. NG2_INTERP=1/0 overrides.
 REXCVAR_DEFINE_INT32(frame_interpolation, 0, "Video",
-                     "0: off, 1: a picture each refresh, 2: each second refresh (each one below 120 Hz), "
-                     "3: 2x (one picture between the game's frames)");
+                     "0: off, 1: a picture each refresh, 2: each second refresh (each one at 120 Hz and "
+                     "below), 3: 2x (one picture between the game's frames); for displays above 60 Hz");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -1976,6 +1976,17 @@ std::unique_ptr<RenderCommandSemaphore> g_interpAcquire[NUM_FRAMES][kInterpMaxPi
 std::unique_ptr<RenderCommandList> g_interpLists[NUM_FRAMES][kInterpMaxPictures - 1];
 PictureFence g_interpFences[NUM_FRAMES][kInterpMaxPictures - 1];
 
+// Since when the render thread waits in an acquire for an image (frame
+// interpolation's; 0: it doesn't). An image can be one that only a present
+// still waiting for its time gives back: past kAcquireStallNs the presenter
+// shows what waits at once (Presenter::Main), till the acquire returns.
+std::atomic<int64_t> g_acquireWaitingNs{0};
+constexpr int64_t kAcquireStallNs = 4'000'000;
+bool AcquireStalled() {
+  int64_t since = g_acquireWaitingNs.load(std::memory_order_relaxed);
+  return since && SteadyNs() - since > kAcquireStallNs;
+}
+
 class Presenter {
  public:
   struct Item {
@@ -2114,25 +2125,58 @@ class Presenter {
         return begin && begin(1) == 0;
       }();
       (void)period;
-      while (!hurry_.load() && item.atNs - SteadyNs() > 2000000) {
+      while (!hurry_.load() && !AcquireStalled() && item.atNs - SteadyNs() > 2000000) {
         Sleep(1);
       }
 #endif
+      bool stalled = false;
       for (int64_t now = SteadyNs(); now < item.atNs && !hurry_.load(); now = SteadyNs()) {
+        if (AcquireStalled()) {
+          stalled = true;  // (the render thread waits for an image this one may hold)
+          break;
+        }
         if (item.atNs - now > 2000000) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
           std::this_thread::yield();
         }
       }
-      if (item.atNs && lastId_) {
+      if (stalled) {
+        static uint32_t stalls = 0;
+        if (++stalls <= 10 || stalls % 1000 == 0) {
+          REXLOG_INFO("video: interp: an acquire waited over {} ms for an image: the picture waiting shown "
+                      "{:.1f} ms early ({} times)",
+                      kAcquireStallNs / 1'000'000, double(item.atNs - SteadyNs()) / 1e6, stalls);
+        }
+      }
+      // The last present shown first (one at a refresh). Where the presents
+      // aren't reported shown (a hidden or minimised window: each wait ran
+      // its 30 ms, the pictures behind it holding the game back), not
+      // waited for, and tried again after 5 s.
+      if (item.atNs && lastId_ && !stalled && SteadyNs() >= shownPausedUntil_) {
         int64_t until = SteadyNs() + 30000000;
-        while (g_swapChain->pollPresent(lastId_) == 0 && SteadyNs() < until) {
+        bool shown = false;
+        // (a hurry ends it, but under gamescope, where every frame hurries)
+        const bool hurryEnds = !UnderGamescope();
+        while (!(shown = g_swapChain->pollPresent(lastId_) != 0) && SteadyNs() < until &&
+               !(hurryEnds && hurry_.load()) && !AcquireStalled()) {
 #if defined(_WIN32)
           Sleep(0);
 #else
           std::this_thread::yield();
 #endif
+        }
+        if (shown || SteadyNs() < until) {
+          shownTimeouts_ = 0;  // (shown, or let go for a hurry: not a timeout)
+        } else if (++shownTimeouts_ >= 3) {
+          shownTimeouts_ = 0;
+          shownPausedUntil_ = SteadyNs() + 5'000'000'000;
+          static bool logged = false;
+          if (!logged) {
+            logged = true;
+            REXLOG_WARN("video: interp: presents aren't reported shown (a hidden window?): not waited for, "
+                        "5 s at a time while they aren't");
+          }
         }
       }
       int64_t presentStart = SteadyNs();
@@ -2161,6 +2205,9 @@ class Presenter {
         // time 0 made the average hours late)
         static uint32_t hurried = 0;
         int64_t late = item.atNs ? presentStart - item.atNs : 0;
+        if (item.atNs) {
+          g_interpLateNs.store(std::max<int64_t>(late, 0), std::memory_order_relaxed);
+        }
         hurried += item.atNs == 0;
         lateSum += late, lateMax = std::max(lateMax, late);
         if (lastNs && presentStart - lastNs < 100'000'000) {
@@ -2198,6 +2245,8 @@ class Presenter {
   size_t busy_ = 0;
   std::atomic<bool> hurry_{false};
   bool busyTimed_ = false;  // the picture being presented is a timed one (mutex_)
+  uint32_t shownTimeouts_ = 0;     // waits for the last present shown that ran out, in a row (the thread's)
+  int64_t shownPausedUntil_ = 0;   // those waits left out till then (the thread's)
   bool stop_ = false;
   uint64_t lastId_ = 0;  // the last present's (presenter thread)
   std::thread thread_;
@@ -2323,6 +2372,20 @@ void BeginFrame() {
 
 void SwitchInterp();
 
+// What a frame slot's last frame left, its drawing done: its uploads, the
+// textures freed during it, its log (its present, which ran the log again,
+// has been submitted).
+void ReclaimSlot(uint32_t slot) {
+  g_uploads[slot].Reset();
+  g_interpUploads[slot].Reset();
+  for (auto& texture : g_garbage[slot]) {
+    g_descriptors.Free(texture->descriptor);
+    ForgetTexture(texture.get());
+  }
+  g_garbage[slot].clear();
+  g_frameLogs[slot].Clear();
+}
+
 // The images a frame may hold at once (its pictures and its own) before any
 // is presented: an acquire is only sure to return while no more than the
 // count less the surface's minimum are held (gamescope: 3 of 8 the minimum).
@@ -2387,15 +2450,7 @@ RenderCommandList* CommandList() {
     WaitForFrame(g_frame);
     ReadGpuTiming(g_frame);
     g_boundFramebuffer = nullptr;
-    g_uploads[g_frame].Reset();
-    g_interpUploads[g_frame].Reset();
-    for (auto& texture : g_garbage[g_frame]) {
-      g_descriptors.Free(texture->descriptor);
-      ForgetTexture(texture.get());
-    }
-    g_garbage[g_frame].clear();
-    // (its present, which ran the log again, has been submitted)
-    g_frameLogs[g_frame].Clear();
+    ReclaimSlot(g_frame);
     g_logOps = InterpEnabled();
     uint32_t frame = g_frame;
     if (RenderThreadEnabled()) {
@@ -2954,7 +3009,9 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   StageTimer timer(Stage::kSync);
   bool inOrder = true;
   if (g_prologueMode) {
-    inOrder = g_frameMemExport || ReadThisFrame(address, size);
+    // (a bone palette with interpolation: in the frame's commands, where the
+    // pictures between put their own in its place)
+    inOrder = g_frameMemExport || ReadThisFrame(address, size) || (bones && InterpEnabled());
     if (g_frameReadKeys.insert((uint64_t(address) << 32) | size).second) {
       g_frameReads.push_back({address, size});
     }
@@ -4749,6 +4806,10 @@ void SwitchInterp() {
   ResetInterp(wanted);
   if (!wanted) {
     ReleaseInterpResources();  // (memory given back: nothing of it is used off)
+    // The third slot's last frame, which no frame comes to reclaim while off.
+    for (uint32_t slot = FrameSlots(); slot < NUM_FRAMES; slot++) {
+      ReclaimSlot(slot);
+    }
   }
   UpdateExclusiveMode();  // (with interpolation only: made again below)
   if (g_frame >= FrameSlots()) {
@@ -6201,20 +6262,42 @@ void Present(HostTexture* frontBuffer) {
     // could otherwise wait for an image that only their present frees: the
     // images not yet presented and those taken this frame near all the
     // swapchain's, less the display's own (hurried each frame, the last
-    // frame's last picture came early: a stutter in a turn). Only in
-    // exclusive full screen, where the display holds no more than that:
-    // elsewhere a compositor (gamescope, DWM) keeps images of its own, and
-    // an image taken whose release waited for a present behind its own
-    // drawing stood the GPU still (the Steam Deck: 40 s) - there each frame
-    // hurries the last one's out before its first acquire, as before.
+    // frame's last picture came early: a stutter in a turn). In exclusive
+    // full screen the display holds no more than that. Elsewhere a
+    // compositor (gamescope, DWM) keeps images of its own: hurried when the
+    // images held pass what an acquire is sure to return with (SpareImages),
+    // and an acquire that waits all the same (an image taken whose release
+    // waited for a present behind its own drawing stood the GPU still, the
+    // Steam Deck: 40 s) has the presenter show what waits at once
+    // (g_acquireWaitingNs). (Each frame hurried the last one's out before
+    // its first acquire there before: the last picture of most frames a few
+    // milliseconds early, at times on top of the one before it.) Not under
+    // gamescope, the compositor of the Steam Deck's stall: each frame there
+    // still hurries the last one's out before its first acquire.
     const bool exclusive = g_swapChain->isFullScreenExclusive();
     auto hurryIfShort = [&](uint32_t taken) {
       if (hide || !InterpEnabled()) {
         return;
       }
-      if (exclusive ? g_presenter.Pending() + taken + 3 > g_swapChain->getTextureCount() : taken == 0) {
+      const size_t held = g_presenter.Pending() + taken;
+      if (exclusive        ? held + 3 > g_swapChain->getTextureCount()
+          : UnderGamescope() ? taken == 0
+                             : held + 1 > spare) {
         g_presenter.Hurry();
       }
+    };
+    // An acquire of interpolation's, timed for the presenter's watch (not in
+    // exclusive full screen, which the hurry above keeps whole).
+    auto acquire = [&](RenderCommandSemaphore* semaphore, uint32_t* index) {
+      const bool watch = InterpEnabled() && !hide && !exclusive && !UnderGamescope();
+      if (watch) {
+        g_acquireWaitingNs.store(SteadyNs(), std::memory_order_relaxed);
+      }
+      bool ok = g_swapChain->acquireTexture(semaphore, index);
+      if (watch) {
+        g_acquireWaitingNs.store(0, std::memory_order_relaxed);
+      }
+      return ok;
     };
     uint32_t indices[kMaxPictures] = {};
     uint32_t pictures = 0;
@@ -6265,10 +6348,12 @@ void Present(HostTexture* frontBuffer) {
     }
     // At most a frame's pictures waiting to be shown (the swapchain's images
     // last; plume's acquire lets go of the swapchain between short waits).
+    int64_t roomWaited = 0;  // (this frame's wait for room in the presenter)
     if ((interp || InterpEnabled()) && !hide) {
       int64_t roomStart = SteadyNs();
       g_presenter.WaitFor(3);
       int64_t took = SteadyNs() - roomStart;
+      roomWaited = took;
       parts.room += took;
       roomWaitNs += took;
       roomWaitMaxNs = std::max(roomWaitMaxNs, took);
@@ -6295,20 +6380,33 @@ void Present(HostTexture* frontBuffer) {
     RenderCommandSemaphore* signalSemaphores[kMaxPictures] = {};
     PictureFence* doneFences[kMaxPictures] = {};
     if (g_swapChainValid && interp) {
-      if (prologue && PrologueMode() == 2) {
-        // (the frame's submit runs it too: copies of the same memory)
+      if (prologue && PrologueMode()) {
+        // (before the pictures, which read that memory; the frame's submit
+        // runs it too: copies of the same memory)
         const RenderCommandList* lists[] = {g_prologueLists[frame].get()};
         g_queue->executeCommandLists(lists, 1);
       }
+      // The presenter behind (this frame waited for room there: pictures
+      // come as fast as it shows them, so what waits stays waiting): this
+      // frame's pictures between left out, and it catches up by one.
+      // (paced frames only: a slow screen's pictures are spread by the clock, and wait there)
+      const bool behind = interp->paced && roomWaited > 4'000'000;
+      if (behind) {
+        static uint64_t count = 0;
+        if (++count <= 10 || count % 600 == 0) {
+          REXLOG_INFO("video: interp: the presenter is behind ({:.1f} ms waited for room): a frame's pictures "
+                      "between left out ({} times)", double(roomWaited) / 1e6, count);
+        }
+      }
       size_t k = 0;
-      for (; k < recorded; k++) {
+      for (; k < recorded && !behind; k++) {
         auto& semaphore = g_interpAcquire[frame][k];
         auto& interpList = g_interpLists[frame][k];
         auto& fence = g_interpFences[frame][k];
         uint32_t index = 0;
         int64_t acquireStart = SteadyNs();
         hurryIfShort(pictures);
-        if (!g_swapChain->acquireTexture(semaphore.get(), &index)) {
+        if (!acquire(semaphore.get(), &index)) {
           break;
         }
         NoteAcquire(SteadyNs() - acquireStart);
@@ -6341,7 +6439,7 @@ void Present(HostTexture* frontBuffer) {
     if (g_swapChainValid && !ownHidden) {
       hurryIfShort(pictures);
       int64_t acquireStart = SteadyNs();
-      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
+      g_swapChainValid = acquire(g_acquireSemaphores[frame].get(), &frameIndex);
       if (InterpEnabled()) {
         NoteAcquire(SteadyNs() - acquireStart);
       }
@@ -6380,12 +6478,21 @@ void Present(HostTexture* frontBuffer) {
       if (InterpEnabled() && interp && interp->paced && !starved) {
         // Each at its time on the display's grid.
         int64_t readyNs = SteadyNs();
-        int64_t lag = readyNs - interp->presentNs;
+        // The time to make them, without the wait for room in the presenter:
+        // that wait comes of the pictures' own times, and counted here it
+        // fed itself (a queue once full put every frame's pictures later,
+        // which kept it full: the render thread waiting 15 ms a frame, the
+        // pictures 30 ms behind, for the rest of the session).
+        int64_t lag = std::max<int64_t>(readyNs - interp->presentNs - roomWaited, 0);
         int64_t kept = g_interpReadyLagNs.load();
         g_interpReadyLagNs = lag > kept ? lag : kept - (kept - lag) / 64;  // (the slowest, let go slowly)
         static uint64_t late = 0, shownPaced = 0;
         for (uint32_t i = 0; i < pictures; i++) {
-          int64_t at = i < interp->times.size() ? interp->times[i] : readyNs;
+          // (the frame's own takes the last time, with fewer pictures made
+          // than asked for too: the images left)
+          int64_t at = i + 1 == pictures && !ownHidden && !interp->times.empty() ? interp->times.back()
+                       : i < interp->times.size()                                 ? interp->times[i]
+                                                                                  : readyNs;
           late += at < readyNs;
           shownPaced++;
           g_presenter.Push({indices[i], signalSemaphores[i], at, presents, doneFences[i], inputNs,
@@ -6519,6 +6626,42 @@ void Present(HostTexture* frontBuffer) {
 
 // Setup -----------------------------------------------------------------------
 
+// The refresh of the display mode the window is on: at the start, and again
+// when the window goes to another display or its mode changes (the Steam
+// Deck's refresh slider): the pictures were paced by the first one's for the
+// whole run wherever the display's own clock isn't measured steady.
+void ReadModeRefresh(SDL_Window* window) {
+  int64_t refresh = 0;
+  if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
+    if (mode->refresh_rate > 20.0f) {
+      refresh = int64_t(1e9 / double(mode->refresh_rate));
+      static std::atomic<int64_t> logged{0};
+      if (logged.exchange(refresh) != refresh) {
+        REXLOG_INFO("video: display mode {:.2f} Hz", mode->refresh_rate);
+      }
+    }
+  }
+  // NG2_INTERP_REFRESH=<Hz>: interpolation paced as for that display (tests).
+  if (const char* v = std::getenv("NG2_INTERP_REFRESH"); v && std::atof(v) > 20.0) {
+    refresh = int64_t(1e9 / std::atof(v));
+  }
+  if (refresh) {
+    g_modeRefreshNs = refresh;
+  }
+}
+
+bool SDLCALL WatchDisplayMode(void*, SDL_Event* event) {
+  if (event->type == SDL_EVENT_WINDOW_DISPLAY_CHANGED || event->type == SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED) {
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    if (windows && count > 0) {
+      ReadModeRefresh(windows[0]);
+    }
+    SDL_free(windows);
+  }
+  return true;
+}
+
 bool GetRenderWindow(RenderWindow& renderWindow) {
   int count = 0;
   SDL_Window** windows = SDL_GetWindows(&count);
@@ -6528,16 +6671,7 @@ bool GetRenderWindow(RenderWindow& renderWindow) {
     REXLOG_ERROR("video: no SDL window");
     return false;
   }
-  if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
-    if (mode->refresh_rate > 20.0f) {
-      g_modeRefreshNs = int64_t(1e9 / double(mode->refresh_rate));
-      REXLOG_INFO("video: display mode {:.2f} Hz", mode->refresh_rate);
-    }
-  }
-  // NG2_INTERP_REFRESH=<Hz>: interpolation paced as for that display (tests).
-  if (const char* v = std::getenv("NG2_INTERP_REFRESH"); v && std::atof(v) > 20.0) {
-    g_modeRefreshNs = int64_t(1e9 / std::atof(v));
-  }
+  ReadModeRefresh(window);
 #if defined(__linux__)
   SDL_PropertiesID props = SDL_GetWindowProperties(window);
   if (auto* surface = static_cast<wl_surface*>(
@@ -7089,6 +7223,7 @@ bool CreateHostDevice() {
   }
 #endif
   SDL_AddEventWatch(WatchTraceKey, nullptr);
+  SDL_AddEventWatch(WatchDisplayMode, nullptr);
   // (whether the GPU can do Input Latency Low, not the setting: logged as both, #78)
   REXLOG_INFO("video: Input Latency Low supported (waits for the screen): {}; set to {}",
               g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)",

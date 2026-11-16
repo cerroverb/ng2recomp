@@ -63,8 +63,9 @@ struct InterpFrames {
   // Paced by the display: a picture for each
   // refresh (or each second, third: the rate's divider) in the time the frame
   // stands for, each part of the way by when it is shown. times: when each
-  // picture shown goes out (the pictures between, then the frame's own if
-  // ownShown: a refresh falls at its end); fractions: the pictures between's.
+  // picture shown goes out (the pictures between, then the frame's own, a
+  // whole number of refreshes after the last frame's: ownShown, always set
+  // by the build now); fractions: the pictures between's.
   bool paced = false, ownShown = true;
   std::vector<int64_t> times;
   std::vector<float> fractions;
@@ -184,6 +185,10 @@ void ResetInterp(bool on);  // switched: everything kept from earlier frames dro
 extern std::atomic<uint32_t> g_interpPictureCap;
 extern std::shared_future<std::shared_ptr<InterpFrames>> g_interpLastJob;
 extern std::atomic<int64_t> g_interpReadyLagNs;
+// How long after its time the presenter last showed a paced picture (it shows
+// one only once the one before is on the screen): what the display is behind
+// the pictures' times.
+extern std::atomic<int64_t> g_interpLateNs;
 
 // video.cpp
 int64_t InterpRefreshNs();  // the display's refresh, 0 not known

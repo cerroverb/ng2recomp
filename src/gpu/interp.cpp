@@ -12,6 +12,7 @@
 #include "interp.h"
 #include "../aspect.h"
 #include "guest.h"
+#include "video.h"
 
 #include <algorithm>
 #include <array>
@@ -42,6 +43,7 @@ std::shared_future<std::shared_ptr<InterpFrames>> g_interpLastJob;
 // From a frame's present to its pictures handed to the presenter (the build
 // and the recording), the slowest lately: the pictures' first time is after it.
 std::atomic<int64_t> g_interpReadyLagNs{4'000'000};
+std::atomic<int64_t> g_interpLateNs{0};
 namespace {
 
 using Upload = InterpUpload;
@@ -59,15 +61,15 @@ uint32_t InterpSetDivider() {
   if (REXCVAR_GET(frame_interpolation) != 2) {
     return 1;
   }
-  // Half Rate: never fewer pictures than the game's 60 frames (at 60 or 70 Hz
-  // each second refresh was 30 or 35 a second): each as many refreshes as
-  // fit in the game's frame, two at most (one at 70 or 90 Hz, two at 120 Hz
-  // and up).
+  // Half Rate: each second refresh only where that still leaves a picture
+  // between the game's frames (above 125 Hz: 72 a second at 144 Hz, 120 at
+  // 240 Hz). At 120 Hz and below each second one is the game's own frames, a
+  // frame late and nothing between: each refresh there, as Full Rate.
   int64_t refresh = InterpRefreshNs();
   if (refresh <= 0) {
     return 2;
   }
-  return std::clamp<uint32_t>(uint32_t(1e9 / 60.0 / double(refresh) + 0.05), 1u, 2u);
+  return refresh < 8'000'000 ? 2u : 1u;
 }
 }  // namespace
 
@@ -76,7 +78,21 @@ uint32_t InterpDivider() {
 }
 namespace {
 
+// The autopause's own (the build's; ResetInterp clears it: left from a
+// pause, it kept the pictures off for up to 24 s after the setting was
+// turned off and on again).
+struct InterpAuto {
+  int64_t pausedUntil = 0, holdNs = 0, resumedNs = 0, lastNs = 0;
+  int64_t halvedNs = 0, halfHoldNs = 0, fullAgainNs = 0;  // (half rate)
+  double buildAvg = 0, gapAvg = 1e9 / 60.0, gapFast = 1e9 / 60.0, gapBefore = 0, ownRate = 0, pausedSum = 0;
+  uint32_t behind = 0, pausedCount = 0, sharpRun = 0;
+  uint32_t gameInterval = 0;  // the game's limiter word, as last logged
+  double gameOwn = 0;         // the frame it asks for, kept ownFrames frames past the word's return to 60
+  uint32_t ownFrames = 0;
+};
+
 struct InterpState {
+  InterpAuto autopause;
   std::vector<InterpDraw> previous, current;
   std::vector<InterpDraw> older;  // the frame before the previous (things the previous didn't draw)
   std::vector<InterpPalette> previousPalettes, palettes;
@@ -93,9 +109,15 @@ struct InterpState {
   int64_t lastFullNs = 0;  // the last full frame's present (game thread's clock)
   int64_t lastPresentNs = 0;
   double intervalNs = 1e9 / 60.0;  // between the game's frames, smoothed
-  int64_t baseNs = 0;   // the last paced frame's start: its pictures after it
-  int64_t windowNs = 0; // the time the last paced frame's pictures covered
-  int64_t gridNs = 0;   // the next picture's time on the display's grid
+  int64_t endNs = 0;      // when the last paced frame's own picture is shown: the next one's start (0: none)
+  // (the grid, where the game's frame isn't a whole number of steps)
+  int64_t baseNs = 0;     // the last paced frame's start: its pictures after it
+  int64_t windowNs = 0;   // the time the last paced frame's pictures covered
+  int64_t gridNs = 0;     // the next picture's time on the display's grid
+  int64_t latencyNs = 0;  // from a paced frame's pictures being ready to its own shown
+  // (paced frames, for the log: the pictures between, frames a refresh more or
+  // fewer than usual, timelines started anew)
+  uint64_t pacedFrames = 0, pacedBetween = 0, pacedUneven = 0, pacedAnew = 0;
   uint32_t slowRun = 0;    // full frames in a row a long time apart
   bool slow = false;  // draws without a match given the shared registers' values before
 };
@@ -139,9 +161,11 @@ bool InterpEnabled() {
   return on != 0;
 }
 
-// Pictures between two frames where the display's refresh isn't known or
-// paced by: 2 (180 Hz for the game's 60).
+// Pictures between two frames where the display's refresh isn't known: 2
+// (180 a second for the game's 60).
 constexpr uint32_t kInterpSteps = 2;
+// The game's frame limiter: vblanks a frame (frame_wait.cpp).
+constexpr uint32_t kGameInterval = 0x84C5342C;
 
 int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
                           const uint64_t (&mask)[4], const uint32_t* psConstants,
@@ -310,11 +334,36 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // without them (a cutscene at 30 of its own) isn't paused again while it
   // runs at that rate.
   {
-    static int64_t pausedUntil = 0, holdNs = 0, resumedNs = 0, lastNs = 0;
-    static int64_t halvedNs = 0, halfHoldNs = 0, fullAgainNs = 0;  // (half rate)
-    static double buildAvg = 0, gapAvg = 1e9 / 60.0, gapFast = 1e9 / 60.0, gapBefore = 0, ownRate = 0,
-                  pausedSum = 0;
-    static uint32_t behind = 0, pausedCount = 0, sharpRun = 0;
+    auto& a = g.autopause;
+    int64_t &pausedUntil = a.pausedUntil, &holdNs = a.holdNs, &resumedNs = a.resumedNs, &lastNs = a.lastNs;
+    int64_t &halvedNs = a.halvedNs, &halfHoldNs = a.halfHoldNs, &fullAgainNs = a.fullAgainNs;
+    double &buildAvg = a.buildAvg, &gapAvg = a.gapAvg, &gapFast = a.gapFast, &gapBefore = a.gapBefore,
+           &ownRate = a.ownRate, &pausedSum = a.pausedSum;
+    uint32_t &behind = a.behind, &pausedCount = a.pausedCount, &sharpRun = a.sharpRun;
+    // The rate the game itself asks for: its frame limiter's word, vblanks a
+    // frame (0 at 60; 2 on the Game Over screen and wherever it runs at 30).
+    // A frame that long isn't one the pictures cost: every such section went
+    // to half rate after 6 frames and paused 6 later, to find in the pause
+    // that the game was no faster without them, each time anew.
+    const uint32_t gameInterval = guest::Load32(kGameInterval);
+    if (gameInterval != a.gameInterval) {
+      static uint32_t logged = 0;
+      if (logged < 20) {
+        logged++;
+        REXLOG_INFO("video: interp: the game's frame limiter at {} vblanks a frame (was {})", gameInterval,
+                    a.gameInterval);
+      }
+      a.gameInterval = gameInterval;
+    }
+    // (kept for 8 frames after the word goes back: the frames under way are
+    // still that long, and counted as a sharp drop they paused the pictures)
+    if (gameInterval >= 2 && gameInterval <= 6) {
+      a.gameOwn = double(gameInterval) * 1e9 / 60.0;
+      a.ownFrames = 8;
+    } else if (a.ownFrames && --a.ownFrames == 0) {
+      a.gameOwn = 0;
+    }
+    const double gameOwn = a.gameOwn;
     int64_t gap = lastNs ? presentNs - lastNs : 0;
     lastNs = presentNs;
     const bool gapValid = gap > 0 && gap < 150'000'000;
@@ -335,7 +384,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         g.palettes.clear();
         g.paletteIndex.clear();
         g.keptFor = 0;
-        g.lastFullNs = g.lastPresentNs = g.baseNs = g.gridNs = 0;
+        g.lastFullNs = g.lastPresentNs = g.endNs = g.latencyNs = g.baseNs = g.gridNs = 0;
         g.slowRun = 0;
         g.slow = false;
         g.lastBuildNs = 0;
@@ -363,7 +412,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
       // Half rate back to full once the game is at 60 again for the hold
       // (longer each time full rate costs it frames again soon after).
-      if (g_interpAutoDivider.load() > 1 && presentNs - halvedNs > halfHoldNs && gapAvg < 17'000'000) {
+      // (the rate it asks for itself, or was found to have in a pause)
+      const double own = std::max(ownRate, gameOwn);
+      if (g_interpAutoDivider.load() > 1 && presentNs - halvedNs > halfHoldNs &&
+          gapAvg < (own ? own * 1.02 : 17'000'000.0)) {
         g_interpAutoDivider = 1;
         fullAgainNs = presentNs;
         behind = 0;
@@ -375,22 +427,24 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // pass at 4K, 10 ms a frame and four times that with the pictures: the
       // game at 47 for 40 s, never paused while the build took under 3 ms).
       // A game no faster without them is found in the pause (ownRate).
-      const double late = ownRate ? ownRate * 1.08 : 17'500'000.0;
+      const double late = own ? own * 1.08 : 17'500'000.0;
       if (gapValid && gapAvg > late) {
         behind++;
-      } else if (gapValid && gapAvg < (ownRate ? ownRate * 1.02 : 17'000'000.0)) {
+      } else if (gapValid && gapAvg < (own ? own * 1.02 : 17'000'000.0)) {
         behind = behind > 2 ? behind - 2 : 0;
       }
       // A sharp drop (under 45 fps, or well under the game's own rate, for 6
       // frames in a row on a quick average): at once, not after the 45 above
       // (a dip to 72 on the screen came and went before they added up).
-      const double sharp = ownRate ? ownRate * 1.3 : 1e9 / 45.0;
+      const double sharp = own ? own * 1.3 : 1e9 / 45.0;
       sharpRun = gapValid && gapFast > sharp ? sharpRun + 1 : 0;
-      // First half rate (at 120 Hz and up: 60 pictures a second or more
-      // still), then the pause: the step from 180 to 60 on the screen was
-      // what showed (a heavy room: the game at 45 with the pictures, 53 without).
+      // First half rate, then the pause: the step from 180 to 60 on the screen
+      // was what showed (a heavy room: the game at 45 with the pictures, 53
+      // without). Only where half the refreshes still leave one between the
+      // game's frames (above 125 Hz): at 120 Hz half rate is the game's frames
+      // alone, shown a frame late, and the pause is that without the wait.
       const int64_t refresh = InterpRefreshNs();
-      const bool canHalve = InterpDivider() < 2 && refresh > 0 && refresh < 8'500'000;
+      const bool canHalve = InterpDivider() < 2 && refresh > 0 && refresh < 8'000'000;
       if ((behind >= 45 || sharpRun >= 6) && canHalve) {
         sharpRun = 0;
         behind = 0;
@@ -781,6 +835,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   bool repeat = submitted && submitted < submittedBefore && g.keptFor < 2;
   // (And the poses the same: a still camera over one standing in place, a
   // spark gone, isn't one, its bones moved.)
+  // (The HUD and menus' draws, unmatched above, count as new: left out, a
+  // menu's frames, a draw fewer than the last now and then over a still
+  // scene, were repeats and not shown, the menu at a third of its rate.)
   uint32_t unmatchedNow = 0;
   std::unordered_map<uint64_t, int32_t> paletteBefore;
   for (size_t i = 0; repeat && i < g.current.size(); i++) {
@@ -834,7 +891,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     g.slow = g.slowRun >= 3;
   }
   // A cut (another camera, a loaded room): most draws are new.
-  if (!partial && !g.previous.empty() && submitted && matched * 2 < submitted) {
+  bool between = !partial && !g.previous.empty() && submitted;
+  if (between && matched * 2 < submitted) {
+    between = false;
     g.cuts++;
     static uint32_t logged = 0;
     if (logged < 40) {
@@ -843,92 +902,229 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
                   submitted, g.previous.size());
     }
   }
-  if (!partial && !g.previous.empty() && submitted && matched * 2 >= submitted) {
+  // The pictures a frame gets. Paced by the display where it is faster than
+  // the game (a refresh under 16 ms). A display at the game's own 60 has no
+  // refresh to show a picture in between its frames: none (two were made and
+  // presented each frame, three scenes drawn for the one shown), but for a
+  // slow screen's, a picture each refresh the game leaves out.
+  const int64_t refresh = InterpRefreshNs();
+  const bool paced = refresh > 0 && refresh < 16'000'000;
+  const bool slowNow = !paced && g.slow && span;
+  uint32_t steps = kInterpSteps;
+  int64_t slowSpacing = 0;
+  if (between && slowNow) {
+    // As many pictures as the usual rate gives in that time, or with the
+    // display's refresh known, each the same whole number of refreshes
+    // (two at 180 Hz for 15 a second: pictures held one, then three,
+    // looked as choppy as before).
+    double pictureNs = 1e9 / 60.0 / double(steps + 1);
+    int64_t wanted = std::llround(double(span) / pictureNs);
+    int64_t cap = std::min<int64_t>(kInterpMaxPictures, g_interpPictureCap.load());
+    // (no more than the cap: the images a frame may hold, its own counted)
+    int64_t least = std::min<int64_t>(steps + 1, cap);
+    if (int64_t known = refresh > 0 ? refresh : ModeRefreshNs()) {
+      double refreshes = double(span) / double(known);
+      int64_t per = std::max<int64_t>(1, int64_t(std::ceil(refreshes / double(cap) - 0.05)));
+      wanted = std::max<int64_t>(1, std::llround(refreshes / double(per)));
+      slowSpacing = per * known;
+      least = 1;  // (no more pictures than refreshes to show them)
+    }
+    steps = uint32_t(std::clamp<int64_t>(wanted, least, cap) - 1);
+  } else if (between && !paced && refresh > 0) {
+    steps = 0;
+  }
+  if (between && !paced && steps == 0) {
+    between = false;  // (the frame alone, shown at once)
+  }
+  if (!between && !partial) {
+    g.endNs = 0;  // (shown at once: a paced frame after it starts anew)
+  }
+  if (between) {
     frames = std::make_shared<InterpFrames>();
     frames->presentNs = presentNs;
-    uint32_t steps = kInterpSteps;
-    int64_t refresh = InterpRefreshNs();
-    if (refresh > 0 && refresh < 16'000'000) {
-      // The time this frame stands for: from the last frame to it (a slow
-      // screen's: from the last full one), shown from its start B on: B is
-      // its present and the time to make its pictures, kept a steady
-      // interval from the last one (the game's frames come a little
-      // unevenly). On the display's grid (a refresh, or the divider's
-      // several, apart; more on a slow screen so as not to pass what the
-      // swapchain's images allow), each refresh in (B, B + window] gets a
-      // picture that far along; one at the end is the frame's own.
-      // (the time since the last full frame: a partial one between, near
-      // fire every third, is not shown, so this one's pictures cover both)
+    if (paced) {
+      // The time this frame stands for (window): from the last frame to it
+      // (a slow screen's: from the last full one; a partial frame between,
+      // near fire every third, is not shown, so this one's pictures cover
+      // both). Where that is a whole number of steps, its pictures go from
+      // where the last frame's ended (start: that frame's own picture's time)
+      // to its own picture's time (end), so the frame's own picture is always
+      // one of those shown and every scene drawn is: the pictures between at
+      // each refresh (or the divider's several) back from the end, each as
+      // far along as when it is shown. (On the grid of its own, the frame's
+      // own picture was shown only when a refresh fell at its end: at 120 Hz
+      // most frames drew one scene more than was shown.)
       const int64_t window = span > 0 && span < 4 * int64_t(g.intervalNs) ? span : int64_t(g.intervalNs);
       const int64_t cap = std::min<int64_t>(kInterpMaxPictures, g_interpPictureCap.load());
       int64_t per = std::max<int64_t>(InterpDivider(),
                                       int64_t(std::ceil(double(window) / double(refresh) / double(cap) - 0.05)));
-      const int64_t step = refresh * per;
       const int64_t lag = std::clamp<int64_t>(g_interpReadyLagNs.load() + 1'500'000, 2'000'000, 20'000'000);
-      int64_t base = presentNs + lag;
-      if (g.baseNs) {
-        // Where the last frame's pictures ended (its own shown): this one's
-        // start, so one goes on from the other. (From the last start and this
-        // frame's own time, a frame 3 ms later than the last left 3 ms with
-        // no picture: a refresh shown twice, a jerk, about once a second.)
-        int64_t predicted = g.baseNs + (g.windowNs ? g.windowNs : window);
-        if (std::abs(base - predicted) < window / 3) {
-          // (drawn to the present slowly; never before the pictures are made)
-          base = std::max(predicted + (base - predicted) / 16, presentNs + lag - 1'500'000);
+      const int64_t step = refresh * per;
+      // The game's frame a whole number of steps (120, 180, 240 Hz; half rate
+      // at 240): each frame's own picture shown, its pictures pinned between
+      // the last one's and its own. Otherwise on the display's grid.
+      // (by the display's rate against the game's 60, not the game's frame
+      // as measured: a game dipping to 55 crossed the line and back, a jump
+      // from one timing to the other each time)
+      // Not under gamescope (the Steam Deck), where the last frame's pictures
+      // are hurried out at each frame's first acquire: the frame's own, timed
+      // a frame after its pictures are made, went out with the next frame's,
+      // pictures in twos 0-4 ms apart.
+      const double perFrame = 1e9 / 60.0 / double(step);
+      // (NG2_TEST_PINNED=1: under gamescope too, for the headless tests)
+      static const bool pinnedTest = [] {
+        const char* v = std::getenv("NG2_TEST_PINNED");
+        return v && v[0] == '1';
+      }();
+      const bool whole = (!UnderGamescope() || pinnedTest) && perFrame >= 0.9 &&
+                         std::fabs(perFrame - std::round(perFrame)) < 0.1;
+      if (whole) {
+        g.baseNs = g.gridNs = 0;
+        const int64_t ready = presentNs + lag;  // (its pictures made: none goes out sooner)
+        // From its pictures being ready to its own shown: the game's usual
+        // frame, whatever time this one stands for. (A late frame's, or one
+        // after a partial frame, stands for more: its pictures go from when
+        // they are made to the usual time after, the first part of its motion
+        // left out with the wait that was. Shown that much later instead, the
+        // frames after it carried the time: three frames' pictures waiting in
+        // the presenter, the render thread waiting 16 ms a frame for room
+        // there, the game at 53 and its menus slow to answer.)
+        g.latencyNs = std::min<int64_t>(int64_t(g.intervalNs), window);
+        const int64_t target = ready + g.latencyNs;
+        // The times follow the display, not its nominal rate: where the
+        // presenter shows the pictures after their time (a display at
+        // 119.98 Hz paced as the mode's 120.00: 0.2 ms later each second,
+        // 20 ms of latency after a minute and a half), the start goes an
+        // eighth of that later each frame, until they are shown on time. The
+        // frames then fall behind their target by a step now and then, and
+        // one gets no picture between.
+        // (each one taken once: a late one after a hitch would go on moving
+        // the times; and only with a picture between to give up: a frame of
+        // one step can't make up what its start is put back)
+        const int64_t late = std::clamp<int64_t>(g_interpLateNs.exchange(0), 0, 50'000'000);
+        int64_t start = g.endNs ? g.endNs + (std::llround(perFrame) >= 2 ? late / 8 : 0) : 0;
+        if (!start || std::abs(target - window - start) > 2 * window) {
+          start = target - window;  // (the first, or far off after a hitch: anew)
+          g.pacedAnew++;
         }
-      }
-      g.baseNs = base;
-      g.windowNs = window;
-      if (!g.gridNs || std::abs(g.gridNs - base) > 4 * window) {
-        g.gridNs = base + 1;
-      }
-      while (g.gridNs <= base) {
-        g.gridNs += step;
-      }
-      while (g.gridNs <= base + window + step / 8 && int64_t(frames->times.size()) < cap) {
-        float f = std::min(1.0f, float(double(g.gridNs - base) / double(window)));
-        frames->times.push_back(g.gridNs);
-        frames->fractions.push_back(f);
-        g.gridNs += step;
-      }
-      // 2x: one picture between the game's frames, not one each refresh: of
-      // the refreshes in the window, the one nearest halfway and the last
-      // (at 180 Hz shown one refresh, then two: each drawn as far along as
-      // when it is shown, so the motion keeps its speed).
-      if (REXCVAR_GET(frame_interpolation) == 3 && frames->times.size() > 2) {
-        size_t half = 0;
-        for (size_t k = 1; k + 1 < frames->times.size(); k++) {
-          if (std::fabs(frames->fractions[k] - 0.5f) < std::fabs(frames->fractions[half] - 0.5f)) {
-            half = k;
+        // The steps from the start to the end: those to the target, the
+        // nearest; where the frame is a whole number of them (2 at 120 Hz)
+        // that number until the target is six tenths of one off (the
+        // game's 60 and the display's rate drift apart slowly: at half a
+        // refresh off, the frames' jitter gave one frame a refresh more and the
+        // next one less, back and forth).
+        // (in steps: a refresh, or the divider's several, so that at half
+        // rate the pictures stay each second refresh from frame to frame)
+        const double exact = double(target - start) / double(step);
+        // (the game's usual frame, smoothed: each one's own time jitters a millisecond or two)
+        const bool regular = std::abs(window - int64_t(g.intervalNs)) < int64_t(g.intervalNs) / 4;
+        const double usual = double(regular ? int64_t(g.intervalNs) : window) / double(step);
+        int64_t count = std::llround(exact);
+        if (std::fabs(usual - std::round(usual)) < 0.1 && std::fabs(exact - std::round(usual)) < 0.6) {
+          count = std::llround(usual);
+        }
+        count = std::max<int64_t>(count, 1);
+        g.pacedFrames++;
+        g.pacedUneven += std::fabs(double(count) - double(window) / double(step)) > 0.75;
+        const int64_t end = start + count * step;
+        g.endNs = end;
+        // Back from the end a step apart, down to the start (the last frame's
+        // own is there), none before they are made (it would go out late, on
+        // top of the next), no more than the images allow.
+        std::vector<int64_t> times;
+        for (int64_t t = end - step; t > start + step / 2 && t >= ready - refresh / 2 &&
+                                     int64_t(times.size()) + 1 < cap;
+             t -= step) {
+          times.push_back(t);
+        }
+        // 2x: one picture between the game's frames, not one each refresh: the
+        // refresh nearest halfway (at 180 Hz shown one refresh, then two: each
+        // drawn as far along as when it is shown, so the motion keeps its speed).
+        if (REXCVAR_GET(frame_interpolation) == 3 && times.size() > 1) {
+          const int64_t half = start + std::max<int64_t>(1, count / 2) * step;
+          int64_t best = times[0];
+          for (int64_t t : times) {
+            if (std::abs(t - half) < std::abs(best - half)) {
+              best = t;
+            }
+          }
+          times = {best};
+        }
+        std::reverse(times.begin(), times.end());
+        for (int64_t t : times) {
+          frames->times.push_back(t);
+          frames->fractions.push_back(float(double(t - start) / double(end - start)));
+        }
+        g.pacedBetween += frames->fractions.size();
+        frames->times.push_back(end);  // (the frame's own)
+        frames->ownShown = true;
+      } else {
+        // Where the game's frame isn't a whole number of steps (75, 90, 100,
+        // 144, 165 Hz; half rate at 144): the pictures on the display's grid,
+        // each as far along as when it is shown, the frame's own only when a
+        // refresh falls at its end. (Pinned to whole refreshes there, the
+        // frames took 2 and 3 refreshes by turns at 144 Hz, and the motion a
+        // refresh with them: 0.5, 0.5, 0.33, 0.33, 0.33 of a frame.)
+        // (from the pinned timing: on from its last frame's own picture)
+        int64_t base = presentNs + lag;
+        if (g.endNs && !g.baseNs) {
+          base = std::max(base, g.endNs);
+          g.gridNs = g.endNs + step;  // (the refresh after its own, not that one again)
+        }
+        g.endNs = 0;
+        g.latencyNs = 0;
+        g.pacedFrames++;
+        if (g.baseNs) {
+          // Where the last frame's pictures ended (its own shown): this one's
+          // start, so one goes on from the other. (From the last start and this
+          // frame's own time, a frame 3 ms later than the last left 3 ms with
+          // no picture: a refresh shown twice, a jerk, about once a second.)
+          int64_t predicted = g.baseNs + (g.windowNs ? g.windowNs : window);
+          if (std::abs(base - predicted) < window / 3) {
+            // (drawn to the present slowly; never before the pictures are made)
+            base = std::max(predicted + (base - predicted) / 16, presentNs + lag - 1'500'000);
           }
         }
-        frames->times = {frames->times[half], frames->times.back()};
-        frames->fractions = {frames->fractions[half], frames->fractions.back()};
+        g.baseNs = base;
+        g.windowNs = window;
+        if (g.gridNs) {  // (the grid by the display as it shows them, as the pinned times)
+          g.gridNs += std::clamp<int64_t>(g_interpLateNs.exchange(0), 0, 50'000'000) / 8;
+        }
+        if (!g.gridNs || std::abs(g.gridNs - base) > 4 * window) {
+          g.gridNs = base + 1;
+        }
+        while (g.gridNs <= base) {
+          g.gridNs += step;
+        }
+        while (g.gridNs <= base + window + step / 8 && int64_t(frames->times.size()) < cap) {
+          float f = std::min(1.0f, float(double(g.gridNs - base) / double(window)));
+          frames->times.push_back(g.gridNs);
+          frames->fractions.push_back(f);
+          g.gridNs += step;
+        }
+        // 2x: of the refreshes in the window, the one nearest halfway and the last.
+        if (REXCVAR_GET(frame_interpolation) == 3 && frames->times.size() > 2) {
+          size_t half = 0;
+          for (size_t k = 1; k + 1 < frames->times.size(); k++) {
+            if (std::fabs(frames->fractions[k] - 0.5f) < std::fabs(frames->fractions[half] - 0.5f)) {
+              half = k;
+            }
+          }
+          frames->times = {frames->times[half], frames->times.back()};
+          frames->fractions = {frames->fractions[half], frames->fractions.back()};
+        }
+        frames->ownShown = !frames->fractions.empty() && frames->fractions.back() >= 0.999f;
+        if (frames->ownShown) {
+          frames->fractions.pop_back();
+        }
+        g.pacedBetween += frames->fractions.size();
       }
       frames->paced = true;
-      frames->ownShown = !frames->fractions.empty() && frames->fractions.back() >= 0.999f;
-      if (frames->ownShown) {
-        frames->fractions.pop_back();
-      }
       steps = uint32_t(frames->fractions.size());
       frames->slow = g.slow;
       frames->spanNs = span;
-    } else if (g.slow && span) {
-      // As many pictures as the usual rate gives in that time, or with the
-      // display's refresh known, each the same whole number of refreshes
-      // (two at 180 Hz for 15 a second: pictures held one, then three,
-      // looked as choppy as before).
-      double pictureNs = 1e9 / 60.0 / double(steps + 1);
-      int64_t wanted = std::llround(double(span) / pictureNs);
-      int64_t cap = std::min<int64_t>(kInterpMaxPictures, g_interpPictureCap.load());
-      if (int64_t refresh = ModeRefreshNs()) {
-        double refreshes = double(span) / double(refresh);
-        int64_t per = std::max<int64_t>(1, int64_t(std::ceil(refreshes / double(cap) - 0.05)));
-        wanted = std::max<int64_t>(1, std::llround(refreshes / double(per)));
-        frames->spacingNs = per * refresh;
-      }
-      // (no more than the cap: the images a frame may hold, its own counted)
-      steps = uint32_t(std::clamp<int64_t>(wanted, std::min<int64_t>(steps + 1, cap), cap) - 1);
+    } else if (slowNow) {
+      frames->spacingNs = slowSpacing;
       frames->slow = true;
       frames->spanNs = span;
       static uint32_t logged = 0;
@@ -950,11 +1146,6 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       std::memcpy(&b, y + 2, 8);
       return (a * 0x9E3779B97F4A7C15ull) ^ (b + 0x632BE59BD9B4E019ull + (a << 6) + (a >> 2)) ^ (uint64_t(r) << 52);
     };
-    // A matched draw one of whose own registers (not the camera's) jumped
-    // (taken as it is now while the rest went part of the way, its matrix
-    // would be half one frame's, half the other's: a double): drawn where it
-    // is now, seen from the camera part of the way, as a draw without a match.
-    std::vector<int32_t> lerpMatch = match;
     uint64_t jumpedDraws = 0;
     // Only the moved registers take the value now, in every draw that has
     // that value (one light, the same in each pass); the matrices go on part
@@ -1040,28 +1231,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // that jumped in some draw takes it as now in every draw that has it.
     // (with the register: a common value, a white, means nothing across registers)
     auto valueAt = [&](uint16_t r, const float* y) { return sharedKey(r, y); };
+    std::unordered_map<uint64_t, const float*> shared;
     for (size_t i = 0; i < g.current.size(); i++) {
-      if (match[i] < 0 || lerpMatch[i] >= 0) {
+      if (match[i] < 0 || matchDistance[i] == 0.0f) {
         continue;
       }
       auto& d = g.current[i];
       auto& before = g.previous[match[i]];
-      for (size_t r = 0; r < d.registers.size(); r++) {
-        if (r < skips[i].size() && skips[i][r]) {
-          continue;
-        }
-        if (std::memcmp(&before.constants[r * 4], &d.constants[r * 4], 16) != 0) {
-          jumpedValues.insert(valueAt(d.registers[r], &d.constants[r * 4]));
-        }
-      }
-    }
-    std::unordered_map<uint64_t, const float*> shared;
-    for (size_t i = 0; i < g.current.size(); i++) {
-      if (lerpMatch[i] < 0 || matchDistance[i] == 0.0f) {
-        continue;
-      }
-      auto& d = g.current[i];
-      auto& before = g.previous[lerpMatch[i]];
       for (size_t r = 0; r < d.registers.size(); r++) {
         const float* x = &before.constants[r * 4];
         const float* y = &d.constants[r * 4];
@@ -1104,7 +1280,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     };
     for (size_t i = 0; i < g.current.size(); i++) {
-      if (g.current[i].submitted && lerpMatch[i] < 0) {
+      if (g.current[i].submitted && match[i] < 0) {
         common[g.current[i].group];  // (only the kinds with a draw without a match)
       }
     }
@@ -1125,10 +1301,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     uint64_t psDraws = 0;
     for (size_t i = 0; i < g.current.size(); i++) {
       auto& d = g.current[i];
-      if (!d.submitted || lerpMatch[i] < 0 || d.psConstants.empty()) {
+      if (!d.submitted || match[i] < 0 || d.psConstants.empty()) {
         continue;
       }
-      auto& before = g.previous[lerpMatch[i]];
+      auto& before = g.previous[match[i]];
       if (before.psRegisters != d.psRegisters ||
           std::memcmp(before.psConstants.data(), d.psConstants.data(), d.psConstants.size() * 4) == 0) {
         continue;
@@ -1195,8 +1371,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       if (!d.submitted || d.ui) {
         continue;
       }
-      const bool poisoned = false;  // (moved values are taken as now one by one, below)
-      const InterpDraw* before = (!poisoned && lerpMatch[i] >= 0) ? &g.previous[lerpMatch[i]] : nullptr;
+      // (a moved value is taken as now one by one, below)
+      const InterpDraw* before = match[i] >= 0 ? &g.previous[match[i]] : nullptr;
       notOwn[i] = !before;
       bool any = false;
       std::vector<const float*> xs(d.registers.size(), nullptr);
@@ -1273,7 +1449,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
       if (any) {
         borrowed[i] = std::move(xs);
-        borrowedDraws += lerpMatch[i] < 0 || poisoned;
+        borrowedDraws += match[i] < 0;
       }
     }
     g.fromOlder += fromOlder;
@@ -1295,7 +1471,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         auto& d = g.current[i];
         phase[i] = d.pushConstants;
         if (!psLerp[i].empty()) {
-          auto& before = g.previous[lerpMatch[i]];
+          auto& before = g.previous[match[i]];
           Upload upload = Allocate((d.psRegisters.back() + 1u) * 16u);
           auto* out = reinterpret_cast<float*>(upload.data);
           for (size_t r = 0; r < d.psRegisters.size(); r++) {
@@ -1574,6 +1750,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     REXLOG_INFO("video: interp: {:.2f} bone palettes a frame taken as now (a row jumped), {} bones taken as "
                 "now (left zero or moved far)",
                 double(g.palettesJumped) / 600.0, g.bonesSnapped);
+    if (g.pacedFrames && g.latencyNs) {
+      REXLOG_INFO("video: interp: paced frames: {:.2f} pictures between each, {} of {} a refresh more or fewer "
+                  "than their time, {} started anew; the frame's own shown {:.1f} ms after its pictures are made",
+                  double(g.pacedBetween) / double(g.pacedFrames), g.pacedUneven, g.pacedFrames, g.pacedAnew,
+                  double(g.latencyNs) / 1e6);
+    }
+    g.pacedFrames = g.pacedBetween = g.pacedUneven = g.pacedAnew = 0;
     g.bonesBytes = g.palettesJumped = g.bonesSnapped = 0;
     g.buildNs = 0;
     g.frames = g.interpolated = g.draws = g.matched = g.snapped = g.registers = 0;
@@ -1581,6 +1764,15 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   }
   if (partial) {
     g.keptFor++;
+    g.current.clear();
+    g.palettes.clear();
+    g.paletteIndex.clear();
+    // On a display at the game's rate, outside a slow screen: shown at once
+    // as the full frames there are (handed to the presenter it came a frame
+    // late, on top of the next one).
+    if (refresh >= 16'000'000 && !g.slow) {
+      return nullptr;
+    }
     if (!frames) {
       frames = std::make_shared<InterpFrames>();
     }
@@ -1589,10 +1781,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // Paced by the display: not shown either (the last full frame's pictures
     // go on by the clock; shown at once it cut them short: a jump, near fire
     // every third frame, seen as a double).
-    frames->paced = InterpRefreshNs() > 0 && InterpRefreshNs() < 16'000'000;
-    g.current.clear();
-    g.palettes.clear();
-    g.paletteIndex.clear();
+    frames->paced = paced;
     return frames;
   }
   g.keptFor = 0;
@@ -1644,10 +1833,14 @@ void ResetInterp(bool on) {
   g_interp.palettes.clear();
   g_interp.paletteIndex.clear();
   g_interp.keptFor = 0;
-  g_interp.baseNs = g_interp.gridNs = g_interp.lastFullNs = g_interp.lastPresentNs = 0;
+  g_interp.autopause = {};
+  g_interp.endNs = g_interp.latencyNs = g_interp.baseNs = g_interp.gridNs = g_interp.lastFullNs =
+      g_interp.lastPresentNs = 0;
   g_interp.slowRun = 0;
   g_interp.slow = false;
   g_interpAutoDivider = 1;
+  g_interpLateNs = 0;
+  g_interpReadyLagNs = 4'000'000;  // (as at the start: what it had grown to stayed through off and on)
   g_interpCapture.current.clear();
   g_interpCapture.palettes.clear();
   g_interpCapture.paletteIndex.clear();

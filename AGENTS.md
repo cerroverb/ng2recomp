@@ -94,12 +94,18 @@ devices, and none of the player's settings or saves.
   drops pictures at high refresh rates; decided again when either changes. `NG2_EXCLUSIVE=1` takes it
   always, `2` leaves it to the driver, `0` never.
 - Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
-  2 each second, each one below 120 Hz, 3 2x: one picture between the game's frames; experimental,
+  2 each second, each one at 120 Hz and below, 3 2x: one picture between the game's frames; experimental,
   off by default; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws
   drawn again with their constants and bone palettes part of the way from the last frame's, a picture for each refresh of the
   display, as far along as when it is shown (`NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests).
   Draws are matched by mesh, then by shaders and constants; stats every 600 frames. When building the pictures
-  takes the game below 60 (a big fight on a slow CPU) it drops to half rate, then pauses them for a while.
+  takes the game below 60 (a big fight on a slow CPU) it drops to half rate (above 125 Hz), then pauses them for
+  a while; not where the game itself runs at 30 (its frame limiter's word, 0x84C5342C). For displays above
+  60 Hz: at 60 Hz only the game's 30 fps sections get pictures. A frame's own picture is always one of those
+  shown, a whole number of refreshes after the last frame's, where the game's frame is a whole number of refreshes
+  (120, 180, 240 Hz) and not under gamescope; elsewhere (144, 165, 90 Hz, the Steam Deck) the pictures are on the
+  display's grid, as before. With it on, read-back resolves aren't waited for (`NG2_READBACK_SYNC=1` does) and
+  Input Latency Low doesn't apply; the game's frame is shown about a frame and 2-20 ms later than with it off.
   Best in Window Mode Fullscreen (exclusive). `NG2_INTERP_DEBUG=1` leaves out the draws without their own match.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.

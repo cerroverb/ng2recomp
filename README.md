@@ -265,6 +265,10 @@ for each button; a key in two lists presses both, as the game's two-button moves
   - Overlays drawn over the game in exclusive full screen (the AMD overlay, Windows notifications)
     cause some judder while they're up.
   - Windowed and Borderless have been tested much less than Window Mode Fullscreen.
+  - It is for displays above 60 Hz: on a 60 Hz display it only adds pictures where the game itself
+    runs at 30 fps or less.
+  - It adds input latency (the game's frame is shown about a frame later), Input Latency Low doesn't
+    apply with it on, and the flicker fix for brightness the game reads back is off with it.
 - Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
   from other systems, and from real Windows PCs especially, are welcome.
 
