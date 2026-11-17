@@ -1,0 +1,31 @@
+From 882c221d9da42f976601a80f9d32de1618b68e8f Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Mon, 16 Nov 2026 17:05:00 +0000
+Subject: [PATCH 24/24] Threads: a timed alertable wait's last part of a
+ millisecond is rounded up
+
+Rounded down, it was waits of 0 ms one after another until the deadline: a
+spin. (Found by IzunaRecomp, v0.2.2.1.)
+---
+ src/core/threading_posix.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 5ae018c..f5b8f31 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1201,8 +1201,9 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
+   if (deadline == std::chrono::steady_clock::time_point::max()) {
+     return kAlertablePollSlice;
+   }
+-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+-      deadline - std::chrono::steady_clock::now());
++  // Rounded up: rounded down, the last part of a millisecond was waits of
++  // 0 ms one after another, a spin until the deadline.
++  auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+   if (remaining <= std::chrono::milliseconds::zero()) {
+     return std::chrono::milliseconds::zero();
+   }
+-- 
+2.56.1
+

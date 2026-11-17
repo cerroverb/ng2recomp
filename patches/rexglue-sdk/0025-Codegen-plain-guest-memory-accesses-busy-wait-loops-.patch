@@ -1,0 +1,411 @@
+From 7087d634f1b3c7130c0be7d6e62433db100f9df7 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Mon, 16 Nov 2026 19:07:12 +0000
+Subject: [PATCH] Codegen: plain guest memory accesses, busy-wait loops backed
+ off
+
+The game's loads and stores are ordinary accesses the compiler may
+optimise, no longer volatile. A compiler barrier at every label (hiding the
+memory base) makes each loop read memory again on every pass, so a wait
+still sees another thread's write; sync, lwsync and eieio are compiler
+barriers too. REXGLUE_GUEST_ACCESSES_VOLATILE=ON (or
+-DREX_GUEST_ACCESSES_VOLATILE) brings the volatile accesses back.
+
+Short loops that only read memory until another thread changes it are
+found at codegen and, with the guest's own spin hint db16cyc (before: no
+code), back off on their way round again: a pause, then a yield after 50 us
+of the same wait (src/system/spin_backoff.cpp).
+
+On the Steam Deck in a fight: the game's render thread 540 -> 504 ms of CPU
+a second, the main thread 210 -> 198, its workers 20-25% less.
+
+After IzunaRecomp's v0.2.2.1, which found these.
+---
+ include/rex/ppc/intrinsics.h                |  12 ++
+ resources/templates/codegen/pch_h.inja      |  53 ++++++--
+ resources/templates/init/rexglue_cmake.inja |   6 +
+ src/codegen/builders/system.cpp             |  18 +--
+ src/codegen/function_graph.cpp              | 131 ++++++++++++++++++++
+ src/system/CMakeLists.txt                   |   1 +
+ src/system/spin_backoff.cpp                 |  33 +++++
+ 7 files changed, 238 insertions(+), 16 deletions(-)
+ create mode 100644 src/system/spin_backoff.cpp
+
+diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
+index 3c2fe09..0b3205d 100644
+--- a/include/rex/ppc/intrinsics.h
++++ b/include/rex/ppc/intrinsics.h
+@@ -393,6 +393,17 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+   return simde_mm_packus_epi16(r_lo, r_hi);
+ }
+ 
++// db16cyc: the guest's spin hint ("waiting, low priority"), and the head of
++// each loop the recompiler finds only reading memory until another thread
++// changes it (REX_SPIN_WAIT, function_graph.cpp). On the Xbox 360 such a wait
++// had a hardware thread to itself; here a pause, then after 50 us of the same
++// wait a yield each time, so it can't hold a core the thread it waits for
++// needs. No sleep: one wakes too late for the game's handoffs between its
++// threads, many a frame. Out of line (src/system/spin_backoff.cpp). (After
++// IzunaRecomp v0.2.2.1.)
++void SpinBackoff() noexcept;
++inline void db16cyc() { SpinBackoff(); }
++
+ }  // namespace rex::ppc
+ 
+ //=============================================================================
+@@ -400,6 +411,7 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+ //=============================================================================
+ // Vector mask tables accessible from global scope for generated code
+ using rex::ppc::VectorMaskL;
++#define ppc_db16cyc() ::rex::ppc::db16cyc()
+ using rex::ppc::VectorMaskR;
+ using rex::ppc::VectorShiftTableL;
+ using rex::ppc::VectorShiftTableR;
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..a323964 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -132,17 +132,54 @@ extern PPCFuncMapping PPCFuncMappings[];
+ 
+ #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
+ 
+-#define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
++// Guest memory as ordinary accesses the compiler may optimise (keep in a
++// register, forward a store to the next load, drop a repeated one); memcpy
++// keeps them free of alignment and aliasing assumptions. What keeps one
++// thread's wait seeing another's write is REX_LABEL_BARRIER at every label:
++// each loop goes back to one, and after it no guest load is reused from
++// before. -DREX_GUEST_ACCESSES_VOLATILE makes them volatile again (no codegen
++// needed). (The plain accesses and the barrier after IzunaRecomp v0.2.2.1.)
++#ifdef REX_GUEST_ACCESSES_VOLATILE
++#define REX_GUEST_PTR(x) ((volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
++static inline u8 rex_guest_load_u8(volatile u8* p) { return *p; }
++static inline u16 rex_guest_load_u16(volatile u8* p) { return __builtin_bswap16(*(volatile u16*)p); }
++static inline u32 rex_guest_load_u32(volatile u8* p) { return __builtin_bswap32(*(volatile u32*)p); }
++static inline u64 rex_guest_load_u64(volatile u8* p) { return __builtin_bswap64(*(volatile u64*)p); }
++static inline void rex_guest_store_u8(volatile u8* p, u8 v) { *p = v; }
++static inline void rex_guest_store_u16(volatile u8* p, u16 v) { *(volatile u16*)p = __builtin_bswap16(v); }
++static inline void rex_guest_store_u32(volatile u8* p, u32 v) { *(volatile u32*)p = __builtin_bswap32(v); }
++static inline void rex_guest_store_u64(volatile u8* p, u64 v) { *(volatile u64*)p = __builtin_bswap64(v); }
++#define REX_LABEL_BARRIER() ((void)0)
++#else
++#define REX_GUEST_PTR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++static inline u8 rex_guest_load_u8(const u8* p) { return *p; }
++static inline u16 rex_guest_load_u16(const u8* p) { u16 v; __builtin_memcpy(&v, p, 2); return __builtin_bswap16(v); }
++static inline u32 rex_guest_load_u32(const u8* p) { u32 v; __builtin_memcpy(&v, p, 4); return __builtin_bswap32(v); }
++static inline u64 rex_guest_load_u64(const u8* p) { u64 v; __builtin_memcpy(&v, p, 8); return __builtin_bswap64(v); }
++static inline void rex_guest_store_u8(u8* p, u8 v) { *p = v; }
++static inline void rex_guest_store_u16(u8* p, u16 v) { v = __builtin_bswap16(v); __builtin_memcpy(p, &v, 2); }
++static inline void rex_guest_store_u32(u8* p, u32 v) { v = __builtin_bswap32(v); __builtin_memcpy(p, &v, 4); }
++static inline void rex_guest_store_u64(u8* p, u64 v) { v = __builtin_bswap64(v); __builtin_memcpy(p, &v, 8); }
++// (Not a memory clobber, which would also send the guest registers kept in
++// ctx out to memory and back on every pass of every loop: hiding `base` is
++// enough, no guest address after the label is known to equal one before it.)
++#define REX_LABEL_BARRIER() __asm__ __volatile__("" : "+r"(base))
++#endif
++// The head of a busy-wait loop (function_graph.cpp, IsSpinLoopHead): a
++// pause, then a yield, as the guest's own spin hint.
++#define REX_SPIN_WAIT() ppc_db16cyc()
++
++#define REX_LOAD_U8(x) rex_guest_load_u8(REX_GUEST_PTR(x))
++#define REX_LOAD_U16(x) rex_guest_load_u16(REX_GUEST_PTR(x))
++#define REX_LOAD_U32(x) rex_guest_load_u32(REX_GUEST_PTR(x))
++#define REX_LOAD_U64(x) rex_guest_load_u64(REX_GUEST_PTR(x))
+ #define REX_LOAD_STRING(x, len) \
+   std::string_view(reinterpret_cast<const char*>(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (len))
+ 
+-#define REX_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
+-#define REX_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
+-#define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+-#define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
++#define REX_STORE_U8(x, y) rex_guest_store_u8(REX_GUEST_PTR(x), (y))
++#define REX_STORE_U16(x, y) rex_guest_store_u16(REX_GUEST_PTR(x), (y))
++#define REX_STORE_U32(x, y) rex_guest_store_u32(REX_GUEST_PTR(x), (y))
++#define REX_STORE_U64(x, y) rex_guest_store_u64(REX_GUEST_PTR(x), (y))
+ 
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
+diff --git a/resources/templates/init/rexglue_cmake.inja b/resources/templates/init/rexglue_cmake.inja
+index f39557b..6cfe45a 100644
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -45,6 +45,12 @@ if(WIN32)
+         list(APPEND REXGLUE_RECOMP_OPTIONS -fasync-exceptions)
+     endif()
+ endif()
++# The guest's loads and stores as volatile ones again (pch: plain, with a
++# compiler barrier at every label), to compare or to rule them out.
++option(REXGLUE_GUEST_ACCESSES_VOLATILE "Recompiled code: volatile guest memory accesses" OFF)
++if(REXGLUE_GUEST_ACCESSES_VOLATILE)
++    list(APPEND REXGLUE_RECOMP_OPTIONS -DREX_GUEST_ACCESSES_VOLATILE)
++endif()
+ if(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "none")
+     list(APPEND REXGLUE_RECOMP_OPTIONS
+         $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-g0>)
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..904b47f 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -30,27 +30,29 @@ bool build_attn(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// sync, lwsync, eieio: x86's ordering already covers what the game relies on
++// (these were no-ops), but the guest's loads and stores are plain accesses the
++// compiler may move (pch_h.inja), so each is a compiler barrier: nothing moved
++// across it, as with the volatile accesses before.
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tstd::atomic_signal_fence(std::memory_order_seq_cst);");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tstd::atomic_signal_fence(std::memory_order_seq_cst);");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tstd::atomic_signal_fence(std::memory_order_seq_cst);");
+   return true;
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon's spin-wait hint: a pause, then a yield (rex/ppc/intrinsics.h),
++  // instead of nothing, which left the game's spin loops holding a core.
++  ctx.println("\tppc_db16cyc();");
+   return true;
+ }
+ 
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index fc918bb..5d03720 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -344,6 +344,114 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
+   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
+ }
+ 
++// Whether the loop starting at `head` is a busy-wait: a short run of
++// instructions that only read memory, compare and branch (out, or back to
++// `head`) until another thread changes what it reads. Nothing in it is
++// stored or called, and no register a load takes its address from is written
++// in it, so every pass reads the same words. On the Xbox 360 such a wait had a
++// hardware thread to itself; here it would hold a whole core, so its label
++// gets REX_SPIN_WAIT (the back-off of rex/ppc/intrinsics.h). Loops with the
++// guest's own spin hint (db16cyc: or 31,31,31) have it already. (After
++// IzunaRecomp v0.2.2.1.)
++bool IsSpinLoopHead(const BinaryView& binary, uint32_t head) {
++  constexpr int kMaxInstructions = 12;
++  uint32_t written = 0, bases = 0;
++  int loads = 0;
++  for (int i = 0; i < kMaxInstructions; ++i) {
++    const uint32_t address = head + uint32_t(i) * 4;
++    const uint8_t* p = binary.translate(address);
++    if (!p) {
++      return false;
++    }
++    const uint32_t w = load_and_swap<uint32_t>(p);
++    const uint32_t op = w >> 26, rt = (w >> 21) & 31, ra = (w >> 16) & 31, rb = (w >> 11) & 31;
++    auto load = [&](bool indexed) {
++      written |= 1u << rt;
++      if (ra) {
++        bases |= 1u << ra;
++      }
++      if (indexed) {
++        bases |= 1u << rb;
++      }
++      ++loads;
++    };
++    switch (op) {
++      case 32: case 34: case 40: case 42:  // lwz lbz lhz lha
++        load(false);
++        break;
++      case 58:  // ld, lwa (not ldu)
++        if ((w & 3) == 1) {
++          return false;
++        }
++        load(false);
++        break;
++      case 10: case 11:  // cmpli cmpi
++        break;
++      case 21: case 28:  // rlwinm, andi.: rS -> rA
++        written |= 1u << ra;
++        break;
++      case 24:  // ori: only the nop
++        if (w != 0x60000000u) {
++          return false;
++        }
++        break;
++      case 31: {
++        const uint32_t xo = (w >> 1) & 0x3FF;
++        switch (xo) {
++          case 23: case 87: case 279: case 21:  // lwzx lbzx lhzx ldx
++            load(true);
++            break;
++          case 0: case 32:  // cmp cmpl
++            break;
++          case 444:  // or: mr rA,rS only (db16cyc, or 31,31,31, has its own back-off)
++            if (rt == 31 && ra == 31 && rb == 31) {
++              return false;
++            }
++            if (rt != rb) {
++              return false;
++            }
++            written |= 1u << ra;
++            break;
++          case 28:  // and
++            written |= 1u << ra;
++            break;
++          default:
++            return false;
++        }
++        break;
++      }
++      case 16: {  // bc: out of the loop, or back to its head
++        if (w & 1) {
++          return false;  // (a call)
++        }
++        if (!(rt & 0x04)) {
++          return false;  // (counts CTR: a timed loop, not a wait)
++        }
++        const int32_t bd = int32_t(int16_t(w & 0xFFFC));
++        const uint32_t target = (w & 2) ? uint32_t(bd) : address + uint32_t(bd);
++        if (target == head) {
++          return loads > 0 && !(bases & written);
++        }
++        break;
++      }
++      case 18: {  // b: only back to the head
++        if (w & 1) {
++          return false;
++        }
++        int32_t li = int32_t(w & 0x03FFFFFC);
++        if (li & 0x02000000) {
++          li -= 0x04000000;
++        }
++        const uint32_t target = (w & 2) ? uint32_t(li) : address + uint32_t(li);
++        return target == head && loads > 0 && !(bases & written);
++      }
++      default:
++        return false;
++    }
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -496,6 +604,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+ 
+   ppc_insn insn;
+   std::unordered_set<size_t> emittedLabels;
++  // Busy-wait loop heads (IsSpinLoopHead): the back-off goes on the branches
++  // back to them, so it runs when the wait goes round again, not each time
++  // the loop is entered (a state machine's dispatch, a handoff already done).
++  std::unordered_set<uint32_t> spinHeads;
+ 
+   for (const auto& block : blocks()) {
+     auto blockBase = block.base;
+@@ -511,6 +623,14 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+       // Only emit each label once
+       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
+         emit_println(body, "loc_{:X}:", blockBase);
++        // Guest accesses are plain ones (pch_h.inja): a compiler barrier at
++        // every label makes each loop, which always goes back to one, read
++        // memory again on every pass, so a wait still sees another thread's
++        // write.
++        emit_println(body, "\tREX_LABEL_BARRIER();");
++        if (IsSpinLoopHead(ctx.binary, blockBase)) {
++          spinHeads.insert(blockBase);
++        }
+         csrState = CSRState::Unknown;
+       }
+ 
+@@ -587,11 +707,22 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+           builderCtx.emit_mid_asm_hook();
+         }
+ 
++        const size_t emittedFrom = body.size();
+         if (!DispatchInstruction(id, builderCtx)) {
+           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
+           allRecompiled = false;
+         }
+ 
++        for (uint32_t head : spinHeads) {
++          if (blockBase > head && blockBase < head + 48) {
++            const std::string jump = fmt::format("goto loc_{:X};", head);
++            const size_t at = body.find(jump, emittedFrom);
++            if (at != std::string::npos) {
++              body.replace(at, jump.size(), "{ REX_SPIN_WAIT(); " + jump + " }");
++            }
++          }
++        }
++
+         // Check for mid-asm hook AFTER instruction
+         if (hookIt != ctx.config.midAsmHooks.end() && hookIt->second.afterInstruction) {
+           builderCtx.emit_mid_asm_hook();
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..d842d02 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -8,6 +8,7 @@ set(REXSYSTEM_SOURCES
+     kernel_module.cpp
+     user_module.cpp
+     xthread.cpp
++    spin_backoff.cpp
+     xevent.cpp
+     xfile.cpp
+     xmutant.cpp
+diff --git a/src/system/spin_backoff.cpp b/src/system/spin_backoff.cpp
+new file mode 100644
+index 0000000..9886421
+--- /dev/null
++++ b/src/system/spin_backoff.cpp
+@@ -0,0 +1,33 @@
++/**
++ * The back-off of the guest's busy-waits (rex/ppc/intrinsics.h): db16cyc, and
++ * the head of each loop the recompiler finds only reading memory until
++ * another thread changes it (REX_SPIN_WAIT). After IzunaRecomp v0.2.2.1.
++ */
++#include <rex/ppc/intrinsics.h>
++
++#include <chrono>
++#include <thread>
++
++namespace rex::ppc {
++
++void SpinBackoff() noexcept {
++#if defined(__x86_64__) || defined(_M_X64)
++  __builtin_ia32_pause();
++#elif defined(__aarch64__) || defined(_M_ARM64)
++  __asm__ __volatile__("yield");
++#endif
++  // A pause for the first 50 us of a wait (a handoff between threads answers
++  // at once), a yield each time after. A call more than 200 us after the
++  // thread's last one starts a new wait.
++  static thread_local std::chrono::steady_clock::time_point last{}, start{};
++  const auto now = std::chrono::steady_clock::now();
++  if (now - last > std::chrono::microseconds(200)) {
++    start = now;
++  }
++  last = now;
++  if (now - start >= std::chrono::microseconds(50)) {
++    std::this_thread::yield();
++  }
++}
++
++}  // namespace rex::ppc
+-- 
+2.56.1
+

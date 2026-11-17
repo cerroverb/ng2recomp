@@ -41,6 +41,10 @@ struct InterpDraw {
   bool submitted = false;
   uint32_t boneAddress = 0, boneSize = 0;  // its bone palette (physical), if skinned
   uint64_t mesh = 0;  // its vertex and index data (0: not known)
+  // The same without its vertex buffers' places: a mesh the game writes anew
+  // each frame, in two buffers by turns (Chapter 6's banners, #121), whose
+  // mesh above is one of two (0: not drawn from an index buffer).
+  uint64_t meshAlt = 0;
   // The pixel shader's registers it reads and their values: the lights, in
   // the camera's space, must turn with the camera part of the way too.
   std::vector<uint16_t> psRegisters;

@@ -624,12 +624,35 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
       return n ? float(sum / double(n)) : 0.0f;
     };
+    // A mesh written anew each frame in two buffers by turns: its copies
+    // before, drawn from the other buffer, found by their index data
+    // (only ones whose own mesh isn't drawn now: another mesh's copies
+    // that share the index buffer keep theirs).
+    auto altKey = [](const InterpDraw& d) { return d.meshAlt * 0xC2B2AE3D27D4EB4Full ^ d.group; };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> byAlt;
+    for (auto& [key, before] : meshes) {
+      const auto& b = g.previous[before[0]];
+      if (b.meshAlt && !meshesNow.count(key)) {
+        auto& list = byAlt[altKey(b)];
+        list.insert(list.end(), before.begin(), before.end());
+      }
+    }
     for (auto& [key, now] : meshesNow) {
-      auto it = meshes.find(key);
-      if (it == meshes.end()) {
+      const std::vector<uint32_t>* found = nullptr;
+      if (auto it = meshes.find(key); it != meshes.end()) {
+        found = &it->second;
+      } else if (const auto& d = g.current[now[0]]; d.meshAlt && !d.boneSize && now.size() >= 2) {
+        // (as many copies as before, a few: not sprites from a ring of
+        // vertex data over one quad's indices, unrelated by their count)
+        if (auto alt = byAlt.find(altKey(d)); alt != byAlt.end() && alt->second.size() == now.size() &&
+                                              now.size() <= 16) {
+          found = &alt->second;
+        }
+      }
+      if (!found) {
         continue;
       }
-      auto& before = it->second;
+      auto& before = *found;
       bool single = now.size() == 1 && before.size() == 1;
       float bound = single ? 1.5f : (before.size() > 8 ? 0.1f : 0.3f);
       // A few alike copies without bones (a door's pieces flying from one
@@ -639,6 +662,35 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // was went without: part of the way each piece turned into another's
       // pose, a shake, the pieces thrown about).
       if (!single && now.size() <= 16 && before.size() <= 16 && !g.current[now[0]].boneSize) {
+        // Each copy's own few lights (c96-c107, the nearest of the room's,
+        // picked again as Ryu and the camera move: Chapter 6's banners,
+        // #121; places c96-c99, colours c100-c103, reach c104-c107, all
+        // changed with them) say nothing of where it is: left out of the score. With
+        // them a copy was farther from itself before than from its
+        // neighbour, or from all, and drawn as now between, ahead of the
+        // camera, a flicker as it moved.
+        auto copyDistance = [&](uint32_t i, uint32_t j) {
+          const auto& a = g.current[i].constants;
+          const auto& b = g.previous[j].constants;
+          const auto& regs = g.current[i].registers;
+          const auto& skip = matchSkips[i];
+          float distance = 0;
+          for (size_t r = 0; r * 4 < a.size() && distance < 1.0f; r++) {
+            if ((r < skip.size() && skip[r]) || (regs[r] >= 96 && regs[r] < 108)) {
+              continue;
+            }
+            const float* x = &a[r * 4];
+            const float* y = &b[r * 4];
+            float size = 1.0f, change = 0;
+            for (uint32_t c = 0; c < 4; c++) {
+              size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+              change = std::max(change, std::fabs(x[c] - y[c]));
+            }
+            float d = change / size;
+            distance = std::max(distance, std::isfinite(d) ? d : 1e9f);
+          }
+          return distance;
+        };
         struct Pair {
           float score;
           uint32_t i, j;
@@ -653,7 +705,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
               continue;
             }
-            float distance = InterpDistance(d, g.previous[j], 1.0f, &matchSkips[i]);
+            float distance = copyDistance(i, j);
             if (!(distance < 1.0f)) {
               continue;
             }

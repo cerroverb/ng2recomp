@@ -379,6 +379,8 @@ If you'd like to support the project: [GitHub Sponsors](https://github.com/spons
   Berbece: the PlayStation, Nintendo and keyboard button prompts (CC0)
 - [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
   alicenotmech: a reference for this port's own versions of some of its options
+- [IzunaRecomp](https://github.com/YaibaKamikaze/IzunaRecomp) by The Izuna Project contributors:
+  research on some optimizations, and the busy-wait loop detection of the recompiled code (MIT)
 - [Xenia Edge](https://github.com/has207/xenia-edge) by has207: a reference for how the game
   should look and behave, and its GPU traces for comparing frames with the native renderer
 - Banner lettering: Chakra Petch by Cadson Demak (SIL Open Font License)

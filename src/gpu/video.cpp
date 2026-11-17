@@ -1197,6 +1197,11 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
       // (the game over screen keeps the last picture of play in one, #88:
       // without a host texture its resolves were lost and it read black)
       return RenderFormat::B5G6R5_UNORM;
+    case xenos::TextureFormat::k_8:
+      // (Ninja Cinema's Classic Film Filter keeps the last picture in one and
+      // shows it on the frames it doesn't draw the scene: without a host
+      // texture those frames were black, #123)
+      return RenderFormat::R8_UNORM;
     default:
       return RenderFormat::UNKNOWN;
   }
@@ -2681,9 +2686,10 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
       }
       return nullptr;
     }
-    // Depth textures read their single channel everywhere, as Xenos does.
+    // Depth textures, and k_8's (#123), read their single channel
+    // everywhere, as Xenos does.
     if (fetch.format == xenos::TextureFormat::k_24_8 ||
-        fetch.format == xenos::TextureFormat::k_24_8_FLOAT) {
+        fetch.format == xenos::TextureFormat::k_24_8_FLOAT || fetch.format == xenos::TextureFormat::k_8) {
       RenderTextureViewDesc viewDesc = RenderTextureViewDesc::Texture2D(format);
       viewDesc.mipLevels = 1;
       viewDesc.componentMapping = RenderComponentMapping(RenderSwizzle::R, RenderSwizzle::R,
@@ -4290,7 +4296,9 @@ struct PipelineKey {
   uint32_t alphaToCoverage;
   float depthBias;  // host units (PolygonOffset)
   float slopeDepthBias;
-  uint32_t padding = 0;  // hashed and listed: no unset bytes
+  // PA_CL_CLIP_CNTL.clip_disable: geometry isn't clipped at the near and far
+  // planes, its depth clamped (0, as in the seed's lists: clipped).
+  uint32_t clipDisabled = 0;
 };
 static_assert(sizeof(PipelineKey) == 96);
 
@@ -4357,6 +4365,13 @@ std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShade
         break;
     }
   }
+  // Clipped at the near and far planes as on the console, unless the game
+  // turns clipping off. Left to plume's default (depth clamp, no clipping), a
+  // triangle that came up to the camera was drawn all the way to the eye, where
+  // it covers the screen: a Ninpo cast's swirl seen from inside it (cast in
+  // water, the camera turned by hand) drew long wedges of the scene's copy
+  // across the picture (#119).
+  desc.depthClipEnabled = !key.clipDisabled;
   reg::PA_SU_SC_MODE_CNTL mode;
   mode.value = key.cull;
   // Front faces are counter-clockwise unless PA_SU_SC_MODE_CNTL.face (as
@@ -5220,12 +5235,13 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   uint32_t interpBoneAddress = 0, interpBoneSize = 0;  // the bone palette (NG2_INTERP)
   // Which mesh this is (NG2_INTERP): its vertex and index data and range, the
   // same a frame on whatever the camera did (0: inline data, not known).
-  uint64_t interpMesh = 0;
+  uint64_t interpMesh = 0, interpMeshAlt = 0;
   if (!inlineData && InterpEnabled()) {
     interpMesh = (uint64_t(startVertex) << 32 | count) * 0x9E3779B97F4A7C15ull ^ startIndex;
     if (indexed) {
       if (uint32_t indexBuffer = guest::Load32(device + 0x308C)) {
         interpMesh = interpMesh * 0x100000001B3ull ^ guest::Load32(indexBuffer + 24);
+        interpMeshAlt = interpMesh;
       }
     }
   }
@@ -5347,6 +5363,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     captured.boneAddress = interpBoneAddress;
     captured.boneSize = interpBoneSize;
     captured.mesh = interpMesh;
+    captured.meshAlt = interpMesh ? interpMeshAlt : 0;
   }
 
   Upload sharedUpload = Allocate(sizeof(shared));
@@ -5521,6 +5538,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.depthControl = Register(device, 0x2200);
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
+  key.clipDisabled = (Register(device, 0x2204) >> 16) & 1;  // PA_CL_CLIP_CNTL.clip_disable
   PolygonOffset(device, mode, primitive, sizeSource->scale, key.depthBias, key.slopeDepthBias);
   key.alphaTest = colorControl.alpha_test_enable;
   key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
@@ -5542,7 +5560,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     pixelShader = g_debugShader.get();
     DebugColor(vs->entry->hash, reinterpret_cast<SharedConstants*>(sharedUpload.data)->debugColor);
   }
-  // NG2_DEBUG_SKIP=<vs hash prefix>[:<count>],...: those draws aren't made (to
+  // NG2_DEBUG_SKIP=<vs hash prefix | ps:<ps hash prefix>>[:<count>],...: those draws aren't made (to
   // find what a picture is made of); NG2_DEBUG_SKIP_BLINK=1: only 3 s of every 6.
   if (static const char* skip = std::getenv("NG2_DEBUG_SKIP"); skip && [&] {
         static const bool blink = std::getenv("NG2_DEBUG_SKIP_BLINK") != nullptr;
@@ -5554,14 +5572,17 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
           }
         }
         std::string hash = fmt::format("{:016X}", vs->entry->hash);
+        // ("ps:<prefix>": by the pixel shader's hash instead)
+        std::string psHash = ps ? fmt::format("ps:{:016X}", ps->entry->hash) : std::string();
         std::string list = skip;
         for (size_t at = 0; at <= list.size();) {
           size_t end = list.find(',', at);
           if (end == std::string::npos) end = list.size();
           std::string entry = list.substr(at, end - at);
-          size_t colon = entry.find(':');
+          size_t colon = entry.find(':', entry.rfind("ps:", 0) == 0 ? 3 : 0);
           std::string prefix = entry.substr(0, colon);
-          if (!prefix.empty() && hash.compare(0, prefix.size(), prefix) == 0 &&
+          const std::string& against = prefix.rfind("ps:", 0) == 0 ? psHash : hash;
+          if (!prefix.empty() && against.compare(0, prefix.size(), prefix) == 0 &&
               (colon == std::string::npos || std::strtoul(entry.c_str() + colon + 1, nullptr, 10) == count)) {
             return true;
           }
@@ -7490,8 +7511,13 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
   uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
   // An F7 trace also writes the small resolves (up to 512x512: a shadow map, a reflection,
   // a ripple map) as the GPU holds them, into its folder.
-  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= 512 &&
-              height <= 512;
+  // (NG2_TRACE_RESOLVE_MAX=<side>: bigger ones too, the scene's copies)
+  static const uint32_t dumpSide = [] {
+    const char* v = std::getenv("NG2_TRACE_RESOLVE_MAX");
+    return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 512u;
+  }();
+  bool dump = g_traceFile && !g_traceDir.empty() && Tracing() && width && height && width <= dumpSide &&
+              height <= dumpSide;
   bool toGuest = width && height && width <= kReadbackSide && height <= kReadbackSide;
   if (!toGuest && !dump) {
     return;
@@ -7525,8 +7551,8 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
       return;
     }
   }
-  if (size > (16u << 20)) {
-    return;  // (a trace's dump: up to 16 MB)
+  if (size > (dumpSide > 512 ? 160u << 20 : 16u << 20)) {
+    return;  // (a trace's dump: up to 16 MB; with NG2_TRACE_RESOLVE_MAX, a scene's copy at 4x)
   }
   uint64_t offset = (r.used + 511) & ~511ull;
   if (!r.buffer || offset + size > r.capacity) {
@@ -7768,6 +7794,10 @@ void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], ui
     TraceLog("clear flags {:#x} rects {} target {:x} {}x{} depth {:x} {}x{} z {} stencil {}", flags, rectCount,
              reinterpret_cast<uintptr_t>(target), target ? target->width : 0, target ? target->height : 0,
              reinterpret_cast<uintptr_t>(depth), depth ? depth->width : 0, depth ? depth->height : 0, z, stencil);
+    for (uint32_t i = 0; i < rectCount && rects; i++) {
+      TraceLog("  rect {} {} {} {} color {:08x} scissor {}", rects[i][0], rects[i][1], rects[i][2], rects[i][3], color,
+               guest::Load32(device + kScissorEnable));
+    }
   }
   if (!clearColor && !(flags & 0xE) && !clearDepth && !clearStencil) {
     return;

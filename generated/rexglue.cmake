@@ -45,6 +45,12 @@ if(WIN32)
         list(APPEND REXGLUE_RECOMP_OPTIONS -fasync-exceptions)
     endif()
 endif()
+# The guest's loads and stores as volatile ones again (pch: plain, with a
+# compiler barrier at every label), to compare or to rule them out.
+option(REXGLUE_GUEST_ACCESSES_VOLATILE "Recompiled code: volatile guest memory accesses" OFF)
+if(REXGLUE_GUEST_ACCESSES_VOLATILE)
+    list(APPEND REXGLUE_RECOMP_OPTIONS -DREX_GUEST_ACCESSES_VOLATILE)
+endif()
 if(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "none")
     list(APPEND REXGLUE_RECOMP_OPTIONS
         $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-g0>)
