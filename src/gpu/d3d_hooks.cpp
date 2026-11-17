@@ -279,10 +279,15 @@ REX_HOOK_RAW(sub_8376A518) {
   }
 }
 
-// D3D's writers of dirty constants into its command stream (r3 device; the
-// registers by mask from r6): runs of them copied as packets, the stream's
-// write pointer (device +48) moved on. With no GPU emulation nothing reads the
-// stream and the renderer reads the device's own copies: skipped.
+// D3D's writers of dirty state into its command stream (r3 device): the
+// registers by mask from r6 (the bool/loop constants among them), the float
+// constants, the user clip planes (r4 mask of 6, from device +10272; the
+// renderer has none) and the fetch constants (r4 dirty mask, from device +1152). Runs of them are
+// copied as packets and the stream's write pointer (device +48) moved on;
+// they call only the packet writer (83767020) and the stream's make-room
+// (8375FB58). With no GPU emulation nothing reads the stream and the renderer
+// reads the device's own copies: skipped. The callers reload r3 and read no
+// result.
 REX_EXTERN(__imp__sub_83767670);
 REX_HOOK_RAW(sub_83767670) {
   if (!ng2::video::IsNativeRenderer()) {
@@ -293,6 +298,18 @@ REX_EXTERN(__imp__sub_83767A10);
 REX_HOOK_RAW(sub_83767A10) {
   if (!ng2::video::IsNativeRenderer()) {
     __imp__sub_83767A10(ctx, base);
+  }
+}
+REX_EXTERN(__imp__sub_83767730);
+REX_HOOK_RAW(sub_83767730) {
+  if (!ng2::video::IsNativeRenderer()) {
+    __imp__sub_83767730(ctx, base);
+  }
+}
+REX_EXTERN(__imp__sub_837678B0);
+REX_HOOK_RAW(sub_837678B0) {
+  if (!ng2::video::IsNativeRenderer()) {
+    __imp__sub_837678B0(ctx, base);
   }
 }
 

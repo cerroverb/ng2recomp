@@ -258,8 +258,13 @@ NG2_PROFILE; in a heavy fight frame the renderer's share was 12-21 ms.
 - The Vulkan work on a thread of ours ("Render Commands"): the hooks still read guest memory on
   the game's render thread, everything for Vulkan is queued (a RenderCommandList that copies its
   arguments) and replayed there.
-- D3D's writers of constant packets (sub_83767670, sub_83767A10) are skipped with the native
-  renderer: nothing reads its command stream any more.
+- D3D's writers of state packets (sub_83767670, sub_83767A10, sub_83767730, sub_837678B0) are
+  skipped with the native renderer: nothing reads its command stream any more.
+- Upload buffers the GPU only copies from (guest memory, late copies, texture levels) are in
+  system memory (plume patch 0023), the constants and indices in VRAM through the PCIe BAR, where
+  CPU writes are slow on narrow links (#78, RX 6500 XT at x4). Measured on an R7 240 at PCIe 3.0 x2
+  in the first fight: end of frame 85 -> 5 ms a second, GPU 19.3 -> 21.6 ms a frame (copies over the
+  link); all in system memory (NG2_UPLOAD_HOST=1) also draw 70 -> 44 ms but GPU 24.3 ms.
 - The texture memo indexed by address: a resolve (about 30 a frame) no longer walks the whole memo.
   The stage timers read the CPU's time stamp counter instead of clock_gettime.
 - File reads the game asks to be asynchronous run on an I/O thread (SDK patch 0016): with reads

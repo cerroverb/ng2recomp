@@ -768,12 +768,21 @@ struct UploadAllocator {
   std::vector<UploadChunk> chunks;
   size_t chunk = 0;
   uint64_t offset = 0;
+  bool host = false;  // in system memory (see g_copyUploads)
   void Reset() {
     chunk = 0;
     offset = 0;
   }
 };
 UploadAllocator g_uploads[NUM_FRAMES];
+// What the GPU only copies from (guest memory, late copies, texture levels,
+// movie frames), in system memory: an upload buffer the shaders read goes to
+// VRAM through the PCIe BAR, where the CPU writes slowly on a narrow link
+// (#78: an RX 6500 XT, PCIe x4, spent 400 ms a second at the end of the frame
+// filling the late copies; on an R7 240 at PCIe 3.0 x2, 85 ms -> 5 ms). The
+// constants and indices the shaders read stay in VRAM: the GPU would read them
+// over the link at every draw.
+UploadAllocator g_copyUploads[NUM_FRAMES];
 // The pictures between's constants and bones, made on their own thread while
 // the game goes on (NG2_INTERP): reset with the frame's.
 UploadAllocator g_interpUploads[NUM_FRAMES];
@@ -2382,6 +2391,7 @@ void SwitchInterp();
 // has been submitted).
 void ReclaimSlot(uint32_t slot) {
   g_uploads[slot].Reset();
+  g_copyUploads[slot].Reset();
   g_interpUploads[slot].Reset();
   for (auto& texture : g_garbage[slot]) {
     g_descriptors.Free(texture->descriptor);
@@ -2879,9 +2889,16 @@ Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignmen
   if (allocator.chunk >= allocator.chunks.size()) {
     UploadChunk chunk;
     chunk.size = std::max(UPLOAD_CHUNK_SIZE, size);
-    chunk.buffer = g_device->createBuffer(RenderBufferDesc::UploadBuffer(
+    auto desc = RenderBufferDesc::UploadBuffer(
         chunk.size,
-        RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::INDEX));
+        RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::INDEX);
+    // NG2_UPLOAD_HOST=1: all of them in system memory, =0: all in VRAM (for comparisons).
+    static const int kUploadHost = [] {
+      const char* value = std::getenv("NG2_UPLOAD_HOST");
+      return value && (*value == '0' || *value == '1') ? *value - '0' : -1;
+    }();
+    desc.preferHost = kUploadHost >= 0 ? kUploadHost == 1 : allocator.host;
+    chunk.buffer = g_device->createBuffer(desc);
     if (!chunk.buffer) {
       REXLOG_ERROR("video: out of upload memory ({} MB)", chunk.size >> 20);
       std::_Exit(1);
@@ -2889,9 +2906,9 @@ Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignmen
     chunk.data = static_cast<uint8_t*>(chunk.buffer->map());
     chunk.address = chunk.buffer->getDeviceAddress();
     allocator.chunks.push_back(std::move(chunk));
-    REXLOG_INFO("video: upload chunk {}{} ({} MB)", allocator.chunks.size(),
+    REXLOG_INFO("video: upload chunk {}{} ({} MB{})", allocator.chunks.size(),
                 &allocator >= g_interpUploads && &allocator < g_interpUploads + NUM_FRAMES ? " (interpolation)" : "",
-                allocator.chunks.back().size >> 20);
+                allocator.chunks.back().size >> 20, desc.preferHost ? ", system memory" : "");
   }
   auto& chunk = allocator.chunks[allocator.chunk];
   Upload upload{chunk.buffer.get(), allocator.offset, chunk.data + allocator.offset,
@@ -2904,6 +2921,13 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   return AllocateFrom(g_uploads[g_frame], size, alignment);
 }
 
+// For what the GPU only copies from (g_copyUploads).
+Upload AllocateCopySource(uint64_t size, uint64_t alignment = 256) {
+  auto& allocator = g_copyUploads[g_frame];
+  allocator.host = true;
+  return AllocateFrom(allocator, size, alignment);
+}
+
 // The blank textures behind unbound slots, cleared to 0 and moved to
 // SHADER_READ once, in the first frame's list (#18): their descriptors say
 // SHADER_READ, and they were sampled in their creation layout (undefined),
@@ -2914,7 +2938,7 @@ void PrepareNullTextures() {
     return;
   }
   g_nullTexturesReady = true;
-  Upload zeros = Allocate(256, 256);
+  Upload zeros = AllocateCopySource(256, 256);
   std::memset(zeros.data, 0, 256);
   for (uint32_t i = 0; i < DESCRIPTOR_FIRST_FREE; i++) {
     HostTexture& texture = g_nullTextures[i];
@@ -3032,7 +3056,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   if (range.late) {
     if (range.lateFrame != g_frameCount) {
       range.lateFrame = g_frameCount;
-      Upload upload = Allocate(size, 16);
+      Upload upload = AllocateCopySource(size, 16);
       g_copyTag = bones && InterpEnabled() ? NoteInterpPalette(address, size) : -1;
       RecordGuestMemoryCopy(address, upload, size, inOrder);
       g_copyTag = -1;
@@ -3095,7 +3119,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   range.changedFrame = g_frameCount;
   g_profile.uploadedBytes += length;
   std::memcpy(shadow + begin, source + begin, length);
-  Upload upload = Allocate(length, 16);
+  Upload upload = AllocateCopySource(length, 16);
   std::memcpy(upload.data, source + begin, length);
   RecordGuestMemoryCopy(address + begin, upload, length, inOrder);
 }
@@ -3662,7 +3686,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
     const LevelLayout& level = used->levels[i];
     uint64_t bytes = uint64_t((level.width + info.blockSize - 1) / info.blockSize) *
                      ((level.height + info.blockSize - 1) / info.blockSize) * info.bytesPerBlock;
-    Upload upload = Allocate(bytes, 16);
+    Upload upload = AllocateCopySource(bytes, 16);
     std::memset(upload.data, 0, bytes);
     if (!header.empty()) {
       std::memcpy(upload.data, header.data(), header.size());
@@ -5942,7 +5966,7 @@ HostTexture* MovieTexture() {
     g_movieUploaded = g_movieSerial;
     uint32_t rowBytes = g_movieWidth * 4;
     uint32_t pitch = (rowBytes + 255) & ~255u;
-    Upload upload = Allocate(uint64_t(pitch) * g_movieHeight, 512);
+    Upload upload = AllocateCopySource(uint64_t(pitch) * g_movieHeight, 512);
     for (uint32_t y = 0; y < g_movieHeight; y++) {
       std::memcpy(upload.data + uint64_t(y) * pitch, g_movieRGBA.data() + uint64_t(y) * rowBytes,
                   rowBytes);
@@ -7719,6 +7743,9 @@ void DestroyHostDevice() {
   for (auto& allocator : g_uploads) {
     allocator.chunks.clear();
   }
+  for (auto& allocator : g_copyUploads) {
+    allocator.chunks.clear();
+  }
   ReleaseInterpResources();
   g_guestMemory.reset();
   g_frameRanges.clear();
@@ -8119,7 +8146,7 @@ void UpdateGammaTable(uint32_t device) {
     }
     SetDescriptor(*g_gammaTable);
   }
-  Upload upload = Allocate(256 * 8, 16);
+  Upload upload = AllocateCopySource(256 * 8, 16);
   auto* texels = reinterpret_cast<uint16_t*>(upload.data);
   for (uint32_t i = 0; i < 256; i++) {
     // 10-bit values in the high bits: 1023 << 6 must read as 1.0.
