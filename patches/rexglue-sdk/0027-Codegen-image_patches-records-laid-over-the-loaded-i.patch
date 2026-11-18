@@ -1,0 +1,230 @@
+From 135edafc0a7562821a66634166495bef76934cc4 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Wed, 18 Nov 2026 02:20:42 +0000
+Subject: [PATCH] Codegen: image_patches, records laid over the loaded image
+ before analysis (new code recompiled with the game's; bytes past a section's
+ end in executable sections of their own)
+
+---
+ include/rex/codegen/binary_view.h     |  2 ++
+ include/rex/codegen/codegen_context.h |  3 ++
+ include/rex/codegen/config.h          |  5 ++++
+ src/codegen/binary_view.cpp           | 43 +++++++++++++++++++++++++++
+ src/codegen/codegen_context.cpp       | 40 +++++++++++++++++++++++++
+ src/codegen/config.cpp                |  9 ++++++
+ src/codegen/project_recompiler.cpp    |  6 ++++
+ 7 files changed, 108 insertions(+)
+
+diff --git a/include/rex/codegen/binary_view.h b/include/rex/codegen/binary_view.h
+index 3af16d2..19c0816 100644
+--- a/include/rex/codegen/binary_view.h
++++ b/include/rex/codegen/binary_view.h
+@@ -62,6 +62,8 @@ class BinaryView {
+ 
+   // Section access
+   const uint8_t* translate(uint32_t addr) const;
++  /// Overwrites bytes of a loaded section (image_patches); false if they aren't all in one.
++  bool patch(uint32_t addr, const uint8_t* data, size_t size);
+   bool isExecutable(uint32_t addr) const;
+   const SectionView* findSection(uint32_t addr) const;
+   const SectionView* findSectionByName(std::string_view name) const;
+diff --git a/include/rex/codegen/codegen_context.h b/include/rex/codegen/codegen_context.h
+index a736bcc..c3c9d37 100644
+--- a/include/rex/codegen/codegen_context.h
++++ b/include/rex/codegen/codegen_context.h
+@@ -156,6 +156,9 @@ class CodegenContext {
+ 
+   const std::filesystem::path& configDir() const { return configDir_; }
+   void setConfigDir(const std::filesystem::path& dir) { configDir_ = dir; }
++  /// Lays the config's image_patches over the binary (relative to configDir()); an error names
++  /// the file and record that couldn't be applied.
++  Result<void> applyImagePatches();
+ 
+   void setDllModule(bool is_dll) { is_dll_module_ = is_dll; }
+   bool isDllModule() const { return is_dll_module_; }
+diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
+index ef5f942..2a74648 100644
+--- a/include/rex/codegen/config.h
++++ b/include/rex/codegen/config.h
+@@ -101,6 +101,11 @@ struct RecompilerConfig {
+   /// Vector registers kept in the shared context even when non-volatiles are locals: ones the
+   /// game's code passes values in between functions (shared_vector_registers = [64, 65, ...]).
+   std::bitset<128> sharedVectorRegisters;
++  /// Files of records laid over the loaded image before analysis (image_patches = ["a.bin"],
++  /// relative to the config): new code to recompile with the game's. Format: "MECR", the record
++  /// count (u32 big-endian) at 8, records from 0x20, each address and size (u32 big-endian) then
++  /// the bytes.
++  std::vector<std::string> imagePatches;
+   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
+ 
+   // === Analysis tuning (optional) ===
+diff --git a/src/codegen/binary_view.cpp b/src/codegen/binary_view.cpp
+index 30694bc..02980c6 100644
+--- a/src/codegen/binary_view.cpp
++++ b/src/codegen/binary_view.cpp
+@@ -8,6 +8,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <cstring>
+ #include <limits>
+ 
+ #include <rex/codegen/binary_view.h>
+@@ -139,3 +140,45 @@ const SectionView* BinaryView::findSectionByName(std::string_view name) const {
+ }
+ 
+ }  // namespace rex::codegen
++
++namespace rex::codegen {
++bool BinaryView::patch(uint32_t addr, const uint8_t* data, size_t size) {
++  // Into a loaded section where it falls in one; bytes past every section (code caves at a
++  // section's end, in its last page) go into an executable section of their own.
++  while (size > 0) {
++    const SectionView* in = nullptr;
++    size_t index = 0;
++    for (size_t i = 0; i < sections_.size(); i++) {
++      if (addr >= sections_[i].baseAddress && addr < sections_[i].baseAddress + sections_[i].size) {
++        in = &sections_[i], index = i;
++        break;
++      }
++    }
++    if (in) {
++      size_t n = std::min<size_t>(size, in->baseAddress + in->size - addr);
++      std::memcpy(sectionData_[index].data() + (addr - in->baseAddress), data, n);
++      addr += uint32_t(n), data += n, size -= n;
++      continue;
++    }
++    // (up to the next section's start)
++    uint64_t next = uint64_t(baseAddress_) + imageSize_;
++    for (const auto& section : sections_) {
++      if (section.baseAddress > addr && section.baseAddress < next) {
++        next = section.baseAddress;
++      }
++    }
++    if (addr < baseAddress_ || addr >= next) {
++      return false;
++    }
++    size_t n = std::min<size_t>(size, next - addr);
++    sectionData_.emplace_back(data, data + n);
++    sections_.push_back(SectionView{.name = "patch",
++                                    .baseAddress = addr,
++                                    .size = uint32_t(n),
++                                    .data = sectionData_.back().data(),
++                                    .executable = true});
++    addr += uint32_t(n), data += n, size -= n;
++  }
++  return true;
++}
++}  // namespace rex::codegen
+diff --git a/src/codegen/codegen_context.cpp b/src/codegen/codegen_context.cpp
+index b956713..3143b92 100644
+--- a/src/codegen/codegen_context.cpp
++++ b/src/codegen/codegen_context.cpp
+@@ -9,6 +9,9 @@
+  */
+ 
+ #include "decoded_binary.h"
++#include <cstring>
++#include <fstream>
++#include <iterator>
+ 
+ #include <fmt/format.h>
+ 
+@@ -69,6 +72,10 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
+   ctx.binary_ = BinaryView::fromModule(*module);
+   ctx.resolver_ = runtime.export_resolver();
+ 
++  if (auto patched = ctx.applyImagePatches(); !patched) {
++    return Err<CodegenContext>(patched.error());
++  }
++
+   REXCODEGEN_TRACE("Loaded XEX: base=0x{:08X}, size=0x{:X}, entry=0x{:08X}",
+                    ctx.binary_.baseAddress(), ctx.binary_.imageSize(), ctx.binary_.entryPoint());
+ 
+@@ -81,6 +88,39 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
+   return ctx;
+ }
+ 
++// image_patches: records laid over the image before analysis.
++Result<void> CodegenContext::applyImagePatches() {
++  for (const auto& name : config_.imagePatches) {
++    auto path = configDir_ / name;
++    std::ifstream file(path, std::ios::binary);
++    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    auto be32 = [&](size_t at) {
++      return uint32_t(data[at]) << 24 | uint32_t(data[at + 1]) << 16 | uint32_t(data[at + 2]) << 8 | data[at + 3];
++    };
++    if (data.size() < 0x20 || std::memcmp(data.data(), "MECR", 4) != 0) {
++      return Err<void>(ErrorCategory::Format,
++                                 fmt::format("image patch {}: not a records file", path.string()));
++    }
++    uint32_t count = be32(8);
++    size_t at = 0x20, bytes = 0;
++    for (uint32_t i = 0; i < count; i++) {
++      if (at + 8 > data.size() || at + 8 + be32(at + 4) > data.size()) {
++        return Err<void>(ErrorCategory::Format,
++                                   fmt::format("image patch {}: record {} runs past the end", path.string(), i));
++      }
++      uint32_t address = be32(at), size = be32(at + 4);
++      if (!binary_.patch(address, data.data() + at + 8, size)) {
++        return Err<void>(ErrorCategory::Format,
++                                   fmt::format("image patch {}: 0x{:08X} (+{}) not in a loaded section",
++                                               path.string(), address, size));
++      }
++      at += 8 + size, bytes += size;
++    }
++    REXCODEGEN_INFO("Image patch {}: {} records, {} bytes", path.string(), count, bytes);
++  }
++  return Ok();
++}
++
+ CodegenContext CodegenContext::Create(BinaryView binary, RecompilerConfig config) {
+   CodegenContext ctx;
+   ctx.binary_ = std::move(binary);
+diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
+index cf811ef..725bffe 100644
+--- a/src/codegen/config.cpp
++++ b/src/codegen/config.cpp
+@@ -125,6 +125,15 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+       }
+     }
+   }
++  if (auto patches = toml["image_patches"].as_array()) {
++    for (auto& entry : *patches) {
++      if (auto path = entry.value<std::string>()) {
++        cfg.imagePatches.push_back(*path);
++      } else {
++        REXCODEGEN_ERROR("image_patches: expected file paths");
++      }
++    }
++  }
+   if (hasBool("is_dll")) {
+     cfg.isDll = toml["is_dll"].value_or(false);
+   }
+diff --git a/src/codegen/project_recompiler.cpp b/src/codegen/project_recompiler.cpp
+index 240bcb0..73a3208 100644
+--- a/src/codegen/project_recompiler.cpp
++++ b/src/codegen/project_recompiler.cpp
+@@ -65,6 +65,9 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
+   for (const auto& loaded : cfg.loadedFiles) {
+     inputs.emplace_back(loaded);
+   }
++  for (const auto& patch : cfg.imagePatches) {
++    inputs.push_back(configDir / patch);
++  }
+   if (!cfg.templateDir.empty()) {
+     std::error_code ec;
+     for (const auto& entry : fs::recursive_directory_iterator(configDir / cfg.templateDir, ec)) {
+@@ -317,6 +320,9 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
+     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
+     ctx.setResolver(resolver);
+     ctx.setConfigDir(configDir);
++    if (auto patched = ctx.applyImagePatches(); !patched) {
++      return Err<void>(patched.error());
++    }
+     ctx.analysisState().format = "xex";
+     ctx.analysisState().loadAddress = ctx.binary().baseAddress();
+     ctx.analysisState().entryPoint = ctx.binary().entryPoint();
+-- 
+2.56.1
+

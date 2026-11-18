@@ -2877,6 +2877,39 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
 
 // Uploads ----------------------------------------------------------------------
 
+// How fast the CPU writes an upload buffer in VRAM and one in system memory,
+// in GB/s, timed once at the first upload: on a narrow PCIe link (#78) writing
+// VRAM through the BAR is slow, and the shader constants are better off in
+// system memory. Best of a few passes over 16 MB, after one to fault it in.
+struct UploadWriteRates {
+  double vram = 0, host = 0;
+};
+UploadWriteRates MeasureUploadWrites() {
+  constexpr uint64_t kSize = 16ull << 20;
+  std::vector<uint8_t> source(kSize, 0x5A);
+  auto measure = [&](bool preferHost) {
+    auto desc = RenderBufferDesc::UploadBuffer(kSize, RenderBufferFlag::CONSTANT);
+    desc.preferHost = preferHost;
+    auto buffer = g_device->createBuffer(desc);
+    auto* data = buffer ? static_cast<uint8_t*>(buffer->map()) : nullptr;
+    if (!data) return 0.0;
+    double best = 1e9;
+    for (int pass = 0; pass < 5; pass++) {
+      auto start = std::chrono::steady_clock::now();
+      std::memcpy(data, source.data(), kSize);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      if (pass > 0) best = std::min(best, seconds);
+    }
+    buffer->unmap();
+    return double(kSize) / best / 1e9;
+  };
+  UploadWriteRates rates{measure(false), measure(true)};
+  REXLOG_INFO("video: upload writes {:.1f} GB/s to VRAM, {:.1f} GB/s to system memory", rates.vram,
+              rates.host);
+  return rates;
+}
+
 Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignment = 256) {
   allocator.offset = (allocator.offset + alignment - 1) & ~(alignment - 1);
   // Move on while the current chunk can't hold it (chunks can be bigger
@@ -2892,12 +2925,25 @@ Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignmen
     auto desc = RenderBufferDesc::UploadBuffer(
         chunk.size,
         RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::INDEX);
-    // NG2_UPLOAD_HOST=1: all of them in system memory, =0: all in VRAM (for comparisons).
+    // NG2_UPLOAD_HOST=1: all of them in system memory, =0: all in VRAM (overrides the timing).
     static const int kUploadHost = [] {
       const char* value = std::getenv("NG2_UPLOAD_HOST");
       return value && (*value == '0' || *value == '1') ? *value - '0' : -1;
     }();
-    desc.preferHost = kUploadHost >= 0 ? kUploadHost == 1 : allocator.host;
+    // The constants and indices too in system memory when writing VRAM is
+    // under a quarter of the speed (narrow PCIe link): there the render thread
+    // waits on the writes (#78's RX 6500 XT: draw 450 -> 125 ms a second), at a
+    // cost in GPU time a GPU-bound card feels (an R7 240 at x2: 47.5 -> 42 fps).
+    // Also under 8 GB/s, should system memory's rate come out of the CPU's
+    // cache. Not timed when NG2_UPLOAD_HOST decides.
+    static const bool kSlowVram = [] {
+      if (kUploadHost >= 0) return false;
+      UploadWriteRates rates = MeasureUploadWrites();
+      bool slow = rates.vram > 0 && rates.vram < 8 && rates.vram * 4 < rates.host;
+      if (slow) REXLOG_INFO("video: slow VRAM writes, constants in system memory");
+      return slow;
+    }();
+    desc.preferHost = kUploadHost >= 0 ? kUploadHost == 1 : allocator.host || kSlowVram;
     chunk.buffer = g_device->createBuffer(desc);
     if (!chunk.buffer) {
       REXLOG_ERROR("video: out of upload memory ({} MB)", chunk.size >> 20);
@@ -6182,7 +6228,7 @@ void Present(HostTexture* frontBuffer) {
     // for 5 s then, and tried again)
     static int timeouts = 0;
     static auto pausedUntil = std::chrono::steady_clock::time_point{};
-    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() && !interp &&
+    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !GamescopeUntimed() && !interp &&
         std::chrono::steady_clock::now() >= pausedUntil) {
       // Low leaves a frame one refresh to be ready, and a scene whose frames
       // take about that long shows many of them twice for minutes (#36,
@@ -6987,6 +7033,26 @@ void DisplayClockThread() {
       continue;
     }
     int64_t t = SteadyNs();
+    // (present timing: when it was shown, not when the poll saw it)
+    // (gamescope reports a frame once its flip is set, a few ms before the
+    // refresh it goes out at: times up to 50 ms ahead taken)
+    if (int64_t shownNs = swapChain->getPresentTime(next);
+        shownNs > 0 && shownNs <= t + 50'000'000 && shownNs > t - 250'000'000) {
+      // (how late the reports come, logged every 10 s: negative, early)
+      static double lateSum = 0, lateWorst = -1e9;
+      static int lateCount = 0;
+      static int64_t lateLogAt = 0;
+      double late = double(t - shownNs) / 1e6;
+      lateSum += late, lateWorst = std::max(lateWorst, late), lateCount++;
+      if (!lateLogAt) {
+        lateLogAt = t;
+      } else if (t - lateLogAt > 10'000'000'000) {
+        REXLOG_INFO("video: present timing reports came {:.1f} ms after the frame was shown (latest {:.1f}; {})",
+                    lateSum / lateCount, lateWorst, lateCount);
+        lateSum = 0, lateWorst = -1e9, lateCount = 0, lateLogAt = t;
+      }
+      t = shownNs;
+    }
     {
       std::lock_guard lock(g_taggedMutex);
       TaggedPresent& tag = g_tagged[next % 64];
@@ -7181,12 +7247,51 @@ bool UnderGamescope() {
     const char* v = std::getenv("GAMESCOPE_WAYLAND_DISPLAY");
     bool yes = v && v[0];
     if (yes) {
-      REXLOG_INFO("video: under gamescope: Input Latency Low and Frame Pacing Auto act as "
-                  "Standard and Timer (Auto not with NG2_TEST_GAMESCOPE_AUTO=1)");
+      REXLOG_INFO("video: under gamescope");
     }
     return yes;
   }();
   return under;
+}
+
+// Under gamescope, where present_wait reports when gamescope took a frame,
+// not when it was shown: Input Latency Low needs the shown times, which
+// VK_EXT_present_timing gives where gamescope offers it (SteamOS 3.10; on a
+// Deck in Game Mode, pad to screen 71 -> 55 ms while Low holds). Without it
+// Low acts as Standard. Frame Pacing Auto acts as Timer under gamescope
+// (NG2_TEST_GAMESCOPE_AUTO=1 lets it run), but Low there locks the vblanks to
+// the display itself (LowLocksVblanks).
+bool GamescopeUntimed() {
+  if (!UnderGamescope()) {
+    return false;
+  }
+  // (NG2_TEST_UNTIMED=1: as without it, the shown times still measured)
+  static const bool untimedTest = TestSwitch("NG2_TEST_UNTIMED", "1");
+  // (from the vblank thread too: g_presentDrainCheck is cleared before the
+  // swapchain goes, as for PresentQueueDrained)
+  if (!g_presentDrainCheck.load() || !g_swapChain) {
+    return true;  // (not known yet: logged once there is one)
+  }
+  const bool timed = g_swapChain->hasPresentTiming() && !untimedTest;
+  static std::atomic<int> logged{-1};
+  if (logged.exchange(timed ? 1 : 0) != (timed ? 1 : 0)) {
+    REXLOG_INFO("video: under gamescope {}; Frame Pacing Auto acts as Timer",
+                timed ? "with present timing: Input Latency Low on (it locks the vblanks to the display)"
+                      : "without present timing: Input Latency Low acts as Standard");
+  }
+  return !timed;
+}
+
+// Input Latency Low under gamescope with present timing: the guest's vblanks
+// on the display's refreshes, half a refresh after them, whichever Frame
+// Pacing is set. Each frame there waits until the last is shown, which
+// gamescope reports a few ms before its refresh: a vblank near that moment
+// (the guest timer drifting by, about every 8 minutes at 59.998 Hz, or Auto's
+// 5%) made the game's steps land on the presents' edge for minutes, up to 18
+// frames a second without a step and as many with two. Half a refresh after
+// it they never did (4-minute runs on a Deck: 25% still did).
+bool LowLocksVblanks() {
+  return REXCVAR_GET(input_latency) == 1 && UnderGamescope() && !GamescopeUntimed() && !InterpEnabled();
 }
 
 int64_t DisplayClockNow() {
@@ -7233,9 +7338,22 @@ bool CreateHostDevice() {
 
   g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
   g_swapChain->setAcquireInShortWaits(InterpEnabled());  // (see SwitchInterp)
-  if (UpdateExclusiveMode()) {
-    g_swapChain->resize();  // (made again with it)
+  // VK_EXT_present_timing under gamescope (GamescopeUntimed); NG2_PRESENT_TIMING=0
+  // never, =1 everywhere it's offered (for tests).
+  static const int presentTiming = [] {
+    const char* v = std::getenv("NG2_PRESENT_TIMING");
+    return v && (v[0] == '0' || v[0] == '1') ? v[0] - '0' : -1;
+  }();
+  const bool timing = presentTiming >= 0 ? presentTiming == 1 : UnderGamescope();
+  if (timing && g_device->getCapabilities().presentTiming) {
+    g_swapChain->setPresentTiming(true);
   }
+  if (UpdateExclusiveMode() || (timing && g_device->getCapabilities().presentTiming)) {
+    g_swapChain->resize();  // (made again with them)
+  }
+  REXLOG_INFO("video: present timing {}", g_swapChain->hasPresentTiming() ? "on"
+              : g_device->getCapabilities().presentTiming ? (timing ? "not offered by the surface" : "off")
+                                                          : "not offered by the device");
   SetInterpPictureCap();
   g_presentDrainCheck.store(g_swapChain != nullptr);
   // NG2_TEST_DXGI_CLOCK=1 (Windows): the DXGI display clock even with present_wait.

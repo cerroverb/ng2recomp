@@ -1,0 +1,104 @@
+# Modern Camera and OT/UT Free Camera (src/camera.cpp): the camera code of alicenotmech's
+# Ninja Gaiden II Master Edition (MIT, see THIRD_PARTY.md), recompiled with the game's.
+# Included from ng2_manifest.toml.
+#
+# mods-builtin/master-edition/camera-codegen.bin: their camera functions, laid over the image
+# before analysis (in code caves and over the start of sub_83A42C90, a WMV decoder function of
+# the XDK the game never runs here: movies play on the host). Their glue stubs, which branch
+# into the middle of game functions, are blanked there and done as hooks below and in camera.cpp.
+image_patches = ["mods-builtin/master-edition/camera-codegen.bin"]
+
+[functions]
+0x83A3550C = {}
+0x83A42C90 = {}
+0x83A42D6C = {}
+0x83A43790 = {}
+0x83A43B5C = {}
+0x83A44070 = {}
+0x83A4457C = {}
+0x83A448F0 = {}
+0x83A44C10 = {}
+0x83A44F30 = {}
+0x83A451D8 = {}
+0x83A4543C = {}
+0x83A45554 = {}
+0x83A4D4B4 = {}
+0x83A4D55C = {}
+0x83A63F34 = {}
+0x83A65E5C = {}
+0x83A65F80 = {}
+0x83A6CF7C = {}
+0x83A83654 = {}
+0x83A84B00 = {}
+0x83A84ED4 = {}
+0x83A87FFC = {}
+0x83A881AC = {}
+0x83A88200 = {}
+0x83A88280 = {}
+0x83A884D4 = {}
+0x83A895EC = {}
+0x83A8A400 = {}
+0x83A8A61C = {}
+0x83A8A72C = {}
+0x83A8A7CC = {}
+0x83A8AE58 = {}
+0x83A8B478 = {}
+0x83A8B9C4 = {}
+0x83A8BED8 = {}
+0x83A8C1B0 = {}
+0x83A8C1E0 = {}
+0x83A8C210 = {}
+0x83A8C240 = {}
+0x83A8C400 = {}
+0x83A8D090 = {}
+0x83A8D7B8 = {}
+0x83A8DEC8 = {}
+0x83A8E55C = {}
+0x83A8E75C = {}
+0x83A8E8A4 = {}
+0x83A8EA30 = {}
+0x83A8F000 = {}
+0x83A8F128 = {}
+0x83A8F3B0 = {}
+0x83A8F560 = {}
+0x83A8F6A8 = {}
+0x83A8F7B4 = {}
+0x83A8F858 = {}
+0x83A8F968 = {}
+0x83A8FB44 = {}
+0x83A8FCB8 = {}
+0x83A8FDFC = {}
+0x83A8FFB8 = {}
+0x83A8FFDC = {}
+
+# Their hooks inside the game's camera code, each acting only while Modern Camera is on
+# (camera.cpp). Step B of the follow camera: the distance it keeps, eased.
+[[midasm_hook]]
+address = 0x823071A4
+name = "Ng2CameraStepBDistance"
+registers = ["f10", "f12", "f13", "f27", "f31"]
+
+# Step B: a flag kept only in states 79, 86, 87 of the object (r30).
+[[midasm_hook]]
+address = 0x823073BC
+name = "Ng2CameraStepBFlag"
+registers = ["r11", "r30"]
+
+# Step D: a block skipped.
+[[midasm_hook]]
+address = 0x823082A0
+name = "Ng2CameraModern"
+jump_address_on_true = 0x823084E0
+
+# A turn limit of 3 degrees made 5.
+[[midasm_hook]]
+address = 0x8230B3AC
+name = "Ng2CameraTurnLimit"
+registers = ["f12"]
+
+# A call skipped (sub_823038A8).
+[[midasm_hook]]
+address = 0x823F83B4
+name = "Ng2CameraModern"
+jump_address_on_true = 0x823F83B8
+

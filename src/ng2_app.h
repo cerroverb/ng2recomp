@@ -19,6 +19,7 @@
 
 #include "controls.h"
 #include "aspect.h"
+#include "camera.h"
 #include "dlc.h"
 #include "gameplay.h"
 #include "mods.h"
@@ -178,6 +179,12 @@ class Ng2App : public rex::ReXApp {
     // portable mode).
     const std::filesystem::path data = user_data_root().parent_path();
     ng2::mods::Activate(data / "mods", game_data_root(), data / "mods-cache");
+    DumpImage();
+    // Modern Camera's code (camera.cpp), after the dump: that stays the game's own image.
+    ng2::camera::WriteCameraCode(runtime()->memory());
+  }
+
+  void DumpImage() {
     const char* path = std::getenv("NG2_DUMP_IMAGE");
     if (!path || !*path) {
       return;

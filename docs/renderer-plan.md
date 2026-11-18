@@ -265,6 +265,10 @@ NG2_PROFILE; in a heavy fight frame the renderer's share was 12-21 ms.
   CPU writes are slow on narrow links (#78, RX 6500 XT at x4). Measured on an R7 240 at PCIe 3.0 x2
   in the first fight: end of frame 85 -> 5 ms a second, GPU 19.3 -> 21.6 ms a frame (copies over the
   link); all in system memory (NG2_UPLOAD_HOST=1) also draw 70 -> 44 ms but GPU 24.3 ms.
+  The first upload times 16 MB of writes to each; when VRAM is under a quarter of system memory's
+  speed (and under 8 GB/s) the constants and indices go to system memory too (R7 240: 1.4 vs 30.5 GB/s, switches;
+  9070 XT with Resizable BAR: 29.4 vs 30.6, stays). On #78's RX 6500 XT that cut draw 450 -> 125 ms
+  a second; on the 9070 XT it bought nothing and cost GPU 1.77 -> 2.22 ms a frame.
 - The texture memo indexed by address: a resolve (about 30 a frame) no longer walks the whole memo.
   The stage timers read the CPU's time stamp counter instead of clock_gettime.
 - File reads the game asks to be asynchronous run on an I/O thread (SDK patch 0016): with reads

@@ -29,7 +29,8 @@ is supported and optional: it can be added on the first start or later.
   PlayStation and Nintendo prompts, following the controller in use
 - Options from alicenotmech's Master Edition, in the port's own versions: skip the death screen,
   chapter cards that go on by themselves, a HUD that fades out when not fighting (or hidden),
-  no post-effects, smoother HUD and menus, a sharper font, hi-res shadows in fights
+  no post-effects, smoother HUD and menus, a sharper font, hi-res shadows in fights; and its Modern
+  Camera and OT/UT Free Camera themselves
 - Skip intro and skip any cutscene; cheats: infinite health and ninpo, unlock difficulties and
   costumes, all weapons and ninpo, all crystal skulls, max health and ninpo
 - Low input latency and frame pacing on the display's own refreshes (options)
@@ -144,6 +145,10 @@ be writable (not inside Program Files). Delete `portable.txt` to go back.
 `NG2_GAME_DIR=<folder>` starts with that game folder instead of the remembered one (Linux; on
 Windows pass `--game_data_root=<folder>`).
 
+`NG2_UPLOAD_HOST=1` keeps all the data the game sends to the graphics card each frame in system
+memory, `=0` in the card's memory. Without it the game measures at start how fast it can write to
+the card, and on a slow link (a card on fewer PCIe lanes) keeps that data in system memory.
+
 ## Settings
 
 Everything is in the game's own menus: **RECOMP SETTINGS** on the title menu, and **Recomp
@@ -163,7 +168,8 @@ each defaults to the game's own behaviour.
   Windows, where the driver lacks it (AMD), it follows the monitor's own refreshes; else it runs as
   Timer). Timer is the default: use it on a variable-refresh display, G-Sync or FreeSync.
   In the Steam Deck's Game Mode (and any game run through gamescope) Auto acts as Timer: there it
-  gave me uneven frame pacing
+  gave me uneven frame pacing. Input Latency Low there keeps the game's frames on the display's
+  refreshes by itself, whichever Frame Pacing is set
 - **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
   All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
   new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
@@ -177,9 +183,12 @@ each defaults to the game's own behaviour.
   game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves);
   Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render scales)
 - **Gameplay**: Input Latency (Low: no finished frame waits for the screen; needs
-  VK_KHR_present_wait; in the Steam Deck's Game Mode, and any game run through gamescope, it acts as
-  Standard, as Low made frames come in pairs there); Unlock Difficulties (every path in New Game and Mission Mode, at once
-  either way)
+  VK_KHR_present_wait; under gamescope, as in the Steam Deck's Game Mode, it needs
+  VK_EXT_present_timing, which SteamOS has from 3.10, and acts as Standard without it); Unlock Difficulties (every path in New Game and Mission Mode, at once
+  either way); Modern Camera (Master Edition's camera, from the modern versions of the game: a
+  freer camera that follows less tightly); OT/UT Free Camera
+  (the camera stays under your control during Obliteration Techniques, Ultimate Techniques and
+  throws)
 
 In the in-game menu, a page with six settings has no Restore Defaults row (the list has no room
 for it); the title menu's has.
@@ -365,7 +374,8 @@ If you'd like to support the project: [GitHub Sponsors](https://github.com/spons
 - [Xelu's controller and keyboard prompts](https://thoseawesomeguys.com/prompts/) by Nicolae "Xelu"
   Berbece: the PlayStation, Nintendo and keyboard button prompts (CC0)
 - [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
-  alicenotmech: a reference for this port's own versions of some of its options
+  alicenotmech: its Modern Camera and OT/UT Free Camera, ported (MIT), and a reference for this
+  port's own versions of some of its other options
 - [IzunaRecomp](https://github.com/YaibaKamikaze/IzunaRecomp) by The Izuna Project contributors:
   research on some optimizations, and the busy-wait loop detection of the recompiled code (MIT)
 - [Xenia Edge](https://github.com/has207/xenia-edge) by has207: a reference for how the game

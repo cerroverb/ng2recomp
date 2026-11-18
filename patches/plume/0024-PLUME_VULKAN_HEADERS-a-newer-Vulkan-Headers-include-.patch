@@ -1,0 +1,35 @@
+From 4d2d1f3f2a43104e39d468e16b107d71a31d364e Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Wed, 18 Nov 2026 02:20:42 +0000
+Subject: [PATCH 24/25] PLUME_VULKAN_HEADERS: a newer Vulkan-Headers include
+ directory than the bundled one, for extensions it lacks
+
+---
+ CMakeLists.txt | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a7645a..1731faa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,11 +68,15 @@ endif()
+ # Create target
+ add_library(plume STATIC ${PLUME_SOURCES})
+ 
+-# Include directories
++# Include directories (PLUME_VULKAN_HEADERS: a newer Vulkan-Headers include
++# directory, for extensions the bundled one lacks)
++if(NOT PLUME_VULKAN_HEADERS)
++    set(PLUME_VULKAN_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/contrib/Vulkan-Headers/include)
++endif()
+ target_include_directories(plume PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}/contrib/volk
+-    ${CMAKE_CURRENT_SOURCE_DIR}/contrib/Vulkan-Headers/include
++    ${PLUME_VULKAN_HEADERS}
+     ${CMAKE_CURRENT_SOURCE_DIR}/contrib/VulkanMemoryAllocator/include
+ )
+ 
+-- 
+2.56.1
+

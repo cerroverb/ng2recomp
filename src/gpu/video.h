@@ -66,6 +66,10 @@ void WaitForRecordedCalls(uint64_t records);
 
 // Under gamescope, where frames' times on screen are reported unevenly (video.cpp).
 bool UnderGamescope();
+// Under gamescope without VK_EXT_present_timing (Input Latency Low can't run).
+bool GamescopeUntimed();
+// Input Latency Low under gamescope with present timing: vblanks locked to the display, at 50%.
+bool LowLocksVblanks();
 // The game a frame ahead of the display and held up by it each frame: the vblank
 // timer should skip a step (video.cpp, NoteFrameWait).
 bool DrainRequested();

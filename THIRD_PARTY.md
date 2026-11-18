@@ -22,6 +22,40 @@ checked out into `thirdparty/` at pinned versions, with this port's changes appl
 The native renderer (`src/gpu/video.cpp`) follows the Vulkan renderer of
 [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp) (GPL-3.0).
 
+Modern Camera and OT/UT Free Camera (`src/camera.cpp`) are the camera code of
+[Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by alicenotmech
+(MIT): its camera functions (taken from its `core.bin`: `mods-builtin/master-edition/camera-codegen.bin`) are
+recompiled with the game's and their data (`camera.bin`) written into the game's memory at start, and its hooks into the game's camera are redone as this port's hooks. Its
+notice:
+
+    MIT License
+
+    Copyright (c) 2026 alicenotmech
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+    ---
+
+    This license covers the patches, plugin code and tools by alicenotmech. "1280x720 Resolution" (Margen67) keeps its
+    author's terms. Weapon Property Fixes is ported from Fiend Busa's Ninja Gaiden 2 Black mod. Ninja Gaiden II is a
+    trademark of its owners; you need your own copy of the game.
+
 This port's changes to the ReXGlue SDK's recompiler (`patches/rexglue-sdk/0025`, `0026`) include parts
 taken from [IzunaRecomp](https://github.com/YaibaKamikaze/IzunaRecomp) (MIT): the detection of the
 game's busy-wait loops (`IsSpinLoopHead`), and the plain guest memory accesses with a compiler barrier

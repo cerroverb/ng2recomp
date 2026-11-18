@@ -219,6 +219,9 @@ constexpr Setting kSettings[] = {
      "frame_interpolation", Kind::kLevel},
     // The 1024x1024 shadow map in fights too (extras.cpp).
     {u"Shadows", {u"Original", u"Hi-Res"}, 2, "shadows", Kind::kLevel},
+    // Master Edition's camera (camera.cpp); camera control in OT and UT.
+    {u"Modern Camera", {u"On", u"Off"}, 2, "modern_camera", Kind::kOnOff},
+    {u"OT/UT Free Camera", {u"On", u"Off"}, 2, "free_camera_ot_ut", Kind::kOnOff},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -286,7 +289,7 @@ constexpr Page kPages[] = {
     // shows for its sixth category; builder sub_836D57B8), run as page 11
     // (the Options loop runs page 6 inline, 11 through sub_823E7C40); no
     // Restore Defaults of its own: ours.
-    {u"Gameplay", 11, 0x400, kOurRestore, {{Row(27), Row(10)}}, 2, true, 6},
+    {u"Gameplay", 11, 0x400, kOurRestore, {{Row(27), Row(10), Row(31), Row(32)}}, 4, true, 6},
 };
 static_assert(kOurRestore + kRestoreSize <= kTitleRowsSize);
 constexpr uint32_t kPageCount = std::size(kPages);

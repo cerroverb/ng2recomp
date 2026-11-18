@@ -9,4 +9,4 @@ game_root = "game_files"
 file_path = "game_files/default.xex"
 out_directory_path = "generated/default"
 # Hand-maintained: keep this line if the file is ever regenerated.
-includes = ["ng2_codegen.toml", "ng2_pointer_funcs.toml"]
+includes = ["ng2_codegen.toml", "ng2_pointer_funcs.toml", "ng2_camera.toml"]

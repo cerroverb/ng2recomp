@@ -7,7 +7,8 @@
 // replaced: creating one opens a HostMovie (FFmpeg) and returns a small
 // guest object standing for it, and the method wrappers the game calls (it
 // never calls the player's vtable itself) are answered on the host.
-// NG2_MOVIES=xmedia keeps the original player; NG2_MOVIE_TRACE=1 logs calls.
+// NG2_MOVIES=xmedia keeps the original player (no longer whole: Modern Camera's code, camera.cpp, sits over
+// the start of its WMV decoder, sub_83A42C90); NG2_MOVIE_TRACE=1 logs calls.
 //
 // What the game uses (from its calls and a trace of the original):
 //   create(device, params, &player): params +4 flags (0x8: loop, the

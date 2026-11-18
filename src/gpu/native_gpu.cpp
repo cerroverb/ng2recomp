@@ -397,8 +397,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         return on;
       }();
       int32_t presentMode = REXCVAR_GET(present_mode);
-      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 &&
-          (!ng2::video::UnderGamescope() || gamescopeAuto) &&
+      const bool lowLock = ng2::video::LowLocksVblanks();
+      if (REXCVAR_GET(vsync) && (REXCVAR_GET(frame_pacing) == 0 || lowLock) &&
+          (!ng2::video::UnderGamescope() || gamescopeAuto || lowLock) &&
           (presentMode == 1 || presentMode == 2 || presentMode == 3) &&
           ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
         int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);
@@ -406,15 +407,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (std::abs(step - guestPeriodNs) * 50 < guestPeriodNs) {
           if (!lockedLogged) {
             lockedLogged = true;
-            REXLOG_INFO("gpu: vblanks on the display's refreshes ({:.3f} Hz, every {})",
-                        1e9 / double(periodNs), every);
+            REXLOG_INFO("gpu: vblanks on the display's refreshes ({:.3f} Hz, every {}{})",
+                        1e9 / double(periodNs), every, lowLock ? ", for Input Latency Low under gamescope" : "");
           }
           // frame_pacing_phase after a refresh: the first refresh at least a
           // step, less half a refresh, after the last vblank (no two close
           // together when the lock starts). Refresh by refresh, so on a 120 Hz
           // panel (every 2) the vblanks keep to every second refresh whichever
           // refresh the clock last reported.
-          int64_t phase = std::clamp<int32_t>(REXCVAR_GET(frame_pacing_phase), 0, 50);
+          int64_t phase = lowLock ? 50 : std::clamp<int32_t>(REXCVAR_GET(frame_pacing_phase), 0, 50);
           int64_t target = refreshNs + periodNs * phase / 100;
           // From the last target, not the wake-up after it: an overslept
           // wake-up would push this one a refresh late.

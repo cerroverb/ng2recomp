@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 VERSION 0.6.8 LANGUAGES CXX)
+project(ng2 VERSION 0.6.9 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,8 +27,23 @@ if(CMAKE_CROSSCOMPILING)
 endif()
 
 # Sources
+# Master Edition's camera code (src/camera.cpp) written into the image at start: the records
+# embedded (re-run when the file changes).
+set(NG2_CAMERA_RECORDS "${CMAKE_CURRENT_SOURCE_DIR}/mods-builtin/master-edition/camera.bin")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NG2_CAMERA_RECORDS}")
+file(READ "${NG2_CAMERA_RECORDS}" NG2_CAMERA_HEX HEX)
+file(SIZE "${NG2_CAMERA_RECORDS}" NG2_CAMERA_SIZE)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," NG2_CAMERA_HEX "${NG2_CAMERA_HEX}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/camera_records.cpp.in"
+    "#include <cstdint>\nextern const uint8_t kCameraRecords[] = {${NG2_CAMERA_HEX}};\n"
+    "extern const uint32_t kCameraRecordsSize = ${NG2_CAMERA_SIZE};\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/camera_records.cpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/camera_records.cpp" COPYONLY)
+
 set(NG2_SOURCES
     src/main.cpp
+    src/camera.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/camera_records.cpp"
     src/gpu/video.cpp
     src/gpu/interp.cpp
     src/gpu/native_gpu.cpp
@@ -182,6 +197,8 @@ endif()
 
 # Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
 # Wayland surface support from patches/plume.
+# (the SDK's Vulkan headers, newer than plume's: VK_EXT_present_timing)
+set(PLUME_VULKAN_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk/thirdparty/vulkan-headers/include)
 add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)
 if(UNIX AND NOT APPLE)
     find_package(X11 REQUIRED)
