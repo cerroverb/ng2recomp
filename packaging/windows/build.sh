@@ -28,7 +28,8 @@ ffmpeg_sha256=7157177b8a6cb2174c1650ba8c71b363f2c78cba5330f88c4c02cf5b2b880646
 # PC without the redistributable installed runs the game too.
 vcredist_url=https://download.visualstudio.microsoft.com/download/pr/990c720a-46ce-4dc7-87b9-c2eb615d34b9/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe
 vcredist_sha256=cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b
-vcruntime_dlls=(msvcp140 msvcp140_atomic_wait vcruntime140 vcruntime140_1)
+# (msvcp140_1: std::pmr's functions, src/gpu/interp.cpp)
+vcruntime_dlls=(msvcp140 msvcp140_1 msvcp140_atomic_wait vcruntime140 vcruntime140_1)
 mkdir -p "$deps" "$out"
 
 [ -f "$repo/out/build/linux-amd64-release/shaders/ng2_shader_cache.cpp" ] ||
@@ -57,7 +58,8 @@ fi
 
 # The runtime DLLs, out of the redistributable's installer: cabinets appended to the exe hold the
 # MSI packages and their cabinets, where the x64 files are named <dll>_amd64.
-if [ "$(cat "$deps/vcruntime/.sha256" 2>/dev/null)" != "$vcredist_sha256" ]; then
+# (the stamp names the DLLs too: one added to the list is extracted again)
+if [ "$(cat "$deps/vcruntime/.sha256" 2>/dev/null)" != "$vcredist_sha256 ${vcruntime_dlls[*]}" ]; then
     exe=$deps/VC_redist.x64-$vcredist_sha256.exe
     if [ ! -s "$exe" ]; then
         curl -fL -o "$exe.tmp" "$vcredist_url" ||
@@ -80,7 +82,7 @@ if [ "$(cat "$deps/vcruntime/.sha256" 2>/dev/null)" != "$vcredist_sha256" ]; the
         cp "$tmp/dll/$dll.dll_amd64" "$deps/vcruntime/$dll.dll"
     done
     rm -rf "$tmp"
-    echo "$vcredist_sha256" > "$deps/vcruntime/.sha256"
+    echo "$vcredist_sha256 ${vcruntime_dlls[*]}" > "$deps/vcruntime/.sha256"
 fi
 
 # The bundled runtime must be at least as new as the C++ library the game is built against

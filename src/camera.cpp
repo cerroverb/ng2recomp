@@ -16,6 +16,7 @@
 // - OT/UT Free Camera: the action camera of OT, UT and throws (sub_82312F80) still runs, but its
 //   result is thrown away and the follow camera keeps the player's control.
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
@@ -161,6 +162,12 @@ REX_HOOK_RAW(sub_823039D0) {
     }
   }
   if (Modern()) {
+    // Their camera's speed (0x859F3904, 1-10; 0 reads as 5) from the game's Camera Speed
+    // slider (profile byte 63, 0-100), as a piece of their glue does: without it the camera
+    // turned at the slider's default whatever it was set to (#130).
+    if (const uint32_t profile = Load32(0x84C559E0)) {
+      Store32(0x859F3904, std::min<uint32_t>(10, Load8(profile + 63) * 9u / 100u + 1));
+    }
     sub_83A8FCB8(ctx, base);
     return;
   }

@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <memory_resource>
 #include <numeric>
 #include <unordered_map>
 #include <unordered_set>
@@ -224,10 +226,121 @@ void NoteInterpDraw(int32_t index, const uint64_t (&pushConstants)[3]) {
 
 namespace {
 
+// The build's own containers (its maps by value and kind, its lists for each
+// draw) come from one block a frame instead of a malloc and a free each: in a
+// crowd (900 draws, 15k registers) those were a third of the build's time,
+// the render thread waiting on it (#128). Each pool thread keeps its block,
+// grown to what its biggest frame took (a build may overlap one dropped by a
+// reset, on another thread).
+class BuildArena {
+ public:
+  BuildArena() : resource_(Block().data.get(), Block().size, &upstream_) {}
+  ~BuildArena() {
+    resource_.release();
+    auto& block = Block();
+    if (upstream_.bytes && block.size < kMaxBlock) {
+      block.size = std::min<size_t>(kMaxBlock, (block.size + upstream_.bytes) * 5 / 4);
+      block.data = std::make_unique<std::byte[]>(block.size);
+    }
+  }
+  std::pmr::memory_resource* get() { return &resource_; }
+
+ private:
+  static constexpr size_t kMaxBlock = 64u << 20;
+  struct Owned {
+    std::unique_ptr<std::byte[]> data = std::make_unique<std::byte[]>(1u << 20);
+    size_t size = 1u << 20;
+  };
+  static Owned& Block() {
+    static thread_local Owned block;
+    return block;
+  }
+  // (past the block: from the heap, counted to grow the block for next time)
+  struct Counting : std::pmr::memory_resource {
+    size_t bytes = 0;
+    void* do_allocate(size_t size, size_t alignment) override {
+      bytes += size;
+      return std::pmr::new_delete_resource()->allocate(size, alignment);
+    }
+    void do_deallocate(void* p, size_t size, size_t alignment) override {
+      std::pmr::new_delete_resource()->deallocate(p, size, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+  };
+  Counting upstream_;
+  std::pmr::monotonic_buffer_resource resource_;
+};
+
+template <typename T>
+using ArenaVector = std::pmr::vector<T>;
+template <typename K, typename V>
+using ArenaMap = std::pmr::unordered_map<K, V>;
+
+// The build's tables by register value (a lookup or two for each register of
+// each draw: std::unordered_map's node and prime modulo for each were a sixth
+// of the build, #128): open addressing in the arena, sized once for the most
+// entries it can get and never grown, so a value's reference stays put.
+template <typename V>
+class ValueMap {
+ public:
+  ValueMap(size_t most, std::pmr::memory_resource* arena) : slots_(arena) {
+    size_t size = 16;
+    while (size < most * 2) {
+      size <<= 1;
+    }
+    slots_.resize(size);
+    mask_ = size - 1;
+  }
+  // (the value, made if there's none)
+  V& operator[](uint64_t key) {
+    Slot& slot = Find(key);
+    if (!slot.used) {
+      slot.used = true;
+      slot.key = key;
+      count_++;
+    }
+    return slot.value;
+  }
+  V* find(uint64_t key) {
+    Slot& slot = Find(key);
+    return slot.used ? &slot.value : nullptr;
+  }
+  bool contains(uint64_t key) { return Find(key).used; }
+  void emplace(uint64_t key, const V& value) {  // (kept if there's one)
+    Slot& slot = Find(key);
+    if (!slot.used) {
+      slot.used = true;
+      slot.key = key;
+      slot.value = value;
+      count_++;
+    }
+  }
+  bool empty() const { return count_ == 0; }
+
+ private:
+  struct Slot {
+    uint64_t key = 0;
+    V value{};
+    bool used = false;
+  };
+  Slot& Find(uint64_t key) {
+    uint64_t h = key ^ (key >> 31);  // (the keys are mixed already: their high bits down)
+    h *= 0x9E3779B97F4A7C15ull;
+    for (size_t i = size_t(h >> 32) & mask_;; i = (i + 1) & mask_) {
+      Slot& slot = slots_[i];
+      if (!slot.used || slot.key == key) {
+        return slot;
+      }
+    }
+  }
+  ArenaVector<Slot> slots_;
+  size_t mask_ = 0, count_ = 0;
+};
+
 // How far apart two draws' constants are (the largest change, relative to
 // each register's size).
 float InterpDistance(const InterpDraw& a, const InterpDraw& b, float bound = 1e30f,
-                     const std::vector<bool>* skip = nullptr) {
+                     const ArenaVector<bool>* skip = nullptr) {
   float distance = 0;
   for (size_t r = 0; r * 4 < a.constants.size() && distance < bound; r++) {
     if (skip && r < skip->size() && (*skip)[r]) {
@@ -291,10 +404,9 @@ static bool InterpMovedFromAnother(const float* before, const float* now, size_t
 
 // Each register from a moved one on, in a run (a light is several: where,
 // colour, reach), taken as now.
-static void InterpRunsFrom(const std::vector<uint8_t>& moved, const std::vector<uint16_t>& registers,
-                           std::vector<uint8_t>& asNow) {
-  asNow.assign(registers.size(), 0);
+static void InterpRunsFrom(const uint8_t* moved, const std::vector<uint16_t>& registers, uint8_t* asNow) {
   for (size_t r = 0; r < registers.size(); r++) {
+    asNow[r] = 0;
     if (moved[r] || (r > 0 && asNow[r - 1] && registers[r] == registers[r - 1] + 1)) {
       asNow[r] = 1;
     }
@@ -318,6 +430,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   };
   auto& g = g_interp;
   int64_t startNs = SteadyNs();
+  BuildArena arenaHolder;
+  std::pmr::memory_resource* arena = arenaHolder.get();
   struct Timed {
     int64_t start;
     ~Timed() {
@@ -473,7 +587,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   g.drawsSeen += g.current.size();
   g.drawsWorst = std::max<uint64_t>(g.drawsWorst, g.current.size());
   std::shared_ptr<InterpFrames> frames;
-  std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+  ArenaMap<uint64_t, ArenaVector<uint32_t>> groups(arena);
   for (uint32_t i = 0; i < g.previous.size(); i++) {
     if (g.previous[i].submitted) {
       groups[g.previous[i].group].push_back(i);
@@ -492,8 +606,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // Only a value most draws have (the camera, the view): a light's, shared by
   // the floor's and the walls' passes for it, still tells one light's pass
   // from another's.
-  std::unordered_map<uint64_t, uint32_t> valueDraws;  // draws with each value
-  std::unordered_map<uint64_t, uint32_t> currentCount;  // draws of each kind this frame
+  size_t registersNow = 0;  // (the most values the tables below can get)
+  for (auto& d : g.current) {
+    registersNow += d.registers.size();
+  }
+  ValueMap<uint32_t> valueDraws(registersNow, arena);  // draws with each value
+  ArenaMap<uint64_t, uint32_t> currentCount(arena);  // draws of each kind this frame
   uint32_t submittedNow = 0;
   for (auto& d : g.current) {
     if (!d.submitted) {
@@ -506,7 +624,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     }
   }
   const uint32_t sharedDraws = std::max<uint32_t>(16, submittedNow / 4);
-  std::vector<std::vector<bool>> skips(g.current.size());
+  ArenaVector<ArenaVector<bool>> skips(g.current.size(), arena);
   for (size_t i = 0; i < g.current.size(); i++) {
     auto& d = g.current[i];
     if (!d.submitted) {
@@ -515,8 +633,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     auto& skip = skips[i];
     skip.resize(d.registers.size());
     for (size_t r = 0; r < d.registers.size(); r++) {
-      auto it = valueDraws.find(valueKey(d.registers[r], &d.constants[r * 4]));
-      skip[r] = it != valueDraws.end() && it->second >= sharedDraws;
+      const uint32_t* draws = valueDraws.find(valueKey(d.registers[r], &d.constants[r * 4]));
+      skip[r] = draws && *draws >= sharedDraws;
     }
   }
   // For matching only, also left out: a value many things have now (8 meshes
@@ -524,7 +642,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // which the game sorts again into each thing's list as it moves (outdoors,
   // among torches, a chest's list changed every few frames and it lost its
   // match, drawn off its place: a jerk). A thing's own matrix is its own.
-  std::vector<std::vector<bool>> matchSkips = skips;
+  ArenaVector<ArenaVector<bool>> matchSkips(skips, arena);
   {
     auto vectorKey = [](const float* y) {
       uint64_t a, b;
@@ -534,15 +652,19 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     };
     // (a thing's own values: its few parts' meshes, 3 for a chest; a light's: 40-200)
     constexpr uint32_t kManyMeshes = 8;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> meshesWith;  // value: its meshes, up to 8
+    struct Meshes {
+      uint64_t mesh[kManyMeshes];
+      uint32_t count = 0;
+    };
+    ValueMap<Meshes> meshesWith(registersNow, arena);  // value: its meshes, up to 8
     for (auto& d : g.current) {
       if (!d.submitted) {
         continue;
       }
       for (size_t r = 0; r < d.registers.size(); r++) {
         auto& m = meshesWith[vectorKey(&d.constants[r * 4])];
-        if (m.size() < kManyMeshes && std::find(m.begin(), m.end(), d.mesh) == m.end()) {
-          m.push_back(d.mesh);
+        if (m.count < kManyMeshes && std::find(m.mesh, m.mesh + m.count, d.mesh) == m.mesh + m.count) {
+          m.mesh[m.count++] = d.mesh;
         }
       }
     }
@@ -554,17 +676,17 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       auto& skip = matchSkips[i];
       skip.resize(d.registers.size());
       for (size_t r = 0; r < d.registers.size(); r++) {
-        auto it = meshesWith.find(vectorKey(&d.constants[r * 4]));
-        if (it != meshesWith.end() && it->second.size() >= kManyMeshes) {
+        const Meshes* m = meshesWith.find(vectorKey(&d.constants[r * 4]));
+        if (m && m->count >= kManyMeshes) {
           skip[r] = true;
         }
       }
     }
   }
-  std::vector<int32_t> match(g.current.size(), -1);
-  std::vector<float> matchDistance(g.current.size(), 0.0f);
-  std::vector<bool> used(g.previous.size());
-  std::unordered_map<uint64_t, uint32_t> occurrence;
+  ArenaVector<int32_t> match(g.current.size(), -1, arena);
+  ArenaVector<float> matchDistance(g.current.size(), 0.0f, arena);
+  ArenaVector<bool> used(g.previous.size(), false, arena);
+  ArenaMap<uint64_t, uint32_t> occurrence(arena);
   uint32_t submitted = 0, matched = 0;
   // Close enough to take without looking further: the same place among its
   // kind, moved as things move in a frame.
@@ -581,7 +703,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       int64_t start;
       ~MeshTimed() { g_interp.meshNs += SteadyNs() - start; }
     } meshTimed{meshStartNs};
-    std::unordered_map<uint64_t, std::vector<uint32_t>> meshes, meshesNow;
+    ArenaMap<uint64_t, ArenaVector<uint32_t>> meshes(arena), meshesNow(arena);
     for (uint32_t j = 0; j < g.previous.size(); j++) {
       if (g.previous[j].submitted && g.previous[j].mesh) {
         meshes[meshKey(g.previous[j])].push_back(j);
@@ -595,7 +717,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // Copies of one skinned mesh (bodies of one kind of enemy) can have the
     // same constants and differ only in their bones: how far the bones of
     // one before are from these now (the median of some rows' moves).
-    std::unordered_map<uint64_t, int32_t> previousPalette;
+    ArenaMap<uint64_t, int32_t> previousPalette(arena);
     for (int32_t p = 0; p < int32_t(g.previousPalettes.size()); p++) {
       previousPalette.emplace((uint64_t(g.previousPalettes[p].address) << 32) | g.previousPalettes[p].size, p);
     }
@@ -629,7 +751,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // (only ones whose own mesh isn't drawn now: another mesh's copies
     // that share the index buffer keep theirs).
     auto altKey = [](const InterpDraw& d) { return d.meshAlt * 0xC2B2AE3D27D4EB4Full ^ d.group; };
-    std::unordered_map<uint64_t, std::vector<uint32_t>> byAlt;
+    ArenaMap<uint64_t, ArenaVector<uint32_t>> byAlt(arena);
     for (auto& [key, before] : meshes) {
       const auto& b = g.previous[before[0]];
       if (b.meshAlt && !meshesNow.count(key)) {
@@ -638,7 +760,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     }
     for (auto& [key, now] : meshesNow) {
-      const std::vector<uint32_t>* found = nullptr;
+      const ArenaVector<uint32_t>* found = nullptr;
       if (auto it = meshes.find(key); it != meshes.end()) {
         found = &it->second;
       } else if (const auto& d = g.current[now[0]]; d.meshAlt && !d.boneSize && now.size() >= 2) {
@@ -695,8 +817,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           float score;
           uint32_t i, j;
         };
-        std::vector<Pair> pairs;
-        std::unordered_map<uint32_t, std::pair<float, float>> bestOf;  // i: best, second score
+        ArenaVector<Pair> pairs(arena);
+        ArenaMap<uint32_t, std::pair<float, float>> bestOf(arena);  // i: best, second score
         for (uint32_t i : now) {
           auto& d = g.current[i];
           auto& bs = bestOf[i];
@@ -891,7 +1013,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // menu's frames, a draw fewer than the last now and then over a still
   // scene, were repeats and not shown, the menu at a third of its rate.)
   uint32_t unmatchedNow = 0;
-  std::unordered_map<uint64_t, int32_t> paletteBefore;
+  ArenaMap<uint64_t, int32_t> paletteBefore(arena);
   for (size_t i = 0; repeat && i < g.current.size(); i++) {
     auto& d = g.current[i];
     if (!d.submitted) {
@@ -1202,14 +1324,25 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // Only the moved registers take the value now, in every draw that has
     // that value (one light, the same in each pass); the matrices go on part
     // of the way, so a thing lit by a light sorted again stays in one piece.
-    std::unordered_set<uint64_t> jumpedValues;
+    ValueMap<uint8_t> jumpedValues(registersNow, arena);
+    // Which registers moved: each draw on its own (a crowd's 15k registers,
+    // each looked for among its draw's others), spread over a few threads in
+    // runs of draws, into one array (the arena isn't for threads); the values
+    // that jumped then noted here.
+    ArenaVector<uint32_t> firstRegister(g.current.size() + 1, 0, arena);
     for (size_t i = 0; i < g.current.size(); i++) {
+      firstRegister[i + 1] = firstRegister[i] + uint32_t(g.current[i].registers.size());
+    }
+    ArenaVector<uint8_t> movedAll(registersNow, 0, arena), asNowAll(registersNow, 0, arena);
+    ArenaVector<uint8_t> anyMovedIn(g.current.size(), 0, arena);
+    auto findMoved = [&](size_t i) {
       if (match[i] < 0 || matchDistance[i] == 0.0f) {
-        continue;
+        return;
       }
       auto& d = g.current[i];
       auto& before = g.previous[match[i]];
-      std::vector<uint8_t> moved(d.registers.size(), 0), asNow;
+      uint8_t* moved = movedAll.data() + firstRegister[i];
+      uint8_t* asNow = asNowAll.data() + firstRegister[i];
       bool anyMoved = false;
       for (size_t r = 0; r < d.registers.size(); r++) {
         const bool shared = r < skips[i].size() && skips[i][r];
@@ -1259,18 +1392,37 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         anyMoved |= moved[r] != 0;
       }
       if (!anyMoved) {
-        continue;
+        return;
       }
       // A light is several registers (where, colour, reach): one found moved,
       // its run from it is taken as now, or one light's place would go with
       // another's reach (a flash on a wall, on the floor).
       InterpRunsFrom(moved, d.registers, asNow);
+      anyMovedIn[i] = 1;
+    };
+    {
+      constexpr size_t kRun = 32;
+      static const uint32_t helpers = std::min(3u, std::max(1u, std::thread::hardware_concurrency() / 4) - 1);
+      const size_t runs = (g.current.size() + kRun - 1) / kRun;
+      g_interpPool.ForEach(runs, g.current.size() >= 128 ? helpers : 0, [&](size_t run) {
+        for (size_t i = run * kRun; i < std::min(g.current.size(), (run + 1) * kRun); i++) {
+          findMoved(i);
+        }
+      });
+    }
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (!anyMovedIn[i]) {
+        continue;
+      }
+      auto& d = g.current[i];
+      auto& before = g.previous[match[i]];
+      const uint8_t* asNow = asNowAll.data() + firstRegister[i];
       for (size_t r = 0; r < d.registers.size(); r++) {
         if (!asNow[r]) {
           continue;
         }
         if (std::memcmp(&before.constants[r * 4], &d.constants[r * 4], 16) != 0) {
-          jumpedValues.insert(sharedKey(d.registers[r], &d.constants[r * 4]));
+          jumpedValues[sharedKey(d.registers[r], &d.constants[r * 4])] = 1;
           jumpedDraws++;
         }
       }
@@ -1283,7 +1435,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // that jumped in some draw takes it as now in every draw that has it.
     // (with the register: a common value, a white, means nothing across registers)
     auto valueAt = [&](uint16_t r, const float* y) { return sharedKey(r, y); };
-    std::unordered_map<uint64_t, const float*> shared;
+    ValueMap<const float*> shared(registersNow, arena);
     for (size_t i = 0; i < g.current.size(); i++) {
       if (match[i] < 0 || matchDistance[i] == 0.0f) {
         continue;
@@ -1310,7 +1462,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       uint32_t nx = 0, ny = 0;
       bool xSame = true, ySame = true;
     };
-    std::unordered_map<uint64_t, std::vector<Common>> common;
+    ArenaMap<uint64_t, ArenaVector<Common>> common(arena);
     auto noteCommon = [&](const InterpDraw& d, bool now) {
       auto& c = common[d.group];
       if (c.empty()) {
@@ -1349,7 +1501,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // The pixel shader's registers, by the draw's own match: part of the way,
     // but a light list sorted again taken as now from the first moved one
     // on (its run of registers), as the vertex shader's.
-    std::vector<std::vector<uint8_t>> psLerp(g.current.size());  // 1: part of the way
+    ArenaVector<ArenaVector<uint8_t>> psLerp(g.current.size(), arena);  // 1: part of the way
     uint64_t psDraws = 0;
     for (size_t i = 0; i < g.current.size(); i++) {
       auto& d = g.current[i];
@@ -1361,7 +1513,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           std::memcmp(before.psConstants.data(), d.psConstants.data(), d.psConstants.size() * 4) == 0) {
         continue;
       }
-      std::vector<uint8_t> lerp(d.psRegisters.size(), 0), psMoved(d.psRegisters.size(), 0);
+      ArenaVector<uint8_t> lerp(d.psRegisters.size(), 0, arena), psMoved(d.psRegisters.size(), 0, arena);
       for (size_t r = 0; r < d.psRegisters.size(); r++) {
         const float* x = &before.psConstants[r * 4];
         const float* y = &d.psConstants[r * 4];
@@ -1395,8 +1547,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         lerp[r] = 1;
         psMoved[r] = InterpMovedFromAnother(before.psConstants.data(), d.psConstants.data(), d.psRegisters.size(), r);
       }
-      std::vector<uint8_t> asNow;
-      InterpRunsFrom(psMoved, d.psRegisters, asNow);
+      ArenaVector<uint8_t> asNow(d.psRegisters.size(), 0, arena);
+      InterpRunsFrom(psMoved.data(), d.psRegisters, asNow.data());
       for (size_t r = 0; r < d.psRegisters.size(); r++) {
         if (asNow[r]) {
           lerp[r] = 0;
@@ -1406,16 +1558,16 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       psDraws++;
     }
     g.psDraws += psDraws;
-    std::vector<std::vector<const float*>> borrowed(g.current.size());
-    std::vector<bool> notOwn(g.current.size());  // drawn without its own match's values
+    ArenaVector<ArenaVector<const float*>> borrowed(g.current.size(), arena);
+    ArenaVector<bool> notOwn(g.current.size(), false, arena);  // drawn without its own match's values
     // A thing the game didn't draw the frame before (some it leaves out of
     // a frame now and then; one come into view as the camera turned: a
     // chest, a corpse's sword): its own matrix (it times the camera) is new
     // while the camera's registers take the frame before's, and drawn
     // between it stood off its place, a jerk. Drawn the frame before that,
     // the frame before's value is taken as halfway between that one and now.
-    std::vector<std::vector<float>> halfway(g.current.size());
-    std::vector<bool> olderUsed(g.older.size());
+    ArenaVector<ArenaVector<float>> halfway(g.current.size(), arena);
+    ArenaVector<bool> olderUsed(g.older.size(), false, arena);
     uint64_t fromOlder = 0;
     uint64_t borrowedDraws = 0;
     for (size_t i = 0; i < g.current.size(); i++) {
@@ -1427,7 +1579,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       const InterpDraw* before = match[i] >= 0 ? &g.previous[match[i]] : nullptr;
       notOwn[i] = !before;
       bool any = false;
-      std::vector<const float*> xs(d.registers.size(), nullptr);
+      ArenaVector<const float*> xs(d.registers.size(), nullptr, arena);
       if (!before && match[i] < 0 && d.mesh && !d.boneSize) {
         int32_t best = -1;
         float bestDistance = 0.6f;  // (two frames' move)
@@ -1465,29 +1617,29 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       for (size_t r = 0; r < d.registers.size(); r++) {
         const float* y = &d.constants[r * 4];
         const float* x = nullptr;
-        if (!jumpedValues.empty() && jumpedValues.count(valueAt(d.registers[r], y))) {
+        if (!jumpedValues.empty() && jumpedValues.contains(valueAt(d.registers[r], y))) {
           continue;  // (moved: as now)
         }
         // Its own match's value first; another draw's (by the value now) only
         // for a draw without one, and not one that jumped there (that draw's
         // jump spread to every draw with the value: a spike across the
         // pictures between).
-        auto it = before ? shared.end() : shared.find(valueAt(d.registers[r], y));
-        if (it != shared.end()) {
-          const float* other = it->second;
+        const float* const* sharedBefore = before ? nullptr : shared.find(valueAt(d.registers[r], y));
+        if (sharedBefore) {
+          const float* other = *sharedBefore;
           float size = 1.0f, change = 0;
           for (uint32_t c = 0; c < 4; c++) {
             size = std::max({size, std::fabs(other[c]), std::fabs(y[c])});
             change = std::max(change, std::fabs(other[c] - y[c]));
           }
           if (!(change <= kInterpJump * size)) {
-            it = shared.end();
+            sharedBefore = nullptr;
           }
         }
         if (before) {
           x = &before->constants[r * 4];
-        } else if (it != shared.end()) {
-          x = it->second;
+        } else if (sharedBefore) {
+          x = *sharedBefore;
         } else if (auto c = common.find(d.group); c != common.end() && r < c->second.size()) {
           auto& one = c->second[r];
           if (one.nx >= 2 && one.ny >= 2 && one.xSame && one.ySame) {
@@ -1509,8 +1661,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // Each picture on its own thread (they share nothing but the uploads,
     // taken under a lock): a crowd's 3 ms of constants in about one picture's
     // time. The first is this thread's, and counts the registers.
+    // (one picture, or a few draws: all on this thread, no lock)
+    const uint32_t pictureHelpers = submitted >= 200 && steps > 1 ? steps - 1 : 0;
     std::mutex uploadLock;
     auto LockedAllocate = [&](uint64_t size) {
+      if (!pictureHelpers) {
+        return Allocate(size);
+      }
       std::lock_guard lock(uploadLock);
       return Allocate(size);
     };
@@ -1577,16 +1734,16 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         phase[i][0] = upload.address;
       }
     };
-    g_interpPool.ForEach(steps, submitted >= 200 ? steps - 1 : 0, [&](size_t k) { picture(uint32_t(k)); });
+    g_interpPool.ForEach(steps, pictureHelpers, [&](size_t k) { picture(uint32_t(k)); });
     int64_t mixedNs = SteadyNs();
     g.constantsNs += mixedNs - matchedNs;
     // Bone palettes: as the draws that read them were matched.
-    std::unordered_map<uint64_t, int32_t> previousIndex;
+    ArenaMap<uint64_t, int32_t> previousIndex(arena);
     for (int32_t i = 0; i < int32_t(g.previousPalettes.size()); i++) {
       auto& palette = g.previousPalettes[i];
       previousIndex.emplace((uint64_t(palette.address) << 32) | palette.size, i);
     }
-    std::vector<int32_t> pairs(g.palettes.size(), -1);
+    ArenaVector<int32_t> pairs(g.palettes.size(), -1, arena);
     for (size_t i = 0; i < g.current.size(); i++) {
       auto& d = g.current[i];
       if (match[i] < 0 || !d.boneSize) {
@@ -1622,7 +1779,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       uint32_t* outs[kInterpMaxPictures] = {};
       uint64_t snapped = 0;
     };
-    std::vector<PaletteJob> jobs(g.palettes.size());
+    ArenaVector<PaletteJob> jobs(g.palettes.size(), arena);
     static const uint32_t workers = std::min(4u, std::max(1u, std::thread::hardware_concurrency() / 4));
     auto spread = [&](auto&& body) { g_interpPool.ForEach(jobs.size(), workers - 1, body); };
     spread([&](size_t i) {
