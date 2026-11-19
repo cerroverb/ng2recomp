@@ -396,25 +396,74 @@ float Aspect() {
 
 // The camera's update (sub_822FA8C8, r3 the camera): its projection
 // (sub_822FB378) and right after it its other frustums (camera +688, +752)
-// are built from the field of view at +176, so a narrower aspect's taller
-// one is set around the whole update; the aspect constant is set first.
+// are built from the field of view at +176. A narrower aspect's taller one is
+// set from the projection on (the update's only call of it) and the game's
+// own value put back once the update is done: earlier in the update some
+// cameras ease the field of view toward a target and add an effect's change
+// (sub_822FDE08), so it has to be the value they left. The aspect constant is
+// set first.
+namespace {
+// The vertical field of view that keeps 16:9's sides at a narrower aspect.
+float TallerFov(float fov, float aspect) {
+  return 2.0f * std::atan(std::tan(fov * 0.5f) * kNative / aspect);
+}
+
+struct Taller {
+  uint32_t address = 0;
+  float fov = 0.0f, taller = 0.0f;
+};
+thread_local Taller g_taller;
+}  // namespace
+
 REX_EXTERN(__imp__sub_822FA8C8);
 REX_HOOK_RAW(sub_822FA8C8) {
   float aspect = ng2::aspect::Aspect();
   if (LoadFloat(kAspectConstant) != aspect && ng2::aspect::g_constantWritable) {
     StoreFloat(kAspectConstant, aspect);
   }
-  uint32_t fovAddress = ctx.r3.u32 + kCameraFov;
-  if (aspect >= kNative || !ctx.r3.u32) {
-    __imp__sub_822FA8C8(ctx, base);
+  Taller outer = g_taller;
+  g_taller = {};
+  __imp__sub_822FA8C8(ctx, base);
+  if (g_taller.address && LoadFloat(g_taller.address) == g_taller.taller) {
+    StoreFloat(g_taller.address, g_taller.fov);
+  }
+  g_taller = outer;
+}
+
+REX_EXTERN(__imp__sub_822FB378);
+REX_HOOK_RAW(sub_822FB378) {
+  float aspect = ng2::aspect::Aspect();
+  if (aspect < kNative && ctx.r3.u32) {
+    uint32_t address = ctx.r3.u32 + kCameraFov;
+    float fov = LoadFloat(address);
+    float taller = TallerFov(fov, aspect);
+    StoreFloat(address, taller);
+    g_taller = {address, fov, taller};
+  }
+  __imp__sub_822FB378(ctx, base);
+}
+
+// The camera manager's copy of a camera after its update (sub_822F8850, r3
+// the manager, r4 the camera's index): it keeps the field of view at +176
+// next to the projection and frustums (manager +240, with its half angle's
+// sines and tangents), and a visibility test (sub_822F9718) uses it, so it
+// gets the same taller one as the projection.
+REX_EXTERN(__imp__sub_822F8850);
+REX_HOOK_RAW(sub_822F8850) {
+  float aspect = ng2::aspect::Aspect();
+  uint32_t cameras = ctx.r3.u32 ? Load32(ctx.r3.u32 + 1604) : 0;
+  if (aspect >= kNative || !cameras || ctx.r4.u32 >= 8) {
+    __imp__sub_822F8850(ctx, base);
     return;
   }
-  float fov = LoadFloat(fovAddress);
-  float taller = 2.0f * std::atan(std::tan(fov * 0.5f) * kNative / aspect);
-  StoreFloat(fovAddress, taller);
-  __imp__sub_822FA8C8(ctx, base);
-  // The update may add an effect's change to it (sub_822FDE08): kept.
-  StoreFloat(fovAddress, fov + (LoadFloat(fovAddress) - taller));
+  uint32_t address = cameras + ctx.r4.u32 * 5024 + kCameraFov;
+  float fov = LoadFloat(address);
+  float taller = TallerFov(fov, aspect);
+  StoreFloat(address, taller);
+  __imp__sub_822F8850(ctx, base);
+  if (LoadFloat(address) == taller) {
+    StoreFloat(address, fov);
+  }
 }
 
 // A sprite's or gauge's quad, in 1280x720 pixels.
