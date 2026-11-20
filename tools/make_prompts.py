@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Makes src/gpu/prompt_sets.inc: the PlayStation, Nintendo and keyboard button
+"""Makes src/gpu/prompt_sets.inc: the PlayStation, Nintendo, Steam Deck and keyboard button
 prompts for the game's button atlas (src/gpu/prompts.cpp).
 
 usage: make_prompts.py [<repo>]
@@ -43,6 +43,13 @@ SETS = {
         'LT': 'switch/Switch_LT.png', 'RT': 'switch/Switch_RT.png',
         'LS': 'switch/Switch_Left_Stick_Click.png', 'RS': 'switch/Switch_Right_Stick_Click.png',
         'BACK': 'switch/Switch_Minus.png', 'START': 'switch/Switch_Plus.png',
+    },
+    'kSteamDeck': {
+        'A': 'deck/SteamDeck_A.png', 'B': 'deck/SteamDeck_B.png', 'X': 'deck/SteamDeck_X.png',
+        'Y': 'deck/SteamDeck_Y.png', 'LB': 'deck/SteamDeck_L1.png', 'RB': 'deck/SteamDeck_R1.png',
+        'LT': 'deck/SteamDeck_L2.png', 'RT': 'deck/SteamDeck_R2.png',
+        'LS': 'deck/SteamDeck_Left_Stick_Click.png', 'RS': 'deck/SteamDeck_Right_Stick_Click.png',
+        'BACK': 'deck/SteamDeck_Inventory.png', 'START': 'deck/SteamDeck_Menu.png',
     },
 }
 

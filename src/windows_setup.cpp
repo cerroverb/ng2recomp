@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -21,6 +22,7 @@
 
 #include <SDL3/SDL.h>
 #include <rex/cvar.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
 
 #include "dlc.h"
@@ -848,6 +850,39 @@ bool ConfigurePaths(rex::PathConfig& paths) {
     OfferDlc(data, paths.game_data_root);
   }
   return true;
+}
+
+// Power throttling (EcoQoS) off: Windows may run a throttled process slower,
+// on its efficient cores, and ignore its timer requests. And the system timer
+// at 1 ms, as SDL already asks for by default (SDL_HINT_TIMER_RESOLUTION): so
+// the game's 1 ms sleeps and timeouts don't last a 15.6 ms tick if that hint
+// is ever changed.
+void TuneProcess() {
+  const char* v = std::getenv("NG2_TIMER_PERIOD");
+  if (v && v[0] == '0') {
+    REXLOG_INFO("Windows: power throttling left as it is (NG2_TIMER_PERIOD=0; SDL still sets a 1 ms timer)");
+    return;
+  }
+  PROCESS_POWER_THROTTLING_STATE power{};
+  power.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  power.ControlMask =
+      PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+  power.StateMask = 0;
+  bool unthrottled =
+      SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power, sizeof(power)) != 0;
+  if (!unthrottled) {
+    // (Windows 10: the timer flag is Windows 11's, and a mask with it is refused whole)
+    power.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    unthrottled = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power, sizeof(power)) != 0;
+  }
+  bool period = false;
+  if (HMODULE winmm = LoadLibraryA("winmm.dll")) {
+    using PeriodFn = UINT(WINAPI*)(UINT);
+    auto begin = reinterpret_cast<PeriodFn>(GetProcAddress(winmm, "timeBeginPeriod"));
+    period = begin && begin(1) == 0;
+  }
+  REXLOG_INFO("Windows: power throttling {}, system timer {}", unthrottled ? "off" : "unchanged",
+              period ? "at 1 ms" : "unchanged");
 }
 
 }  // namespace ng2::windows_setup

@@ -129,6 +129,9 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
+#ifdef _WIN32
+    ng2::windows_setup::TuneProcess();
+#endif
     // The recompiled code is Title Update 3's. With another update (or none)
     // next to default.xex the game's data wouldn't fit that code.
     std::error_code ec;

@@ -57,6 +57,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -67,17 +68,24 @@
 
 #include "gpu/guest.h"
 #include "gpu/video.h"
+#include "gpu/win_display.h"
 
 namespace {
 
+// Time spent in each kind of wait (NG2_PROFILE: ng2::video::TakeWaitTimes).
+std::atomic<int64_t> g_waitNs[int(ng2::video::WaitKind::kCount)];
+
 // One step of a spin; a new wait (a gap since the last step) starts over.
-void Backoff() {
+void Backoff(ng2::video::WaitKind kind) {
   using clock = std::chrono::steady_clock;
   thread_local uint32_t spins = 0;
   thread_local clock::time_point last;
   auto now = clock::now();
   if (now - last > std::chrono::microseconds(500)) {
     spins = 0;
+  } else {
+    g_waitNs[int(kind)].fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count(), std::memory_order_relaxed);
   }
   spins++;
   if (spins < 64) {
@@ -89,7 +97,13 @@ void Backoff() {
   } else {
 #if defined(_WIN32)
     // MSVC's sleep_for rounds up to whole milliseconds (Sleep(1), 1-2 ms): too coarse here.
-    std::this_thread::yield();
+    // The high-resolution timer instead; a yield alone (Windows before 10 1803)
+    // returns at once with a core free, keeping this thread busy (#17).
+    if (ng2::video::PreciseSleepAvailable()) {
+      ng2::video::PreciseSleepNs(50'000);
+    } else {
+      std::this_thread::yield();
+    }
 #else
     std::this_thread::sleep_for(std::chrono::microseconds(50));
 #endif
@@ -99,10 +113,20 @@ void Backoff() {
 
 }  // namespace
 
+void ng2::video::NoteWait(WaitKind kind, int64_t ns) {
+  g_waitNs[int(kind)].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void ng2::video::TakeWaitTimes(int64_t* ns) {
+  for (int k = 0; k < int(WaitKind::kCount); k++) {
+    ns[k] = g_waitNs[k].exchange(0, std::memory_order_relaxed);
+  }
+}
+
 // Before the compare: r11 is the handoff word, 0 once the frame is taken.
 void Ng2FrameHandoffWait(PPCRegister& r11) {
   if (r11.u32 != 0) {
-    Backoff();
+    Backoff(ng2::video::WaitKind::kHandoff);
   } else {
     ng2::video::NoteFrameTaken();  // (NG2_LATENCY_LOG)
   }
@@ -110,7 +134,7 @@ void Ng2FrameHandoffWait(PPCRegister& r11) {
 
 // At each loop's quit-flag check, reached only while the word is still 0.
 void Ng2FrameWait() {
-  Backoff();
+  Backoff(ng2::video::WaitKind::kFrame);
 }
 
 namespace {
@@ -204,7 +228,7 @@ REX_HOOK_RAW(sub_83751980) {
 }
 
 void Ng2VblankWait() {
-  Backoff();
+  Backoff(ng2::video::WaitKind::kVblank);
 }
 
 // The limiter's reads of the vblank count: its start (returning to 822F0C40)

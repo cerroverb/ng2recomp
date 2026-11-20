@@ -1,6 +1,6 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
-// Button prompts: the PlayStation, Nintendo or keyboard buttons drawn instead
+// Button prompts: the PlayStation, Nintendo, Steam Deck or keyboard buttons drawn instead
 // of the Xbox 360's (prompts.cpp; the Button Prompts setting).
 
 #pragma once
@@ -9,7 +9,7 @@
 
 namespace ng2::prompts {
 
-enum class Set { kXbox, kPlayStation, kNintendo, kKeyboard };
+enum class Set { kXbox, kPlayStation, kNintendo, kKeyboard, kSteamDeck };
 enum class Kind { kIndex8, kRGBA8, kOther };
 
 // The set the atlas is made with now.

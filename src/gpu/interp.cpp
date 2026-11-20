@@ -105,6 +105,8 @@ struct InterpState {
   uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0, bonesSnapped = 0;
   int64_t buildNs = 0, matchNs = 0, constantsNs = 0, bonesNs = 0;
   int64_t prepNs = 0, meshNs = 0, worstNs = 0;  // (worst: the slowest frame's whole build)
+  // The slowest frame's split: setup, by mesh, the rest of matching, constants, bones.
+  std::array<int64_t, 5> worstSplit{};
   uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t fromOlder = 0;  // things not drawn the frame before, taken from the one before it
@@ -437,13 +439,26 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   std::pmr::memory_resource* arena = arenaHolder.get();
   struct Timed {
     int64_t start;
+    std::array<int64_t, 5> was;
+    static std::array<int64_t, 5> Sums() {
+      auto& g = g_interp;
+      return {g.prepNs, g.meshNs, g.matchNs, g.constantsNs, g.bonesNs};
+    }
     ~Timed() {
       int64_t ns = SteadyNs() - start;
       g_interp.buildNs += ns;
-      g_interp.worstNs = std::max(g_interp.worstNs, ns);
+      auto now = Sums();
+      // (not the frame whose stats line set the sums to 0: its split is lost)
+      if (ns > g_interp.worstNs && now[2] >= was[2]) {
+        g_interp.worstNs = ns;
+        for (size_t k = 0; k < now.size(); k++) {
+          g_interp.worstSplit[k] = now[k] - was[k];
+        }
+        g_interp.worstSplit[2] -= g_interp.worstSplit[0] + g_interp.worstSplit[1];
+      }
       g_interp.lastBuildNs = ns;
     }
-  } timed{startNs};
+  } timed{startNs, Timed::Sums()};
   // Paused when the pictures cost the game its 60 (the Steam Deck in a big
   // fight: 7-12 ms of building a frame, the game at 30): the frames shown as
   // they are for a while (1.5 s, longer each time it comes back too soon), then
@@ -1226,21 +1241,41 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       ArenaVector<int32_t> partner(now.size(), -1, arena);   // the copy before, by any such register
       ArenaVector<uint32_t> tested(now.size(), 0, arena), unlike(now.size(), 0, arena);
       ArenaVector<int32_t> unlikeReg(now.size(), -1, arena);
+      // (each register's values before and now in tables: a scan of the
+      // copies before for each copy now, and of the copies now for each of
+      // those, was a register's copies cubed, milliseconds a frame where
+      // an explosion drew dozens of one mesh, #134)
+      ArenaMap<uint64_t, uint32_t> beforeAt(arena), nowAt(arena);  // value -> its first draw
+      auto sameAt = [&](const ArenaMap<uint64_t, uint32_t>& table, const float* x, size_t r,
+                        bool previous) -> int32_t {
+        auto found = table.find(valueKey(0, x));
+        if (found == table.end()) {
+          return -1;
+        }
+        const auto& y = (previous ? g.previous[found->second] : g.current[found->second]).constants;
+        return std::memcmp(x, &y[r * 4], 16) == 0 ? int32_t(found->second) : -1;
+      };
       for (size_t r = 0; r < registers; r++) {
         if (!distinct[r]) {
           continue;
         }
+        beforeAt.clear();
+        nowAt.clear();
+        for (uint32_t j : before) {
+          const auto& y = g.previous[j].constants;
+          if (y.size() == first.constants.size()) {
+            beforeAt.emplace(valueKey(0, &y[r * 4]), j);
+          }
+        }
+        for (uint32_t i : now) {
+          nowAt.emplace(valueKey(0, &g.current[i].constants[r * 4]), i);
+        }
         uint32_t kept = 0;
         has.assign(now.size(), false);
         for (size_t a = 0; a < now.size(); a++) {
-          const float* x = &g.current[now[a]].constants[r * 4];
-          for (uint32_t j : before) {
-            const auto& y = g.previous[j].constants;
-            if (y.size() == first.constants.size() && std::memcmp(x, &y[r * 4], 16) == 0) {
-              has[a] = true;
-              kept++;
-              break;
-            }
+          if (sameAt(beforeAt, &g.current[now[a]].constants[r * 4], r, true) >= 0) {
+            has[a] = true;
+            kept++;
           }
         }
         if (kept < 2 || kept * 2 < now.size()) {
@@ -1250,13 +1285,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           const float* x = &g.current[now[a]].constants[r * 4];
           if (has[a]) {
             if (partner[a] < 0) {
-              for (uint32_t j : before) {
-                const auto& y = g.previous[j].constants;
-                if (y.size() == first.constants.size() && std::memcmp(x, &y[r * 4], 16) == 0) {
-                  partner[a] = int32_t(j);
-                  break;
-                }
-              }
+              partner[a] = sameAt(beforeAt, x, r, true);
             }
             continue;
           }
@@ -1274,11 +1303,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             if (y.size() != first.constants.size()) {
               continue;
             }
-            bool held = false;  // (another copy's now)
-            for (size_t b = 0; b < now.size() && !held; b++) {
-              held = std::memcmp(&g.current[now[b]].constants[r * 4], &y[r * 4], 16) == 0;
-            }
-            if (!held) {
+            if (sameAt(nowAt, &y[r * 4], r, false) < 0) {  // (not another copy's now)
               nearest = std::min(nearest, apart(x, &y[r * 4]));
             }
           }
@@ -1493,10 +1518,23 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         }
         continue;
       }
-      for (uint32_t i : now) {
+      for (size_t position = 0; position < now.size(); position++) {
+        const uint32_t i = now[position];
         auto& d = g.current[i];
         if (strangerReg[i] >= 0 || match[i] >= 0) {
           continue;
+        }
+        // Hundreds of copies without bones (sparks, debris of an explosion):
+        // only those before near its own place in the draw order, which such
+        // copies keep from frame to frame. Each against every one before was
+        // the most of a frame's matching where rockets burst (#134).
+        constexpr size_t kWindow = 32;
+        size_t from = 0, to = before.size();
+        const bool windowed = !d.boneSize && before.size() > 2 * kWindow;
+        if (windowed) {
+          size_t at = position * before.size() / now.size();
+          from = at > kWindow ? at - kWindow : 0;
+          to = std::min(before.size(), at + kWindow + 1);
         }
         int32_t best = -1;
         float bestDistance = 1e30f, bestScore = 1e30f, secondScore = 1e30f;
@@ -1515,7 +1553,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             havePlace |= (d.boneAddress & 0xFFFF) == (g.previous[j].boneAddress & 0xFFFF);
           }
         }
-        for (uint32_t j : before) {
+        for (size_t at = from; at < to; at++) {
+          const uint32_t j = before[at];
           if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
             continue;
           }
@@ -1571,7 +1610,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         // Past the bound but far nearer than any other copy: still it (a
         // camera turn moves the matrices of nine alike things 0.11 a frame,
         // past their 0.1; a light of its own sorted again).
-        bool clear = !d.boneSize && bestDistance <= 0.6f && secondScore >= 2.5f * bestScore;
+        // (not with a window: a copy outside it could be as near)
+        bool clear = !d.boneSize && !windowed && bestDistance <= 0.6f && secondScore >= 2.5f * bestScore;
         if (ranked >= 0) {
           best = ranked;
           bestDistance = rankedDistance;
@@ -1582,9 +1622,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         // left without, a rack of 18 behind the camera was taken from two
         // frames ago, any copy's, and between two copies' matrices it stood
         // before the camera, on a wall, for a picture (#131).
-        if (!d.boneSize && !single && !(best >= 0 && (bestDistance <= bound || clear))) {
+        // (a few copies, as for copyRank: among hundreds, sparks of one mesh,
+        // each against every one before was milliseconds a frame, #134)
+        if (rankCopies && !single && !(best >= 0 && (bestDistance <= bound || clear))) {
           int32_t nearest = -1;
           float apart = 0.3f;
+          Mat4 wvpNow;
+          const bool byCamera = cameraFor(d.group) && wvpOf(d, d.constants, wvpNow);
           for (uint32_t j : before) {
             if (used[j] || g.previous[j].constants.size() != d.constants.size() ||
                 (anchoredDraw[i] && anchoredOf(i, g.previous[j]) < 0)) {
@@ -1596,10 +1640,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             if (!(a >= 0 && a < 0.3f)) {
               continue;
             }
-            if (cameraFor(d.group)) {
-              Mat4 now, was;
-              if (wvpOf(d, d.constants, now) && wvpOf(d, g.previous[j].constants, was)) {
-                a = std::min(matOff(now, carried(was, cameraChange)), 0.299f);
+            if (byCamera) {
+              Mat4 was;
+              if (wvpOf(d, g.previous[j].constants, was)) {
+                a = std::min(matOff(wvpNow, carried(was, cameraChange)), 0.299f);
               }
             }
             if (a < apart) {
@@ -2857,11 +2901,15 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   }
   if (g.frames == 600) {
     REXLOG_INFO("video: interp: ms a frame: matching {:.2f} (setup {:.2f}, by mesh {:.2f}), constants {:.2f}, "
-                "bones {:.2f}; slowest frame {:.2f} ms; draws {:.0f} a frame, {} at most",
+                "bones {:.2f}; slowest frame {:.2f} ms ({:.2f} {:.2f} {:.2f} {:.2f} {:.2f}); draws {:.0f} a frame, "
+                "{} at most",
                 double(g.matchNs) / 600e6, double(g.prepNs) / 600e6, double(g.meshNs) / 600e6,
                 double(g.constantsNs) / 600e6, double(g.bonesNs) / 600e6, double(g.worstNs) / 1e6,
+                g.worstSplit[0] / 1e6, g.worstSplit[1] / 1e6, g.worstSplit[2] / 1e6, g.worstSplit[3] / 1e6,
+                g.worstSplit[4] / 1e6,
                 double(g.drawsSeen) / 600.0, g.drawsWorst);
     g.matchNs = g.constantsNs = g.bonesNs = g.prepNs = g.meshNs = g.worstNs = 0;
+    g.worstSplit = {};
     g.drawsSeen = g.drawsWorst = 0;
     REXLOG_INFO("video: interp: {}/{} frames interpolated, {:.1f}% of draws matched, {:.1f}% "
                 "given the camera only, {:.2f}% of registers snapped",

@@ -40,6 +40,7 @@
 #include "guest.h"
 #include "native_gpu.h"
 #include "video.h"
+#include "win_display.h"
 
 namespace {
 
@@ -356,15 +357,28 @@ REX_HOOK_RAW(sub_8376AA48) {
 REX_EXTERN(__imp__sub_8375E588);
 REX_HOOK_RAW(sub_8375E588) {
   thread_local uint32_t spins = 0, lastStamp = 0;
+  thread_local int64_t lastNs = 0;
   uint32_t stamp = ng2::guest::Load32(ctx.r3.u32 + 20);
+  const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
   if (stamp != lastStamp) {
     lastStamp = stamp;
     spins = 0;
+  } else if (spins > 0) {
+    ng2::video::NoteWait(ng2::video::WaitKind::kFence, nowNs - lastNs);  // (NG2_PROFILE)
   }
+  lastNs = nowNs;
   __imp__sub_8375E588(ctx, base);
   if (ctx.r3.u32 != 0 && ++spins > 64) {
 #if defined(_WIN32)
-    std::this_thread::yield();  // a sleep there is a millisecond or more
+    // (Sleep is a millisecond or more: the high-resolution timer, or a yield
+    // where there is none, which keeps the core busy)
+    if (ng2::video::PreciseSleepAvailable()) {
+      ng2::video::PreciseSleepNs(100'000);
+    } else {
+      std::this_thread::yield();
+    }
 #else
     std::this_thread::sleep_for(std::chrono::microseconds(100));
 #endif

@@ -188,7 +188,7 @@ constexpr Setting kSettings[] = {
     {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
     {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9", u"4:3"}, 5, "aspect_ratio", Kind::kAspect},
     // The prompts follow the device in use (gpu/prompts.cpp).
-    {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard"}, 5,
+    {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard", u"Steam Deck"}, 6,
      "button_prompts", Kind::kLevel},
     {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2"}, 6, "mnk_sensitivity",
      Kind::kSensitivity},

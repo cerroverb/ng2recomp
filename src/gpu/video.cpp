@@ -57,6 +57,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 #include <rex/ui/windowed_app_context.h>
 #if defined(__linux__)
@@ -66,6 +67,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/cvar.h>
+#include <rex/hook.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
@@ -573,26 +575,32 @@ void ReportLatency() {
 }
 
 // With NG2_PROFILE, every 5 s: the busiest threads' CPU time (ms of each
-// second, from /proc; Linux only), so a slow machine's log tells which thread
-// limits the frame rate. "(renderer)" is the game's render thread, which runs
-// the renderer's hooks (the Vulkan side is on "Render Commands").
+// second; Linux from /proc, Windows from GetThreadTimes), so a slow machine's
+// log tells which thread limits the frame rate. "(renderer)" is the game's
+// render thread, which runs the renderer's hooks (the Vulkan side is on
+// "Render Commands").
 void ReportThreads() {
-#if defined(__linux__)
-  static std::unordered_map<int, uint64_t> last;
+#if defined(__linux__) || defined(_WIN32)
+  // Each thread's CPU time in ms since it started, by thread id, with its name.
+  struct Sample {
+    double ms;
+    std::string name;
+  };
+  static std::unordered_map<uint32_t, double> last;
   static auto lastTime = std::chrono::steady_clock::now();
-  static const int self = int(gettid());
   auto now = std::chrono::steady_clock::now();
   double seconds = std::chrono::duration<double>(now - lastTime).count();
   if (seconds < 5.0) {
     return;
   }
   lastTime = now;
+  std::unordered_map<uint32_t, Sample> samples;
+#if defined(__linux__)
+  static const uint32_t self = uint32_t(gettid());
   static const double msPerTick = 1000.0 / double(sysconf(_SC_CLK_TCK));
-  std::vector<std::pair<double, std::string>> busy;
-  std::unordered_map<int, uint64_t> current;
   std::error_code error;
   for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", error)) {
-    int tid = std::atoi(entry.path().filename().c_str());
+    uint32_t tid = uint32_t(std::atoi(entry.path().filename().c_str()));
     FILE* f = std::fopen((entry.path() / "stat").c_str(), "r");
     if (!f) {
       continue;
@@ -612,16 +620,64 @@ void ReportThreads() {
                     &stime) != 2) {
       continue;
     }
-    uint64_t ticks = utime + stime;
-    current[tid] = ticks;
-    auto it = last.find(tid);
-    if (it == last.end() || ticks < it->second) {  // new, or a reused thread id
+    samples[tid] = {double(utime + stime) * msPerTick, std::string(open + 1, close)};
+  }
+#else
+  static const uint32_t self = uint32_t(GetCurrentThreadId());
+  // (Windows 10 1607 and later, and Wine; looked up so older systems still start)
+  using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+  static const auto getDescription = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+  const DWORD process = GetCurrentProcessId();
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  THREADENTRY32 entry{};
+  entry.dwSize = sizeof(entry);
+  for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != process) {
       continue;
     }
-    double ms = double(ticks - it->second) * msPerTick / seconds;
+    HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+    if (!thread) {
+      continue;
+    }
+    FILETIME created, exited, kernel, user;
+    if (GetThreadTimes(thread, &created, &exited, &kernel, &user)) {
+      auto ticks = [](const FILETIME& t) {  // 100 ns units
+        return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+      };
+      std::string name;
+      PWSTR wide = nullptr;
+      if (getDescription && SUCCEEDED(getDescription(thread, &wide)) && wide) {
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+        if (bytes > 1) {
+          name.resize(size_t(bytes - 1));
+          WideCharToMultiByte(CP_UTF8, 0, wide, -1, name.data(), bytes, nullptr, nullptr);
+        }
+        LocalFree(wide);
+      }
+      if (name.empty()) {
+        name = fmt::format("thread {}", entry.th32ThreadID);
+      }
+      samples[entry.th32ThreadID] = {double(ticks(kernel) + ticks(user)) / 1e4, std::move(name)};
+    }
+    CloseHandle(thread);
+  }
+  CloseHandle(snapshot);
+#endif
+  std::vector<std::pair<double, std::string>> busy;
+  std::unordered_map<uint32_t, double> current;
+  for (auto& [tid, sample] : samples) {
+    current[tid] = sample.ms;
+    auto it = last.find(tid);
+    if (it == last.end() || sample.ms < it->second) {  // new, or a reused thread id
+      continue;
+    }
+    double ms = (sample.ms - it->second) / seconds;
     if (ms >= 10.0) {
-      std::string name(open + 1, close);
-      busy.emplace_back(ms, tid == self ? name + " (renderer)" : name);
+      busy.emplace_back(ms, tid == self ? sample.name + " (renderer)" : sample.name);
     }
   }
   last = std::move(current);
@@ -636,10 +692,157 @@ void ReportThreads() {
 #endif
 }
 
+// With NG2_PROFILE, every 5 s: where the game's threads block in the kernel
+// (sleeps, events, semaphores, critical sections), by thread and by the game
+// code that waits (the address of its call). The game's threads wait for each
+// other there, so a frame that is slow while no thread is busy shows up here.
+namespace kernel_waits {
+struct Entry {
+  const char* name;
+  uint32_t call;
+  int64_t ns;
+  uint32_t count;
+};
+struct Buffer {
+  std::mutex mutex;
+  uint32_t tid = 0;
+  std::unordered_map<uint64_t, Entry> entries;
+};
+std::mutex g_mutex;
+std::vector<std::shared_ptr<Buffer>> g_buffers;
+
+// A thread's name by id, looked up when reported (a new thread starts with
+// its creator's name and the game names it after).
+std::string ThreadName(uint32_t tid) {
+  std::string name;
+#if defined(_WIN32)
+  using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+  static const auto getDescription = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+  HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, DWORD(tid));
+  if (thread) {
+    PWSTR wide = nullptr;
+    if (getDescription && SUCCEEDED(getDescription(thread, &wide)) && wide) {
+      int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+      if (bytes > 1) {
+        name.resize(size_t(bytes - 1));
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, name.data(), bytes, nullptr, nullptr);
+      }
+      LocalFree(wide);
+    }
+    CloseHandle(thread);
+  }
+#else
+  if (FILE* f = std::fopen(fmt::format("/proc/self/task/{}/comm", tid).c_str(), "r")) {
+    char text[64] = {};
+    if (std::fgets(text, sizeof(text), f)) {
+      name = text;
+      while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) {
+        name.pop_back();
+      }
+    }
+    std::fclose(f);
+  }
+#endif
+  return name.empty() ? fmt::format("thread {}", tid) : name;
+}
+
+uint32_t CurrentThreadId() {
+#if defined(_WIN32)
+  return uint32_t(GetCurrentThreadId());
+#else
+  return uint32_t(gettid());
+#endif
+}
+
+void Observe(const char* name, uint32_t lr, uint32_t, int64_t ns) {
+  thread_local std::shared_ptr<Buffer> mine;
+  if (!mine) {
+    mine = std::make_shared<Buffer>();
+    mine->tid = CurrentThreadId();
+    std::lock_guard lock(g_mutex);
+    g_buffers.push_back(mine);
+  }
+  std::lock_guard lock(mine->mutex);
+  uint32_t call = lr - 4;
+  auto& entry = mine->entries[(uint64_t(call) << 32) ^ uint64_t(uintptr_t(name))];
+  entry.name = name, entry.call = call, entry.ns += ns, entry.count++;
+}
+
+void Report() {
+  static bool started = false;
+  static auto last = std::chrono::steady_clock::now();
+  if (!started) {
+    started = true;
+    const char* off = std::getenv("NG2_PROFILE_KERNEL");  // (0: not timed)
+    if (!off || std::strcmp(off, "0") != 0) {
+      rex::SetWaitObserver(&Observe);
+    }
+    return;
+  }
+  auto now = std::chrono::steady_clock::now();
+  double seconds = std::chrono::duration<double>(now - last).count();
+  if (seconds < 5.0) {
+    return;
+  }
+  last = now;
+  const uint32_t self = CurrentThreadId();
+  struct Row {
+    double ms;
+    std::string text;
+  };
+  std::vector<Row> rows;
+  std::lock_guard lock(g_mutex);
+  for (auto& buffer : g_buffers) {
+    std::lock_guard bufferLock(buffer->mutex);
+    if (buffer->entries.empty()) {
+      continue;
+    }
+    std::string thread = ThreadName(buffer->tid);
+    if (buffer->tid == self) {
+      thread += " (renderer)";
+    }
+    for (auto& [key, entry] : buffer->entries) {
+      double ms = entry.ns / 1e6 / seconds;
+      if (ms >= 2.0) {
+        const char* name = entry.name;
+        if (std::strncmp(name, "__imp__", 7) == 0) {
+          name += 7;
+        }
+        rows.push_back({ms, fmt::format("{}: {} at {:08X} {:.0f} ({:.0f} a second)", thread, name,
+                                        entry.call, ms, entry.count / seconds)});
+      }
+    }
+    buffer->entries.clear();
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
+  std::string line;
+  for (size_t i = 0; i < rows.size() && i < 24; i++) {
+    line += fmt::format("{}{}", i ? "; " : " ", rows[i].text);
+  }
+  if (!line.empty()) {
+    REXLOG_INFO("kernel waits, ms each second:{}", line);
+  }
+}
+}  // namespace kernel_waits
+
 void ReportProfile() {
   ReportHitch();
   if (g_profile.enabled) {
     ReportThreads();
+    kernel_waits::Report();
+  }
+  // (the game's own waits, ms each second: where a thread that isn't busy is)
+  static auto lastWaits = std::chrono::steady_clock::now();
+  if (g_profile.enabled && std::chrono::steady_clock::now() - lastWaits >= std::chrono::seconds(1)) {
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastWaits).count();
+    lastWaits = std::chrono::steady_clock::now();
+    int64_t waits[int(WaitKind::kCount)];
+    TakeWaitTimes(waits);
+    REXLOG_INFO("waits, ms each second: main loop for the render thread {:.0f}, render thread for a frame "
+                "{:.0f}, vblank limiter {:.0f}, GPU fences {:.0f}",
+                waits[0] / 1e6 / seconds, waits[1] / 1e6 / seconds, waits[2] / 1e6 / seconds,
+                waits[3] / 1e6 / seconds);
   }
   g_profile.frames++;
   auto now = std::chrono::steady_clock::now();

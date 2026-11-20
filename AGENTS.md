@@ -70,9 +70,13 @@ devices, and none of the player's settings or saves.
 - `NG2_BARYCENTRIC=1` or `0`: cut-off parts' id interpolated in the shader, or by the hardware
   (default: in the shader on NVIDIA, where the GPU supports it).
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
-- `NG2_PROFILE=1`: time per renderer stage, once a second, and every 5 s (Linux) the busiest threads' CPU
+- `NG2_PROFILE=1`: time per renderer stage, once a second, and every 5 s the busiest threads' CPU
   time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render
-  Commands" ours). `NG2_HITCHES=1` (or `log_hitches`): slow frames with what they were spent on.
+  Commands" ours), and once a second the game's own waits ("waits, ms each second": the main loop for the
+  render thread, the render thread for a frame, its vblank limiter, the D3D library's GPU fences; a thread that
+  isn't busy is mostly in one of them), and every 5 s where the game's threads block in the kernel ("kernel waits, ms
+  each second": thread, call and the game code's address, from the SDK's timed exports, `rex::SetWaitObserver`;
+  `NG2_PROFILE_KERNEL=0` leaves them untimed). `NG2_HITCHES=1` (or `log_hitches`): slow frames with what they were spent on.
   `NG2_FPS_LOG=1`: the game's frame rate once a second.
 - `NG2_PIPELINE_STATS=1`: what the driver compiled each shader pair to, logged once a pair (registers,
   scratch, instructions; VK_KHR_pipeline_executable_properties, plume patches 0011 and 0012: the driver feature is only enabled with it). On AMD the vertex

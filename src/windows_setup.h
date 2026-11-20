@@ -19,4 +19,8 @@ namespace ng2::windows_setup {
 // the player cancelled or the game can't start.
 bool ConfigurePaths(rex::PathConfig& paths);
 
+// Power throttling off and the system timer at 1 ms for this process (as SDL
+// already sets it). Logged. NG2_TIMER_PERIOD=0 leaves the throttling as it is.
+void TuneProcess();
+
 }  // namespace ng2::windows_setup

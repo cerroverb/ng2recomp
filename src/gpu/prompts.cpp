@@ -5,7 +5,7 @@
 // atlas (X, Y, B, A, the triggers and shoulders, the sticks, the d-pad, BACK
 // and START) looked up in a 256x1 palette. Both are told apart by their
 // content as the renderer loads them (CreateTexture); for the PlayStation,
-// Nintendo or keyboard prompts the button cells are painted over with that
+// Nintendo, Steam Deck or keyboard prompts the button cells are painted over with that
 // set's pictures (prompt_sets.inc, from Xelu's CC0 prompts; the keyboard's are
 // the keys bound to each button) and the set's colours written into the
 // palette entries no other part of the atlas uses. The sticks' and the
@@ -29,7 +29,8 @@
 #include <xxhash.h>
 
 REXCVAR_DEFINE_INT32(button_prompts, 0, "Display",
-                     "0: Auto (the device in use), 1: Xbox, 2: PlayStation, 3: Nintendo, 4: Keyboard");
+                     "0: Auto (the device in use), 1: Xbox, 2: PlayStation, 3: Nintendo, 4: Keyboard, "
+                     "5: Steam Deck");
 
 namespace ng2::prompts {
 
@@ -64,6 +65,8 @@ SetData Data(Set set) {
       return {kPlayStationColors, sizeof(kPlayStationColors) / 4, kPlayStationCells};
     case Set::kNintendo:
       return {kNintendoColors, sizeof(kNintendoColors) / 4, kNintendoCells};
+    case Set::kSteamDeck:
+      return {kSteamDeckColors, sizeof(kSteamDeckColors) / 4, kSteamDeckCells};
     default:
       return {nullptr, 0, nullptr};
   }
@@ -71,6 +74,7 @@ SetData Data(Set set) {
 
 static_assert(sizeof(kPlayStationColors) / 4 <= sizeof(kFree));
 static_assert(sizeof(kNintendoColors) / 4 <= sizeof(kFree));
+static_assert(sizeof(kSteamDeckColors) / 4 <= sizeof(kFree));
 static_assert(sizeof(kKeyboardColors) / 4 <= sizeof(kFree));
 
 // The atlas's cells, in kPromptCells' order: the button whose keys a keyboard
@@ -117,12 +121,13 @@ const KeyPictures& Key(const std::string& name) {
 }
 
 Set Chosen() {
-  // NG2_PROMPTS=ps / nintendo / keys / xbox overrides the setting (tests).
+  // NG2_PROMPTS=ps / nintendo / steamdeck / keys / xbox overrides the setting (tests).
   if (const char* v = std::getenv("NG2_PROMPTS"); v && *v) {
     switch (v[0]) {
       case 'p': case 'P': return Set::kPlayStation;
       case 'n': case 'N': return Set::kNintendo;
       case 'k': case 'K': return Set::kKeyboard;
+      case 's': case 'S': return Set::kSteamDeck;
       default: return Set::kXbox;
     }
   }
@@ -131,11 +136,13 @@ Set Chosen() {
     case 2: return Set::kPlayStation;
     case 3: return Set::kNintendo;
     case 4: return Set::kKeyboard;
+    case 5: return Set::kSteamDeck;
     default:
       switch (controls::ActiveDevice()) {
         case controls::Device::kPlayStation: return Set::kPlayStation;
         case controls::Device::kNintendo: return Set::kNintendo;
         case controls::Device::kKeyboard: return Set::kKeyboard;
+        case controls::Device::kSteamDeck: return Set::kSteamDeck;
         default: return Set::kXbox;
       }
   }

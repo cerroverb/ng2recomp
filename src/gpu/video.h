@@ -87,6 +87,13 @@ int64_t DisplayClockNow();
 void NoteInputRead();
 void NoteFrameTaken();
 
+// NG2_PROFILE: time the game's threads spend waiting, by kind: the main loop
+// for the render thread to take a frame, the render thread for the next frame,
+// its vblank limiter, and the D3D library's GPU fence waits (src/frame_wait.cpp).
+enum class WaitKind { kHandoff, kFrame, kVblank, kFence, kCount };
+void NoteWait(WaitKind kind, int64_t ns);
+void TakeWaitTimes(int64_t* ns);  // ns[WaitKind::kCount], since the last call
+
 // NG2_TRACE_STACKS=1: the guest call chain of the draw about to be made, for its trace line.
 void NoteDrawStack(const std::string& stack);
 
