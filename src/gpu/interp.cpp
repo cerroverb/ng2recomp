@@ -10,11 +10,14 @@
 // frame's commands again with those, and presents the pictures in time.
 
 #include "interp.h"
+
+#include "../gameplay.h"
 #include "../aspect.h"
 #include "guest.h"
 #include "video.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -683,8 +686,229 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     }
   }
+  // Between copies of one mesh, which one before a copy now was. A thing of 8
+  // meshes or more has its own matrices in all of them (Chapter 7's pods, 24
+  // each), so the rule above leaves them out and every pod before was as near
+  // as any: the first free one was taken, in draw order, which their glass
+  // and lamps change as they are sorted back to front, and part of the way
+  // they went toward the next pod's place, ghosts between the pods (#131).
+  // What a camera turn can't change tells them apart: a copy that stands
+  // still has registers exactly as they were (where it is in its room: c3),
+  // and how many of its own (not the lights, c96-c107, nor what most draws
+  // share) are the same to the bit ranks the copies before first (as many for
+  // each, what all the copies have alike, for a copy that moves); then the
+  // score, and how far apart those registers are. Only to rank copies that
+  // are near enough: whether one is near enough stays as it was.
+  // The camera's change this frame, as a matrix (set in the mesh pass, from
+  // the things that are one of a kind and stand still): a thing's matrix
+  // (c21-c24: its place times the camera's view and projection) before,
+  // times this, is its matrix now if it stood still. Which copy of a mesh a
+  // draw was can't be told by the nearest when the camera moves further in a
+  // frame than half the way between two copies (a ceiling's racks, each
+  // taken for the next as the camera turned or Ryu walked, a slot over in
+  // the pictures between, #131): the copy before that this carries onto the
+  // draw now is it, however far the camera went.
+  struct Mat4 {
+    double m[4][4];
+  };
+  static std::atomic<uint32_t> statStill{0}, statNew{0}, statBack{0};  // (for the log below)
+  bool cameraKnown = false;
+  Mat4 cameraChange{}, cameraBack{};  // (back: from a matrix now to the one before)
+  // Kinds of draws (shaders and target) whose one-of-a-kind things didn't go
+  // with it: another view's (a shadow map's light, a reflection), where the
+  // camera's change says nothing.
+  ArenaMap<uint64_t, uint8_t> cameraKinds(arena);  // 1: one agreed, 2: one didn't
+  auto cameraFor = [&](uint64_t group) {
+    if (!cameraKnown) {
+      return false;
+    }
+    auto it = cameraKinds.find(group);
+    return it == cameraKinds.end() || (it->second & 1);
+  };
+  auto wvpOf = [](const InterpDraw& d, const std::vector<float>& constants, Mat4& out) {
+    uint32_t have = 0;
+    for (size_t r = 0; r < d.registers.size(); r++) {
+      if (d.registers[r] >= 21 && d.registers[r] <= 24) {
+        for (uint32_t c = 0; c < 4; c++) {
+          out.m[d.registers[r] - 21][c] = constants[r * 4 + c];
+        }
+        have |= 1u << (d.registers[r] - 21);
+      } else if (d.registers[r] > 24) {
+        break;
+      }
+    }
+    return have == 15;
+  };
+  auto carried = [](const Mat4& before, const Mat4& change) {
+    Mat4 out{};
+    for (uint32_t i = 0; i < 4; i++) {
+      for (uint32_t j = 0; j < 4; j++) {
+        for (uint32_t k = 0; k < 4; k++) {
+          out.m[i][j] += before.m[i][k] * change.m[k][j];
+        }
+      }
+    }
+    return out;
+  };
+  // (how far a matrix is from another, by its largest value)
+  auto matOff = [](const Mat4& a, const Mat4& b) {
+    double size = 1.0, off = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+      for (uint32_t j = 0; j < 4; j++) {
+        size = std::max(size, std::fabs(a.m[i][j]));
+        double d = std::fabs(a.m[i][j] - b.m[i][j]);
+        off = std::max(off, std::isfinite(d) ? d : 1e30);
+      }
+    }
+    return float(std::min(off / size, 1e9));
+  };
+  auto inverse = [](const Mat4& in, Mat4& out) {
+    double a[4][8];
+    for (uint32_t i = 0; i < 4; i++) {
+      for (uint32_t j = 0; j < 4; j++) {
+        a[i][j] = in.m[i][j];
+        a[i][j + 4] = i == j ? 1.0 : 0.0;
+      }
+    }
+    for (uint32_t c = 0; c < 4; c++) {
+      uint32_t pivot = c;
+      for (uint32_t r = c + 1; r < 4; r++) {
+        if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) {
+          pivot = r;
+        }
+      }
+      if (!(std::fabs(a[pivot][c]) > 1e-9)) {
+        return false;
+      }
+      for (uint32_t j = 0; j < 8; j++) {
+        std::swap(a[c][j], a[pivot][j]);
+      }
+      double scale = 1.0 / a[c][c];
+      for (uint32_t j = 0; j < 8; j++) {
+        a[c][j] *= scale;
+      }
+      for (uint32_t r = 0; r < 4; r++) {
+        if (r != c) {
+          double f = a[r][c];
+          for (uint32_t j = 0; j < 8; j++) {
+            a[r][j] -= f * a[c][j];
+          }
+        }
+      }
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+      for (uint32_t j = 0; j < 4; j++) {
+        out.m[i][j] = a[i][j + 4];
+      }
+    }
+    return true;
+  };
+  // How far apart two draws' own matrices are (below c64, not what most
+  // draws share): which copy of a mesh a draw is, whatever its lights did
+  // (-1: it has none).
+  auto matrixApart = [&](size_t i, const InterpDraw& b) {
+    const auto& d = g.current[i];
+    float most = -1.0f;
+    for (size_t r = 0; r * 4 < d.constants.size(); r++) {
+      if (d.registers[r] >= 64 || (r < skips[i].size() && skips[i][r])) {
+        continue;
+      }
+      const float* x = &d.constants[r * 4];
+      const float* y = &b.constants[r * 4];
+      float size = 1.0f, change = 0;
+      for (uint32_t c = 0; c < 4; c++) {
+        size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+        change = std::max(change, std::fabs(x[c] - y[c]));
+      }
+      most = std::max(most, std::isfinite(change) ? change / size : 1e9f);
+    }
+    return most;
+  };
+  struct CopyRank {
+    int32_t anchored = 0;  // registers as its thing's found mesh had them before, less those unlike
+    uint32_t same = 0;
+    float rest = 1e30f;
+    bool operator<(const CopyRank& o) const {
+      return anchored != o.anchored ? anchored > o.anchored : same != o.same ? same > o.same : rest < o.rest;
+    }
+  };
+  // By a value now, the value the draw before of the same thing had (below).
+  ValueMap<const float*> anchorBefore(registersNow, arena);
+  ArenaVector<uint8_t> anchoredDraw(g.current.size(), 0, arena);  // carries such a value
+  // Only whether a copy before is another thing's, by the found mesh's
+  // values (the anchors): -1 at the first that says so.
+  auto anchoredOf = [&](size_t i, const InterpDraw& b) {
+    if (!anchoredDraw[i]) {
+      return 0;
+    }
+    const auto& d = g.current[i];
+    int32_t anchored = 0;
+    for (size_t r = 0; r * 4 < d.constants.size(); r++) {
+      if ((r < skips[i].size() && skips[i][r]) || d.registers[r] >= 64) {
+        continue;
+      }
+      const float* const* was = anchorBefore.find(valueKey(d.registers[r], &d.constants[r * 4]));
+      if (was && *was) {
+        if (std::memcmp(*was, &b.constants[r * 4], 16) != 0) {
+          return -1;
+        }
+        anchored++;
+      }
+    }
+    return anchored;
+  };
+  auto copyRank = [&](uint32_t i, const InterpDraw& b, float score) {
+    const auto& d = g.current[i];
+    const auto& skip = skips[i];
+    float distance = 0;
+    uint32_t same = 0;
+    int32_t anchored = 0;
+    for (size_t r = 0; r * 4 < d.constants.size(); r++) {
+      if ((r < skip.size() && skip[r]) || d.registers[r] >= 64) {
+        continue;
+      }
+      const float* x = &d.constants[r * 4];
+      const float* y = &b.constants[r * 4];
+      if (anchoredDraw[i]) {
+        const float* const* was = anchorBefore.find(valueKey(d.registers[r], x));
+        if (was && *was) {
+          anchored += std::memcmp(*was, y, 16) == 0 ? 1 : -1;
+        }
+      }
+      if (std::memcmp(x, y, 16) == 0) {
+        same++;
+        continue;
+      }
+      float size = 1.0f, change = 0;
+      for (uint32_t c = 0; c < 4; c++) {
+        size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+        change = std::max(change, std::fabs(x[c] - y[c]));
+      }
+      // (summed, each to its whole size at most: by the largest alone, one
+      // register that changes much in every copy, a light's pulse, hid which
+      // copy's matrices were nearest, and three ceiling parts turned about
+      // a column were each taken for the next, #131)
+      float v = change / size;
+      distance += std::isfinite(v) ? std::min(v, 1.0f) : 1.0f;
+    }
+    // (by the camera's change where it is known: the rest says less)
+    if (cameraFor(d.group)) {
+      Mat4 now, was;
+      if (wvpOf(d, d.constants, now) && wvpOf(d, b.constants, was)) {
+        return CopyRank{anchored, 0, matOff(now, carried(was, cameraChange))};
+      }
+    }
+    return CopyRank{anchored, same, score + 0.002f * std::min(distance, 16.0f)};
+  };
   ArenaVector<int32_t> match(g.current.size(), -1, arena);
+  // A copy of a mesh that wasn't drawn the frame before, among copies that
+  // were (a pod come into view as the camera turned, #131): the register
+  // that says so (below), or -1. It takes no other copy's draw before.
+  ArenaVector<int32_t> strangerReg(g.current.size(), -1, arena);
+  ArenaVector<uint8_t> meshBefore(g.current.size(), 0, arena);  // its mesh was drawn the frame before
+  ArenaVector<uint8_t> oneOfMany(g.current.size(), 0, arena);   // matched among copies of its mesh
   ArenaVector<float> matchDistance(g.current.size(), 0.0f, arena);
+  ArenaVector<uint8_t> matchHow(g.current.size(), 0, arena);  // 1 pairs, 2 each in turn, 3 by kind, 4 stood still
   ArenaVector<bool> used(g.previous.size(), false, arena);
   ArenaMap<uint64_t, uint32_t> occurrence(arena);
   uint32_t submitted = 0, matched = 0;
@@ -695,6 +919,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // same thing, however far the camera turned. One of it before and now: taken
   // unless it moved more than its size (another thing in a reused buffer);
   // several (copies of one mesh): the nearest, as close as alike draws must be.
+  std::function<void(bool)> rejectFar;  // (set in the mesh pass, used again after the pass by kind)
   {
     auto meshKey = [](const InterpDraw& d) { return d.mesh * 0xC2B2AE3D27D4EB4Full ^ d.group; };
     int64_t meshStartNs = SteadyNs();
@@ -712,6 +937,175 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     for (uint32_t i = 0; i < g.current.size(); i++) {
       if (g.current[i].submitted && g.current[i].mesh) {
         meshesNow[meshKey(g.current[i])].push_back(i);
+      }
+    }
+    // The camera's change: from one thing of a kind (its mesh drawn once
+    // before and once now), the one that most others agree with.
+    {
+      struct One {
+        Mat4 was, now;
+        uint64_t group;
+      };
+      ArenaVector<One> ones(arena);
+      for (auto& [key, now] : meshesNow) {
+        auto it = meshes.find(key);
+        if (now.size() != 1 || it == meshes.end() || it->second.size() != 1 || ones.size() >= 96) {
+          continue;
+        }
+        const auto& d = g.current[now[0]];
+        const auto& b = g.previous[it->second[0]];
+        One one;
+        one.group = d.group;
+        if (!d.boneSize && !d.ui && b.constants.size() == d.constants.size() && wvpOf(d, d.constants, one.now) &&
+            wvpOf(d, b.constants, one.was)) {
+          ones.push_back(one);
+        }
+      }
+      uint32_t most = 0;
+      float moved = 0;
+      const size_t tries = std::min<size_t>(ones.size(), 12);
+      for (size_t t = 0; t < tries && ones.size() >= 8; t++) {
+        const One& ref = ones[t * ones.size() / tries];
+        Mat4 inv;
+        if (!inverse(ref.was, inv)) {
+          continue;
+        }
+        Mat4 change = carried(inv, ref.now);
+        uint32_t agree = 0;
+        for (const One& o : ones) {
+          agree += matOff(o.now, carried(o.was, change)) < 0.01f;
+        }
+        if (agree > most) {
+          most = agree;
+          cameraChange = change;
+          moved = matOff(ref.now, ref.was);
+        }
+      }
+      // (not across a cut to another camera in the same room: the room's
+      // things agree with any change, and would be carried across it)
+      cameraKnown = most >= 6 && most * 3 >= ones.size() && moved <= 1.0f && inverse(cameraChange, cameraBack);
+      if (cameraKnown) {
+        for (const One& o : ones) {
+          cameraKinds[o.group] |= matOff(o.now, carried(o.was, cameraChange)) < 0.01f ? 1 : 2;
+        }
+      }
+      // (how often the camera's change is known, for the log)
+      static std::atomic<uint32_t> frames{0}, known{0}, agreed{0}, of{0};
+      known += cameraKnown;
+      agreed += most;
+      of += uint32_t(ones.size());
+      if (++frames % 600 == 0) {
+        REXLOG_INFO("video: interp: camera change known in {} of 600 frames; {} of {} one-of-a-kind things agree; "
+                    "{} draws stood still, {} new among copies, {} given the matrix they had before",
+                    known.exchange(0), agreed.exchange(0), of.exchange(0), statStill.exchange(0), statNew.exchange(0),
+                    statBack.exchange(0));
+      }
+    }
+    // First, for sure: a draw whose matrix now is a copy before's carried by
+    // the camera's change stood still, and is that copy (whatever its lights
+    // did, however many copies, in whatever order they were drawn). Then, in
+    // a mesh some of whose copies stood still, a copy with no copy before
+    // near where it would have been is new in view: it takes none (and is
+    // given the matrix it would have had before, below: it comes into view
+    // with the rest, not a picture late).
+    if (cameraKnown) {
+      ArenaVector<Mat4> was(arena);
+      for (auto& [key, now] : meshesNow) {
+        auto it = meshes.find(key);
+        if (it == meshes.end()) {
+          continue;
+        }
+        auto& before = it->second;
+        const auto& first = g.current[now[0]];
+        if (first.boneSize || first.ui || now.size() * before.size() > 8192 || !cameraFor(first.group)) {
+          continue;
+        }
+        was.clear();
+        bool rows = true;
+        for (uint32_t j : before) {
+          Mat4 m;
+          rows = rows && g.previous[j].constants.size() == first.constants.size() &&
+                 wvpOf(first, g.previous[j].constants, m);
+          if (!rows) {
+            break;
+          }
+          was.push_back(carried(m, cameraChange));
+        }
+        if (!rows) {
+          continue;
+        }
+        uint32_t still = 0;
+        for (uint32_t i : now) {
+          Mat4 m;
+          if (g.current[i].constants.size() != first.constants.size() || !wvpOf(g.current[i], g.current[i].constants, m)) {
+            continue;
+          }
+          int32_t best = -1;
+          float off = 0.01f, second = 1e30f;
+          for (size_t k = 0; k < before.size(); k++) {
+            if (used[before[k]]) {
+              continue;
+            }
+            float o = matOff(m, was[k]);
+            if (o < off) {
+              second = off;
+              off = o;
+              best = int32_t(k);
+            } else {
+              second = std::min(second, o);
+            }
+          }
+          // (two as near: passes of one thing with one matrix, told apart
+          // by their other registers, below)
+          if (best >= 0 && second >= off + 1e-4f) {
+            used[before[best]] = true;
+            match[i] = int32_t(before[best]);
+            matchHow[i] = 4;
+            matched++;
+            g.byMesh++;
+            still++;
+            statStill++;
+          }
+        }
+        if (!still || now.size() < 2) {
+          continue;
+        }
+        // (near: within half the least way between two copies, so a copy
+        // that moves a little keeps its own, and one new in view beside a
+        // copy gone from it doesn't take that one's)
+        float nearBy = 0.05f;
+        if (before.size() <= 64) {
+          float spacing = 0.6f;
+          for (size_t a = 0; a < was.size(); a++) {
+            for (size_t b = a + 1; b < was.size(); b++) {
+              float o = matOff(was[a], was[b]);
+              if (o > 1e-4f) {
+                spacing = std::min(spacing, o);
+              }
+            }
+          }
+          nearBy = 0.5f * spacing;
+        }
+        for (uint32_t i : now) {
+          Mat4 m;
+          if (match[i] >= 0 || !wvpOf(g.current[i], g.current[i].constants, m)) {
+            continue;
+          }
+          float nearest = 1e30f;
+          for (size_t k = 0; k < before.size(); k++) {
+            if (!used[before[k]]) {
+              nearest = std::min(nearest, matOff(m, was[k]));
+            }
+          }
+          if (nearest >= nearBy) {
+            for (size_t r = 0; r < g.current[i].registers.size(); r++) {
+              if (g.current[i].registers[r] == 24) {
+                strangerReg[i] = int32_t(r);
+                statNew++;
+              }
+            }
+          }
+        }
       }
     }
     // Copies of one skinned mesh (bodies of one kind of enemy) can have the
@@ -759,7 +1153,213 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         list.insert(list.end(), before.begin(), before.end());
       }
     }
+    // Before any is matched: which copies are which by a register of their
+    // own, and through them the things they are part of.
+    // Copies that stand still each have a register of their own, the same
+    // to the bit as the frame before (where a pod is in its room, c3): one
+    // whose value there no copy before had is new, come into view, not one
+    // of them moved. Left to the nearest still free, it took the draw of a
+    // pod gone from view at the other end of the row (their distance leaves
+    // out what a thing of 8 meshes shares, so every pod is as near), and
+    // part of the way its glass and lamps stood between two pods, a flicker
+    // while the camera turned (#131). Such a register: each copy now has
+    // its own value in it, and at least half of them (two or more) have
+    // theirs from a copy before. Not bodies: their place in the bone buffer
+    // says which.
+    // The other meshes of such a thing (a pod's body, 20 meshes by another
+    // shader) have no such register, only matrices with the camera's in them,
+    // which they share with the mesh that has: the value now tells which
+    // thing a draw is part of, and the value its found copy had before, which
+    // draw before is its own (anchorBefore; null: of a thing new in view, no
+    // draw before is). Without it the bodies went by draw order, each to the
+    // next pod's before while the camera turned and pods came into view, and
+    // part of the way they stood a third of the way to the next pod, their
+    // glass, rightly placed, a ghost beside them.
+    // (only registers where every copy of the mesh has a value of its own: a
+    // fade one copy has and the rest share says nothing of which thing)
+    struct NewCopy {
+      uint32_t draw;
+      int32_t reg;
+    };
+    ArenaVector<NewCopy> newCopies(arena);
+    ArenaVector<uint64_t> newValues(arena);
+    auto apart = [](const float* x, const float* y) {
+      float d = 0;
+      for (uint32_t c = 0; c < 4; c++) {
+        float v = std::fabs(x[c] - y[c]);
+        d = std::max(d, std::isfinite(v) ? v : 1e30f);
+      }
+      return d;
+    };
     for (auto& [key, now] : meshesNow) {
+      auto it = meshes.find(key);
+      if (it == meshes.end()) {
+        continue;
+      }
+      auto& before = it->second;
+      if (now.size() < 2 || now.size() > 64 || before.size() > 64 || g.current[now[0]].boneSize) {
+        continue;
+      }
+      const auto& first = g.current[now[0]];
+      const size_t registers = first.constants.size() / 4;
+      ArenaVector<bool> distinct(registers, false, arena);
+      bool any = false;
+      for (size_t r = 0; r < registers; r++) {
+        if (first.registers[r] >= 64) {
+          continue;
+        }
+        bool own = true;
+        for (size_t a = 0; a < now.size() && own; a++) {
+          const auto& x = g.current[now[a]].constants;
+          own = x.size() == first.constants.size();
+          for (size_t b = 0; b < a && own; b++) {
+            own = std::memcmp(&x[r * 4], &g.current[now[b]].constants[r * 4], 16) != 0;
+          }
+        }
+        distinct[r] = own;
+        any |= own;
+      }
+      if (!any) {
+        continue;
+      }
+      ArenaVector<bool> has(now.size(), false, arena);
+      ArenaVector<int32_t> partner(now.size(), -1, arena);   // the copy before, by any such register
+      ArenaVector<uint32_t> tested(now.size(), 0, arena), unlike(now.size(), 0, arena);
+      ArenaVector<int32_t> unlikeReg(now.size(), -1, arena);
+      for (size_t r = 0; r < registers; r++) {
+        if (!distinct[r]) {
+          continue;
+        }
+        uint32_t kept = 0;
+        has.assign(now.size(), false);
+        for (size_t a = 0; a < now.size(); a++) {
+          const float* x = &g.current[now[a]].constants[r * 4];
+          for (uint32_t j : before) {
+            const auto& y = g.previous[j].constants;
+            if (y.size() == first.constants.size() && std::memcmp(x, &y[r * 4], 16) == 0) {
+              has[a] = true;
+              kept++;
+              break;
+            }
+          }
+        }
+        if (kept < 2 || kept * 2 < now.size()) {
+          continue;
+        }
+        for (size_t a = 0; a < now.size(); a++) {
+          const float* x = &g.current[now[a]].constants[r * 4];
+          if (has[a]) {
+            if (partner[a] < 0) {
+              for (uint32_t j : before) {
+                const auto& y = g.previous[j].constants;
+                if (y.size() == first.constants.size() && std::memcmp(x, &y[r * 4], 16) == 0) {
+                  partner[a] = int32_t(j);
+                  break;
+                }
+              }
+            }
+            continue;
+          }
+          // (one that moved keeps its own: a draw before that no copy now
+          // has the value of, nearer in this register than half the way to
+          // the next copy; a pod gone from view is a pod's width away or more)
+          float spacing = 1e30f, nearest = 1e30f;
+          for (size_t b = 0; b < now.size(); b++) {
+            if (b != a) {
+              spacing = std::min(spacing, apart(x, &g.current[now[b]].constants[r * 4]));
+            }
+          }
+          for (uint32_t j : before) {
+            const auto& y = g.previous[j].constants;
+            if (y.size() != first.constants.size()) {
+              continue;
+            }
+            bool held = false;  // (another copy's now)
+            for (size_t b = 0; b < now.size() && !held; b++) {
+              held = std::memcmp(&g.current[now[b]].constants[r * 4], &y[r * 4], 16) == 0;
+            }
+            if (!held) {
+              nearest = std::min(nearest, apart(x, &y[r * 4]));
+            }
+          }
+          tested[a]++;
+          if (!(nearest < 0.5f * spacing)) {
+            unlike[a]++;
+            if (unlikeReg[a] < 0) {
+              unlikeReg[a] = int32_t(r);
+            }
+          }
+        }
+      }
+      // What a found copy has of its own (its matrices with the camera's in
+      // them: c24, c11, c16), by the value now, with the value its draw
+      // before had: the thing's other meshes carry them too. A copy new by
+      // every such register (and found by none): its values noted once all
+      // the found ones are, so a thing one of whose meshes was drawn before
+      // isn't taken for new by another that wasn't.
+      for (size_t a = 0; a < now.size(); a++) {
+        const uint32_t i = now[a];
+        const auto& d = g.current[i];
+        const auto& skip = skips[i];
+        if (match[i] >= 0) {
+          partner[a] = match[i];  // (it stood still: that one, for sure)
+        }
+        const bool isNew = partner[a] < 0 && tested[a] > 0 && unlike[a] == tested[a] && now.size() >= 3;
+        if (partner[a] < 0 && !isNew) {
+          continue;
+        }
+        if (isNew) {
+          newCopies.push_back({i, unlikeReg[a]});
+        }
+        for (size_t r = 0; r < registers; r++) {
+          if (!distinct[r] || (r < skip.size() && skip[r])) {
+            continue;
+          }
+          uint64_t valueAt = valueKey(d.registers[r], &d.constants[r * 4]);
+          if (isNew) {
+            newValues.push_back(valueAt);
+          } else {
+            anchorBefore.emplace(valueAt, &g.previous[partner[a]].constants[r * 4]);
+          }
+        }
+      }
+    }
+    for (const NewCopy& n : newCopies) {
+      strangerReg[n.draw] = n.reg;
+    }
+    for (uint64_t valueAt : newValues) {
+      anchorBefore.emplace(valueAt, nullptr);  // (a found copy's stays)
+    }
+    // The other meshes of a thing new in view: new too. And which draws carry
+    // a found thing's value (only those are looked up when ranked).
+    if (!anchorBefore.empty()) {
+      for (size_t i = 0; i < g.current.size(); i++) {
+        auto& d = g.current[i];
+        if (!d.submitted || !d.mesh || d.boneSize) {
+          continue;
+        }
+        for (size_t r = 0; r * 4 < d.constants.size(); r++) {
+          if ((r < skips[i].size() && skips[i][r]) || d.registers[r] >= 64) {
+            continue;
+          }
+          const float* const* x = anchorBefore.find(valueKey(d.registers[r], &d.constants[r * 4]));
+          if (!x) {
+            continue;
+          }
+          if (*x) {
+            anchoredDraw[i] = 1;
+          } else if (strangerReg[i] < 0) {
+            strangerReg[i] = int32_t(r);
+          }
+        }
+      }
+    }
+    for (auto& [key, now] : meshesNow) {
+      if (meshes.count(key)) {
+        for (uint32_t i : now) {
+          meshBefore[i] = 1;
+        }
+      }
       const ArenaVector<uint32_t>* found = nullptr;
       if (auto it = meshes.find(key); it != meshes.end()) {
         found = &it->second;
@@ -769,6 +1369,30 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         if (auto alt = byAlt.find(altKey(d)); alt != byAlt.end() && alt->second.size() == now.size() &&
                                               now.size() <= 16) {
           found = &alt->second;
+        }
+      } else if (d.meshAlt && d.boneSize && now.size() <= 16) {
+        // (as many before as now or not: two like bodies' draws before share
+        // the key; each takes the one at its own place)
+        // A body's meshes whose vertex data the game moved (Sonia in Chapter
+        // 7's cockpit, every few frames, #131): by their index data, each with
+        // a draw before at its own place in the bone buffer, its palette's
+        // size the same. Left without, they were drawn with the pose now and
+        // the camera before while the rest of her went part of the way: two
+        // of her, a ghost.
+        if (auto alt = byAlt.find(altKey(d)); alt != byAlt.end() && alt->second.size() <= 16) {
+          bool placed = true;
+          for (uint32_t i : now) {
+            const auto& c = g.current[i];
+            bool own = false;
+            for (uint32_t j : alt->second) {
+              const auto& b = g.previous[j];
+              own |= b.boneSize == c.boneSize && (b.boneAddress & 0xFFFF) == (c.boneAddress & 0xFFFF);
+            }
+            placed &= own;
+          }
+          if (placed) {
+            found = &alt->second;
+          }
         }
       }
       if (!found) {
@@ -815,6 +1439,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         };
         struct Pair {
           float score;
+          CopyRank rank;  // (alike copies told apart)
           uint32_t i, j;
         };
         ArenaVector<Pair> pairs(arena);
@@ -823,6 +1448,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           auto& d = g.current[i];
           auto& bs = bestOf[i];
           bs = {1e30f, 1e30f};
+          if (strangerReg[i] >= 0 || match[i] >= 0) {
+            continue;
+          }
           for (uint32_t j : before) {
             if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
               continue;
@@ -831,7 +1459,11 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             if (!(distance < 1.0f)) {
               continue;
             }
-            pairs.push_back({distance, i, j});
+            CopyRank rank = copyRank(i, g.previous[j], distance);
+            if (rank.anchored < 0) {
+              continue;  // (another thing's draw before)
+            }
+            pairs.push_back({distance, rank, i, j});
             if (distance < bs.first) {
               bs.second = bs.first;
               bs.first = distance;
@@ -841,7 +1473,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           }
         }
         std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
-          return a.score < b.score || (a.score == b.score && (a.i < b.i || (a.i == b.i && a.j < b.j)));
+          return a.rank < b.rank || (!(b.rank < a.rank) && (a.i < b.i || (a.i == b.i && a.j < b.j)));
         });
         for (const Pair& p : pairs) {
           if (match[p.i] >= 0 || used[p.j]) {
@@ -853,6 +1485,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             used[p.j] = true;
             match[p.i] = int32_t(p.j);
             matchDistance[p.i] = p.score;
+            matchHow[p.i] = 1;
+            oneOfMany[p.i] = 1;
             matched++;
             g.byMesh++;
           }
@@ -861,8 +1495,18 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
       for (uint32_t i : now) {
         auto& d = g.current[i];
+        if (strangerReg[i] >= 0 || match[i] >= 0) {
+          continue;
+        }
         int32_t best = -1;
         float bestDistance = 1e30f, bestScore = 1e30f, secondScore = 1e30f;
+        // Among those near enough (the bound), the best by copyRank: taken
+        // over the best by score, which stays for the rest (#131).
+        int32_t ranked = -1;
+        float rankedDistance = 0;
+        CopyRank rankedRank;
+        // (a few copies: among hundreds, sparks of one mesh, it is the nearest as before)
+        const bool rankCopies = !d.boneSize && now.size() <= 64 && before.size() <= 64;
         // A copy before at the same place in the bone buffer is this one
         // (another place is another body of its kind): only it, if there's one.
         bool havePlace = false;
@@ -888,9 +1532,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
               continue;
             }
           }
-          float distance = InterpDistance(d, g.previous[j], secondScore, &matchSkips[i]);
-          if (!(distance < secondScore)) {
-            continue;  // (can't be the best or the next)
+          if (rankCopies && anchoredDraw[i] && anchoredOf(i, g.previous[j]) < 0) {
+            continue;  // (another thing's draw before)
+          }
+          float distance =
+              InterpDistance(d, g.previous[j], rankCopies ? std::max(secondScore, bound) : secondScore, &matchSkips[i]);
+          if (!(distance < secondScore) && !(rankCopies && distance <= bound)) {
+            continue;  // (can't be the best, the next or near enough)
           }
           float apart = bonesApart(d, g.previous[j]);
           if (apart > kPaletteJump) {
@@ -899,6 +1547,18 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           // (the same place in the bone buffer, the next of its copies: most likely it)
           bool samePlace = (d.boneAddress & 0xFFFF) == (g.previous[j].boneAddress & 0xFFFF);
           float score = distance + apart + (d.boneSize && !samePlace ? 0.25f : 0.0f);
+          // (its bones and their place counted: one near enough with them)
+          if (rankCopies && score <= bound) {
+            CopyRank rank = copyRank(i, g.previous[j], score);
+            if (rank < rankedRank) {
+              ranked = int32_t(j);
+              rankedDistance = distance;
+              rankedRank = rank;
+            }
+          }
+          if (!(distance < secondScore)) {
+            continue;
+          }
           if (score < bestScore) {
             secondScore = bestScore;
             best = int32_t(j);
@@ -912,14 +1572,125 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         // camera turn moves the matrices of nine alike things 0.11 a frame,
         // past their 0.1; a light of its own sorted again).
         bool clear = !d.boneSize && bestDistance <= 0.6f && secondScore >= 2.5f * bestScore;
+        if (ranked >= 0) {
+          best = ranked;
+          bestDistance = rankedDistance;
+        }
+        // None near enough: a light's flash on it (an enemy's shot: values
+        // of its own above c64, past the bound in a frame) is no move. The
+        // copy before whose matrices are nearest, if they hardly differ:
+        // left without, a rack of 18 behind the camera was taken from two
+        // frames ago, any copy's, and between two copies' matrices it stood
+        // before the camera, on a wall, for a picture (#131).
+        if (!d.boneSize && !single && !(best >= 0 && (bestDistance <= bound || clear))) {
+          int32_t nearest = -1;
+          float apart = 0.3f;
+          for (uint32_t j : before) {
+            if (used[j] || g.previous[j].constants.size() != d.constants.size() ||
+                (anchoredDraw[i] && anchoredOf(i, g.previous[j]) < 0)) {
+              continue;
+            }
+            // (by the camera's change where it is known: the nearest as the
+            // matrices stand is the next copy's while the camera turns)
+            float a = matrixApart(i, g.previous[j]);
+            if (!(a >= 0 && a < 0.3f)) {
+              continue;
+            }
+            if (cameraFor(d.group)) {
+              Mat4 now, was;
+              if (wvpOf(d, d.constants, now) && wvpOf(d, g.previous[j].constants, was)) {
+                a = std::min(matOff(now, carried(was, cameraChange)), 0.299f);
+              }
+            }
+            if (a < apart) {
+              apart = a;
+              nearest = int32_t(j);
+            }
+          }
+          if (nearest >= 0) {
+            best = nearest;
+            bestDistance = bound;  // (taken: the check after the pass sees to the rest)
+          }
+        }
         if (best >= 0 && (bestDistance <= bound || clear)) {
           used[best] = true;
           match[i] = best;
           matchDistance[i] = bestDistance;
+          matchHow[i] = 2;
+          oneOfMany[i] = !single;
           matched++;
           g.byMesh++;
         }
       }
+    }
+    // A copy matched among copies went by a distance that can't see a big
+    // thing's own matrix (8 meshes share it: left out), so one new in view
+    // took whichever copy before was free: a ceiling's ducts, come into view
+    // as the camera tilted up, each drawn between its place and another's
+    // in the pictures between, there and gone from picture to picture
+    // (#131). Its matrices (below c64: not its lights), all of them, must not
+    // have changed much more than those of the things that are one of a kind
+    // did, which is the camera's move this frame: or it is new, drawn as it
+    // is now.
+    {
+      auto ownChange = [&](size_t i, int32_t* worst) {
+        const auto& d = g.current[i];
+        const auto& b = g.previous[match[i]];
+        float most = 0;
+        for (size_t r = 0; r * 4 < d.constants.size(); r++) {
+          if (d.registers[r] >= 64 || (r < skips[i].size() && skips[i][r])) {
+            continue;
+          }
+          const float* x = &d.constants[r * 4];
+          const float* y = &b.constants[r * 4];
+          float size = 1.0f, change = 0;
+          for (uint32_t c = 0; c < 4; c++) {
+            size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+            change = std::max(change, std::fabs(x[c] - y[c]));
+          }
+          float v = std::isfinite(change) ? change / size : 1e9f;
+          if (v > most) {
+            most = v;
+            if (worst) {
+              *worst = int32_t(r);
+            }
+          }
+        }
+        return most;
+      };
+      rejectFar = [&, ownChange](bool byKind) {
+        ArenaVector<float> alone(arena);
+        for (size_t i = 0; i < g.current.size(); i++) {
+          if (match[i] >= 0 && !oneOfMany[i] && matchHow[i] != 3 && !g.current[i].boneSize) {
+            alone.push_back(ownChange(i, nullptr));
+          }
+        }
+        if (alone.size() < 8) {
+          return;
+        }
+        std::nth_element(alone.begin(), alone.begin() + alone.size() / 2, alone.end());
+        const float most = std::max(0.3f, 2.5f * alone[alone.size() / 2] + 0.1f);
+        for (size_t i = 0; i < g.current.size(); i++) {
+          // (by its kind: a mesh taken for another draw's, as blindly)
+          const bool check = byKind ? matchHow[i] == 3 && g.current[i].mesh != 0 : oneOfMany[i] != 0;
+          if (match[i] < 0 || !check || g.current[i].boneSize) {
+            continue;
+          }
+          int32_t worst = 0;
+          if (ownChange(i, &worst) > most) {
+            used[match[i]] = false;
+            match[i] = -1;
+            matchDistance[i] = 0;
+            matchHow[i] = 0;
+            strangerReg[i] = worst;  // (nor by its kind, below)
+            matched--;
+            if (!byKind) {
+              g.byMesh--;
+            }
+          }
+        }
+      };
+      rejectFar(false);
     }
   }
   for (size_t i = 0; i < g.current.size(); i++) {
@@ -929,8 +1700,8 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     }
     submitted++;
     uint32_t n = occurrence[d.group]++;
-    if (match[i] >= 0) {
-      continue;  // (by its mesh)
+    if (match[i] >= 0 || strangerReg[i] >= 0) {
+      continue;  // (by its mesh; or new among its copies)
     }
     auto it = groups.find(d.group);
     if (it == groups.end()) {
@@ -947,6 +1718,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           (d.mesh != g.previous[j].mesh ||
            (d.boneAddress & 0xFFFF) != (g.previous[j].boneAddress & 0xFFFF))) {
         return;  // (skinned: another body; its own was looked for by mesh)
+      }
+      if (anchoredDraw[i] && anchoredOf(i, g.previous[j]) < 0) {
+        return;  // (another thing's draw before, by its found mesh)
       }
       float distance = InterpDistance(d, g.previous[j], bestDistance, &matchSkips[i]);
       if (distance < bestDistance) {
@@ -973,8 +1747,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       used[best] = true;
       match[i] = best;
       matchDistance[i] = bestDistance;
+      matchHow[i] = 3;
       matched++;
     }
+  }
+  if (rejectFar) {
+    rejectFar(true);
   }
   // (whether a matched draw changed at all: with the shared registers)
   for (size_t i = 0; i < g.current.size(); i++) {
@@ -1075,6 +1853,19 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       REXLOG_INFO("video: interp: not between (a cut?): {} of {} draws matched, {} draws before", matched,
                   submitted, g.previous.size());
     }
+  }
+  // A cutscene (a script with a skip argument running: the word the skip
+  // reads, gameplay.cpp): no pictures between. The game plays them at 30,
+  // cut by cut, and between two shots' frames, or of a body set aside for
+  // the next shot, the pictures showed what neither frame had (Chapter 7's
+  // cockpit: another shot of Sonia across the canopy, #131).
+  // NG2_INTERP_CUTSCENES=1 gives them pictures again.
+  static const bool cutscenePictures = [] {
+    const char* v = std::getenv("NG2_INTERP_CUTSCENES");
+    return v && v[0] == '1';
+  }();
+  if (between && !cutscenePictures && ng2::gameplay::InCutscene()) {
+    between = false;
   }
   // The pictures a frame gets. Paced by the display where it is faster than
   // the game (a refresh under 16 ms). A display at the game's own 60 has no
@@ -1344,6 +2135,33 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       uint8_t* moved = movedAll.data() + firstRegister[i];
       uint8_t* asNow = asNowAll.data() + firstRegister[i];
       bool anyMoved = false;
+      // A thing that spins fast (a helicopter's rotor, a turbine's fan: a
+      // quarter turn or more in a frame): its matrix's rows turn that far,
+      // and part of the way between two such the rows are shorter (by the
+      // cosine of half the angle: nothing left at a half turn), the blades
+      // shrunk, gone and back from picture to picture (Chapter 7's cutscenes,
+      // #131). Rows of its own (two at least: one vector passing by zero
+      // isn't a turn) that lose a fifth of their length halfway, about 75
+      // degrees: taken as now, the rotor stepping at the game's rate as it
+      // does without the pictures between.
+      auto spun = [&](size_t r) {
+        if ((r < skips[i].size() && skips[i][r]) || d.registers[r] >= 64) {
+          return false;
+        }
+        const float* x = &before.constants[r * 4];
+        const float* y = &d.constants[r * 4];
+        float lx = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        float ly = std::sqrt(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+        float mx = 0.5f * (x[0] + y[0]), my = 0.5f * (x[1] + y[1]), mz = 0.5f * (x[2] + y[2]);
+        float half = std::sqrt(mx * mx + my * my + mz * mz);
+        float mean = 0.5f * (lx + ly);
+        // (rows of like length: a turn, not a thing shown or hidden by its scale)
+        return std::isfinite(half) && mean > 1e-4f && std::fabs(lx - ly) < 0.1f * mean && half < 0.8f * mean;
+      };
+      uint32_t spunRows = 0;
+      for (size_t r = 0; r < d.registers.size() && spunRows < 2; r++) {
+        spunRows += spun(r);
+      }
       for (size_t r = 0; r < d.registers.size(); r++) {
         const bool shared = r < skips[i].size() && skips[i][r];
         const float* x = &before.constants[r * 4];
@@ -1391,13 +2209,22 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
                     InterpMovedFromAnother(before.constants.data(), d.constants.data(), d.registers.size(), r));
         anyMoved |= moved[r] != 0;
       }
-      if (!anyMoved) {
+      // (the turned rows alone: not the rows after them, where the thing is,
+      // or a rotor would stand still while its helicopter moved on)
+      bool anySpun = false;
+      for (size_t r = 0; r < d.registers.size() && spunRows >= 2; r++) {
+        anySpun |= spun(r);
+      }
+      if (!anyMoved && !anySpun) {
         return;
       }
       // A light is several registers (where, colour, reach): one found moved,
       // its run from it is taken as now, or one light's place would go with
       // another's reach (a flash on a wall, on the floor).
       InterpRunsFrom(moved, d.registers, asNow);
+      for (size_t r = 0; r < d.registers.size() && anySpun; r++) {
+        asNow[r] |= spun(r) ? 1 : 0;
+      }
       anyMovedIn[i] = 1;
     };
     {
@@ -1580,7 +2407,43 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       notOwn[i] = !before;
       bool any = false;
       ArenaVector<const float*> xs(d.registers.size(), nullptr, arena);
+      ArenaVector<bool> found(before ? 0 : d.registers.size(), false, arena);  // (a value before, if any)
+      // (not one a matched draw says where it was: a part of a thing whose
+      // other meshes were drawn, with the thing's own matrix in it. The one
+      // two frames ago was any copy's, a pod's inner part taken from the next
+      // pod's: between, it stood out of its pod, halfway to the next, #131)
+      bool placedByThing = false;
       if (!before && match[i] < 0 && d.mesh && !d.boneSize) {
+        for (size_t r = 0; r < d.registers.size() && !placedByThing; r++) {
+          if ((r < skips[i].size() && skips[i][r]) || d.registers[r] >= 64) {
+            continue;
+          }
+          placedByThing = shared.find(valueAt(d.registers[r], &d.constants[r * 4])) != nullptr;
+        }
+      }
+      // A draw with no draw before, and the camera's change known: its
+      // matrix before as if it stood still (the matrix now carried back). A
+      // thing come into view moves in with the rest of the picture, not at
+      // its place now a picture early; nothing is taken from another copy.
+      bool carriedBack = false;
+      if (!before && match[i] < 0 && cameraFor(d.group) && !d.boneSize && !d.ui && !placedByThing) {
+        Mat4 now;
+        if (wvpOf(d, d.constants, now)) {
+          Mat4 was = carried(now, cameraBack);
+          auto& h = halfway[i];
+          h.assign(d.constants.begin(), d.constants.end());
+          for (size_t r = 0; r < d.registers.size(); r++) {
+            if (d.registers[r] >= 21 && d.registers[r] <= 24) {
+              for (uint32_t c = 0; c < 4; c++) {
+                h[r * 4 + c] = float(was.m[d.registers[r] - 21][c]);
+              }
+            }
+          }
+          carriedBack = true;
+          statBack++;
+        }
+      }
+      if (!before && match[i] < 0 && d.mesh && !d.boneSize && !placedByThing && !carriedBack) {
         int32_t best = -1;
         float bestDistance = 0.6f;  // (two frames' move)
         for (uint32_t j = 0; j < g.older.size(); j++) {
@@ -1589,7 +2452,24 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
               o.constants.size() != d.constants.size()) {
             continue;
           }
-          float distance = InterpDistance(d, o, bestDistance, &matchSkips[i]);
+          // (new among its copies: itself two frames ago only)
+          if (strangerReg[i] >= 0 && std::memcmp(&o.constants[size_t(strangerReg[i]) * 4],
+                                                 &d.constants[size_t(strangerReg[i]) * 4], 16) != 0) {
+            continue;
+          }
+          float distance = InterpDistance(d, o, 0.6f, &matchSkips[i]);
+          if (!(distance < 0.6f)) {
+            continue;
+          }
+          // (by its matrices where it has its own: which copy it was; one
+          // whose matrices are far is another copy, a blind pick)
+          float apart = matrixApart(i, o);
+          if (apart >= 0) {
+            if (apart >= 0.45f) {
+              continue;
+            }
+            distance = apart;
+          }
           if (distance < bestDistance) {
             best = int32_t(j);
             bestDistance = distance;
@@ -1646,9 +2526,53 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
             x = one.x;  // (the kind's own camera)
           }
         }
+        if (!before && x) {
+          found[r] = true;
+        }
         if (x && std::memcmp(x, y, 16) != 0) {
           xs[r] = x;
           any = true;
+        }
+      }
+      // A draw without its own match: a run of registers (a matrix: c21-c24)
+      // some of whose rows have a value before and some not (rows the kind's
+      // draws all share, its camera's turn, and a row of its own, where it
+      // is) was the camera before turning a place now: a thing near the
+      // camera swung far, into view (Chapter 7's cockpit while the camera
+      // shook: a Sonia set aside for the next shot, a ghost across the
+      // pictures between, #131). Such a run as it is now, all of it.
+      // (only a mesh drawn before, its change too big to be taken: not a
+      // particle or a sprite, whose own place is new each frame while it
+      // goes with the camera)
+      if (!before && any && meshBefore[i]) {
+        any = false;
+        for (size_t r = 0; r < d.registers.size();) {
+          size_t end = r + 1;
+          while (end < d.registers.size() && d.registers[end] == d.registers[end - 1] + 1) {
+            end++;
+          }
+          bool some = false, all = true;
+          for (size_t k = r; k < end; k++) {
+            some |= xs[k] != nullptr;
+            all &= found[k];
+          }
+          if (some && !all) {
+            for (size_t k = r; k < end; k++) {
+              xs[k] = nullptr;
+            }
+          }
+          for (size_t k = r; k < end; k++) {
+            any |= xs[k] != nullptr;
+          }
+          r = end;
+        }
+      }
+      if (carriedBack) {
+        for (size_t r = 0; r < d.registers.size(); r++) {
+          if (d.registers[r] >= 21 && d.registers[r] <= 24) {
+            xs[r] = std::memcmp(&halfway[i][r * 4], &d.constants[r * 4], 16) != 0 ? &halfway[i][r * 4] : nullptr;
+            any |= xs[r] != nullptr;
+          }
         }
       }
       if (any) {

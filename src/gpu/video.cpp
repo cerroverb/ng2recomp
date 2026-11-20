@@ -937,6 +937,7 @@ void DebugColor(uint64_t vertexShader, float color[4]) {
 // reports. The key is seen on SDL's event thread; the trace starts at the
 // next present.
 std::atomic<bool> g_traceRequest{false};
+std::atomic<bool> g_interpShotRequest{false};  // F8 (NG2_INTERP_SHOTS): take the pictures now
 FILE* g_traceFile = nullptr;
 std::string g_traceDir;
 int64_t g_traceFrames = 0, g_traceLeft = 0;
@@ -956,6 +957,9 @@ bool TraceAllConstants() {
 thread_local std::string g_drawStack;  // NG2_TRACE_STACKS: the last draw's guest call chain
 
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F8 && !event->key.repeat) {
+    g_interpShotRequest = true;
+  }
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
     g_traceRequest = true;
   }
@@ -6028,6 +6032,77 @@ HostTexture* MovieTexture() {
   return g_movieTexture.get();
 }
 
+// NG2_INTERP_SHOTS=<dir> (a debug aid, #131): when <dir>/go appears, every
+// picture shown for the next NG2_INTERP_SHOTS_FRAMES (6) frames, the pictures
+// between and the frames' own, is copied as it is blitted and written to
+// <dir>/shot-<frame>-<k>.ppm (k: the picture between's number, 9 the frame's
+// own) some frames later, whole. To compare a picture between with the
+// frames around it.
+struct InterpShot {
+  std::unique_ptr<RenderBuffer> buffer;
+  std::string path;
+  uint32_t width = 0, height = 0, rowWidth = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;
+};
+std::vector<InterpShot> g_interpShots;
+std::atomic<int> g_interpShotsLeft{0};  // frames still to take
+uint64_t g_interpShotsWriteAt = 0;  // the frame they are written at
+const char* InterpShotsDir() {
+  static const char* dir = std::getenv("NG2_INTERP_SHOTS");
+  return dir && *dir ? dir : nullptr;
+}
+void TakeInterpShot(RenderCommandList* l, HostTexture* front, int k) {
+  if (g_interpShotsLeft <= 0 || !front || front->samples != RenderSampleCount::COUNT_1 ||
+      (front->format != RenderFormat::R8G8B8A8_UNORM && front->format != RenderFormat::R16G16B16A16_UNORM)) {
+    return;
+  }
+  InterpShot shot;
+  uint32_t texel = front->format == RenderFormat::R16G16B16A16_UNORM ? 8 : 4;
+  shot.rowWidth = (front->width + 63) & ~63u;
+  shot.width = front->width, shot.height = front->height, shot.format = front->format;
+  shot.buffer = g_device->createBuffer(
+      RenderBufferDesc::ReadbackBuffer(uint64_t(shot.rowWidth) * front->height * texel));
+  if (!shot.buffer) {
+    return;
+  }
+  shot.path = fmt::format("{}/shot-{}-{}.ppm", InterpShotsDir(), g_frameCount, k);
+  l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+              RenderTextureBarrier(front->texture.get(), RenderTextureLayout::COPY_SOURCE));
+  l->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(shot.buffer.get(), front->format, front->width,
+                                                                  front->height, 1, shot.rowWidth),
+                       RenderTextureCopyLocation::Subresource(front->texture.get()));
+  l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+              RenderTextureBarrier(front->texture.get(), RenderTextureLayout::SHADER_READ));
+  g_interpShots.push_back(std::move(shot));
+}
+void WriteInterpShots() {
+  for (auto& shot : g_interpShots) {
+    bool wide = shot.format == RenderFormat::R16G16B16A16_UNORM;
+    uint32_t texel = wide ? 8 : 4;
+    const auto* data = static_cast<const uint8_t*>(shot.buffer->map());
+    FILE* file = data ? std::fopen(shot.path.c_str(), "wb") : nullptr;
+    if (file) {
+      fmt::print(file, "P6\n{} {}\n255\n", shot.width, shot.height);
+      std::vector<uint8_t> row(shot.width * 3);
+      for (uint32_t y = 0; y < shot.height; y++) {
+        for (uint32_t x = 0; x < shot.width; x++) {
+          const uint8_t* at = data + (size_t(y) * shot.rowWidth + x) * texel;
+          for (uint32_t c = 0; c < 3; c++) {
+            row[x * 3 + c] = wide ? at[c * 2 + 1] : at[c];
+          }
+        }
+        std::fwrite(row.data(), 1, row.size(), file);
+      }
+      std::fclose(file);
+    }
+    if (data) {
+      shot.buffer->unmap();
+    }
+  }
+  REXLOG_INFO("video: interp shots: {} pictures written to {}", g_interpShots.size(), InterpShotsDir());
+  g_interpShots.clear();
+}
+
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   {
@@ -6051,6 +6126,29 @@ void Present(HostTexture* frontBuffer) {
     std::error_code error;
     if (std::filesystem::remove(traceFile, error)) {
       g_traceRequest = true;
+    }
+  }
+  if (InterpShotsDir()) {
+    if (g_interpShotsLeft > 0 && --g_interpShotsLeft == 0) {
+      g_interpShotsWriteAt = g_frameCount + 30;
+    } else if (g_interpShotsWriteAt && g_frameCount >= g_interpShotsWriteAt) {
+      g_interpShotsWriteAt = 0;
+      WriteInterpShots();
+    } else if (!g_interpShotsLeft && !g_interpShotsWriteAt && g_interpShotRequest.exchange(false)) {
+      g_interpShotsLeft = 12;  // (F8: 12 frames, this one first)
+      REXLOG_INFO("video: interp shots: F8 at frame {}", g_frameCount);
+    } else if (g_frameCount % 30 == 0 && !g_interpShotsLeft && !g_interpShotsWriteAt) {
+      // (NG2_INTERP_SHOTS_EVERY=<s>: by itself every so many seconds of frames)
+      static const int every = [] {
+        const char* v = std::getenv("NG2_INTERP_SHOTS_EVERY");
+        return v ? std::max(std::atoi(v), 0) * 60 : 0;
+      }();
+      std::error_code error;
+      if ((every && g_frameCount % uint64_t(every) == 0) ||
+          std::filesystem::remove(fmt::format("{}/go", InterpShotsDir()), error)) {
+        const char* frames = std::getenv("NG2_INTERP_SHOTS_FRAMES");
+        g_interpShotsLeft = std::clamp(frames ? std::atoi(frames) : 6, 1, 12);
+      }
     }
   }
   // NG2_TEST_WAIT_GPU=1: the CPU waits for the GPU at each present, as F7's
@@ -6285,6 +6383,7 @@ void Present(HostTexture* frontBuffer) {
 
     // The frame's picture into a swapchain image: index and the semaphore
     // its acquire signals.
+    int shotPicture = -1;  // (NG2_INTERP_SHOTS: which picture the next blit is)
     auto blit = [&](RenderCommandList* l, uint32_t index) {
       g_swapChainFramebuffers.resize(g_swapChain->getTextureCount());
       RenderTexture* target = g_swapChain->getTexture(index);
@@ -6324,6 +6423,9 @@ void Present(HostTexture* frontBuffer) {
         l->setViewports(&viewport, 1);
         l->setScissors(&scissor, 1);
         l->drawInstanced(3, 1, 0, 0);
+      }
+      if (shotPicture >= 0 && source == frontBuffer) {
+        TakeInterpShot(l, frontBuffer, shotPicture);
       }
       l->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
@@ -6504,6 +6606,7 @@ void Present(HostTexture* frontBuffer) {
         parts.acquire += SteadyNs() - acquireStart;
         growSemaphores();
         layouts.AtEnd();  // (the lists recorded since moved plume's idea of them on)
+        shotPicture = int(k);
         blit(interpList.get(), index);
         RestoreCarried(interpList.get(), carried);  // (the next picture, or the frame, starts from them)
         layouts.BackToStart(interpList.get());
@@ -6541,6 +6644,7 @@ void Present(HostTexture* frontBuffer) {
     if (g_swapChainValid) {
       WriteGpuMark(list, frame, presentMark);
       if (!ownHidden) {
+        shotPicture = 9;
         blit(list, frameIndex);
       }
     }

@@ -99,6 +99,10 @@ bool SkipIntro() {
   return REXCVAR_GET(skip_intro);
 }
 
+bool InCutscene() {
+  return Load16(kScriptSkip) != 0;
+}
+
 }  // namespace ng2::gameplay
 
 // The input update, once a frame: the pads read, the scripts still to run.

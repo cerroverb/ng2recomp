@@ -107,6 +107,15 @@ devices, and none of the player's settings or saves.
   display's grid, as before. With it on, read-back resolves aren't waited for (`NG2_READBACK_SYNC=1` does) and
   Input Latency Low doesn't apply; the game's frame is shown about a frame and 2-20 ms later than with it off.
   Best in Window Mode Fullscreen (exclusive). `NG2_INTERP_DEBUG=1` leaves out the draws without their own match.
+  No pictures between while a cutscene script runs (`NG2_INTERP_CUTSCENES=1` gives them pictures again).
+  Copies of one mesh (a row of pods, a ceiling's racks) are matched by the camera's change, found each
+  frame from the things drawn once: a copy whose matrix now is a copy before's carried by it stood still
+  and is that one; a copy with none near is new in view and gets the matrix it would have had before
+  (#131). The interp stats line "camera change known" says how often that worked.
+- `NG2_INTERP_SHOTS=<dir>`: every picture shown (the pictures between and the frame's own) saved as
+  `shot-<frame>-<k>.ppm` (k from 0 between, 9 own) for `NG2_INTERP_SHOTS_FRAMES` (6, at most 12) frames
+  when F8 is pressed (12 frames), `<dir>/go` appears, or every `NG2_INTERP_SHOTS_EVERY` seconds; written about 30
+  frames later. To compare a picture between with the frames around it.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
   `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading

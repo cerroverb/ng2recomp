@@ -264,7 +264,8 @@ for each button; a key in two lists presses both, as the game's two-button moves
   like) can upset frame pacing: if the game looks choppy at a steady 60 fps, close them completely
   (not only minimized) and try again.
 - Frame Interpolation (experimental): some objects or effects can flicker or judder. It is meant for
-  displays above 60 Hz and adds a little input latency. Please report any issues with it.
+  displays above 60 Hz and adds a little input latency. It is off in cutscenes for now, which play at
+  the game's own rate, until the problems it causes there are solved. Please report any issues with it.
 - Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
   from other systems, and from real Windows PCs especially, are welcome.
 
