@@ -29,6 +29,17 @@
 #include <cstring>
 #include <utility>
 
+#include <SDL3/SDL.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
@@ -178,6 +189,43 @@ void Frame() {
                window->GetCursorVisibility() == Visibility::kHidden) {
       window->SetCursorVisibility(Visibility::kAutoHidden);
     }
+#ifdef _WIN32
+    // SDL meant it hidden, but it puts its blank cursor in only while it
+    // takes the mouse to be over the window: Windows' own shown instead.
+    static const bool rehide = [] {
+      const char* v = std::getenv("NG2_POINTER_FIX");
+      return !(v && v[0] == '0');
+    }();
+    if (rehide && !SDL_CursorVisible()) {
+      if (SDL_Window* focus = SDL_GetKeyboardFocus()) {
+        HWND own = static_cast<HWND>(
+            SDL_GetPointerProperty(SDL_GetWindowProperties(focus), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        POINT pt{};
+        if (own && GetForegroundWindow() == own && GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) &&
+            ci.hCursor && GetCursorPos(&pt) && WindowFromPoint(pt) == own) {
+          // SDL took the mouse to have left (a leave right after the focus
+          // came back, with relative mode off for that moment): it shows the
+          // arrow there, put back at each move. Its focus back: relative mode
+          // on again sets it, a warp to where the pointer is does otherwise.
+          const bool hadMouse = SDL_GetMouseFocus() != nullptr;
+          if (!hadMouse) {
+            if (SDL_GetWindowRelativeMouseMode(focus)) {
+              SDL_SetWindowRelativeMouseMode(focus, false);
+              SDL_SetWindowRelativeMouseMode(focus, true);
+            } else {
+              POINT client = pt;
+              ScreenToClient(own, &client);
+              float density = SDL_GetWindowPixelDensity(focus);
+              density = density > 0 ? density : 1.0f;
+              SDL_WarpMouseInWindow(focus, float(client.x) / density, float(client.y) / density);
+            }
+          }
+        }
+      }
+    }
+#endif
   });
 }
 

@@ -34,6 +34,7 @@ is supported and optional: it can be added on the first start or later.
 - Skip intro and skip any cutscene; cheats: infinite health and ninpo, unlock difficulties and
   costumes, all weapons and ninpo, all crystal skulls, max health and ninpo
 - Low input latency and frame pacing on the display's own refreshes (options)
+- Frame Interpolation (experimental): higher frame rates while the game logic stays at 60 Hz
 - Mods: game files replaced by files in a mods folder, nothing of the game's changed
 - Render pipelines made in the background and remembered between sessions, so new areas don't
   stutter; the game's movies decoded on the PC (FFmpeg)

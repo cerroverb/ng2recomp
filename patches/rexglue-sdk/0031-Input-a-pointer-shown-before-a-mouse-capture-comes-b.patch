@@ -1,0 +1,32 @@
+From c937a4ec35949919588177070bfb27204c74b975 Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Sat, 21 Nov 2026 17:06:15 +0000
+Subject: [PATCH 31/35] Input: a pointer shown before a mouse capture comes
+ back auto-hidden at the release
+
+---
+ src/input/mnk/mnk_input_driver.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index a3b94914..20e5dafc 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -451,7 +451,13 @@ void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
+     return;
+   }
+   mouse_captured_ = false;
+-  window->SetCursorVisibility(precapture_cursor_visibility_);
++  // A pointer shown before the capture (the window's own default) comes back
++  // auto-hidden: shown again at a move. Shown at once, it flashed up on each
++  // release (a pad press after mouse look), and exclusive full screen kept
++  // drawing it after the app hid it again a moment later.
++  window->SetCursorVisibility(precapture_cursor_visibility_ == rex::ui::Window::CursorVisibility::kVisible
++                                  ? rex::ui::Window::CursorVisibility::kAutoHidden
++                                  : precapture_cursor_visibility_);
+   window->SetRelativeMouseMode(false);
+   relative_mouse_mode_ = false;
+   window->ReleaseMouse();
+-- 
+2.56.1
+

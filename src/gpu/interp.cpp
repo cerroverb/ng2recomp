@@ -728,6 +728,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   };
   static std::atomic<uint32_t> statStill{0}, statNew{0}, statBack{0};  // (for the log below)
   bool cameraKnown = false;
+  // (for the log of cuts: how many things drawn once agreed on it, of how many, and how far it moved)
+  uint32_t cameraAgreed = 0, cameraOnes = 0;
+  // (of the things drawn once that moved on the screen: how many, how many as the camera's change has it;
+  // one that stood still is another view's, a shadow map's, or the camera stood still too)
+  uint32_t cameraMovedOnes = 0, cameraMovedAgreed = 0;
+  float cameraMoved = 0;
   Mat4 cameraChange{}, cameraBack{};  // (back: from a matrix now to the one before)
   // Kinds of draws (shaders and target) whose one-of-a-kind things didn't go
   // with it: another view's (a shadow map's light, a reflection), where the
@@ -999,6 +1005,17 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // (not across a cut to another camera in the same room: the room's
       // things agree with any change, and would be carried across it)
       cameraKnown = most >= 6 && most * 3 >= ones.size() && moved <= 1.0f && inverse(cameraChange, cameraBack);
+      if (cameraKnown) {
+        for (const One& o : ones) {
+          if (matOff(o.now, o.was) > 1e-4f) {
+            cameraMovedOnes++;
+            cameraMovedAgreed += matOff(o.now, carried(o.was, cameraChange)) < 0.01f;
+          }
+        }
+      }
+      cameraAgreed = most;
+      cameraOnes = uint32_t(ones.size());
+      cameraMoved = moved;
       if (cameraKnown) {
         for (const One& o : ones) {
           cameraKinds[o.group] |= matOff(o.now, carried(o.was, cameraChange)) < 0.01f ? 1 : 2;
@@ -1886,16 +1903,60 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     }
     g.slow = g.slowRun >= 3;
   }
-  // A cut (another camera, a loaded room): most draws are new.
+  // A cut (another camera, a loaded room): most draws are new. But not where
+  // the camera's change from the frame before was found (the things drawn once
+  // agree on one, a small one: never across a cut): an effect's burst
+  // (hundreds of new dust and debris draws where an Izuna Drop lands) left
+  // under half of all draws matched four to eight frames running, each then
+  // shown without a picture between, the counter at 108 for it (#134).
   bool between = !partial && !g.previous.empty() && submitted;
   if (between && matched * 2 < submitted) {
-    between = false;
-    g.cuts++;
+    auto kindKey = [](const InterpDraw& d) { return d.mesh * 0xC2B2AE3D27D4EB4Full ^ d.group; };
+    ArenaMap<uint64_t, uint32_t> before(arena), now(arena);
+    for (auto& b : g.previous) {
+      if (b.submitted && b.mesh && !b.ui) {
+        before[kindKey(b)]++;
+      }
+    }
+    for (auto& d : g.current) {
+      if (d.submitted && d.mesh && !d.ui) {
+        now[kindKey(d)]++;
+      }
+    }
+    uint32_t ones = 0, onesMatched = 0;
+    for (size_t i = 0; i < g.current.size(); i++) {
+      auto& d = g.current[i];
+      if (!d.submitted || !d.mesh || d.ui) {
+        continue;
+      }
+      const uint64_t key = kindKey(d);
+      auto it = before.find(key);
+      if (now[key] == 1 && it != before.end() && it->second == 1) {
+        ones++;
+        onesMatched += match[i] >= 0;
+      }
+    }
+    // (and a third of those that moved agreeing on it too: the change a third of
+    // all agree on can be a shadow map's or a reflection's view, which stood
+    // still across a cut in the same room while all that moved in the picture
+    // disagreed. Not most of them: where the Izuna Drop lands in a fight, a
+    // third and more move by themselves, weapons and pieces, 53 to 82 of 96
+    // agreeing. From six that moved: fewer, a door or a pickup turning by
+    // itself decided it, and none moved where a loaded room kept only still
+    // overlays.)
+    const bool cut = !cameraKnown || cameraMovedOnes < 6 || cameraMovedAgreed * 3 < cameraMovedOnes;
     static uint32_t logged = 0;
     if (logged < 40) {
       logged++;
-      REXLOG_INFO("video: interp: not between (a cut?): {} of {} draws matched, {} draws before", matched,
-                  submitted, g.previous.size());
+      REXLOG_INFO("video: interp: {}: {} of {} draws matched, {} draws before; {} of {} things drawn once matched, "
+                  "the camera's change {} ({} of {} agree, {} of {} that moved, moved {:.3f})",
+                  cut ? "not between (a cut?)" : "between (new draws, not a cut)", matched, submitted,
+                  g.previous.size(), onesMatched, ones, cameraKnown ? "known" : "not known",
+                  cameraAgreed, cameraOnes, cameraMovedAgreed, cameraMovedOnes, cameraMoved);
+    }
+    if (cut) {
+      between = false;
+      g.cuts++;
     }
   }
   // A cutscene (a script with a skip argument running: the word the skip
@@ -2439,6 +2500,32 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // the frame before's value is taken as halfway between that one and now.
     ArenaVector<ArenaVector<float>> halfway(g.current.size(), arena);
     ArenaVector<bool> olderUsed(g.older.size(), false, arena);
+    // Those two frames ago by kind (mesh, pass, constants' count) in draw
+    // order, made when first needed: a new draw is looked for among its own
+    // kind only, and among hundreds of copies (debris where rockets burst)
+    // only near its own place in the order, as in matching. Each against
+    // every one was 12 ms of a frame there (#134).
+    auto kindOf = [](const InterpDraw& d) {
+      return (d.mesh * 0x9E3779B97F4A7C15ull) ^ (d.group + 0x632BE59BD9B4E019ull + (d.group << 6) + (d.group >> 2)) ^
+             (uint64_t(d.constants.size()) << 48);
+    };
+    bool kindsMade = false;
+    ArenaMap<uint64_t, ArenaVector<uint32_t>> olderOfKind(arena);
+    ArenaMap<uint64_t, uint32_t> currentOfKind(arena);  // how many this frame
+    ArenaVector<uint32_t> placeInKind(g.current.size(), 0, arena);
+    auto makeKinds = [&] {
+      kindsMade = true;
+      for (uint32_t j = 0; j < g.older.size(); j++) {
+        if (g.older[j].submitted && g.older[j].mesh) {
+          olderOfKind[kindOf(g.older[j])].push_back(j);
+        }
+      }
+      for (size_t k = 0; k < g.current.size(); k++) {
+        if (g.current[k].submitted && g.current[k].mesh) {
+          placeInKind[k] = currentOfKind[kindOf(g.current[k])]++;
+        }
+      }
+    };
     uint64_t fromOlder = 0;
     uint64_t borrowedDraws = 0;
     for (size_t i = 0; i < g.current.size(); i++) {
@@ -2490,7 +2577,21 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       if (!before && match[i] < 0 && d.mesh && !d.boneSize && !placedByThing && !carriedBack) {
         int32_t best = -1;
         float bestDistance = 0.6f;  // (two frames' move)
-        for (uint32_t j = 0; j < g.older.size(); j++) {
+        if (!kindsMade) {
+          makeKinds();
+        }
+        const uint64_t kind = kindOf(d);
+        auto bucket = olderOfKind.find(kind);
+        const size_t count = bucket != olderOfKind.end() ? bucket->second.size() : 0;
+        constexpr size_t kWindow = 32;
+        size_t from = 0, to = count;
+        if (count > 2 * kWindow) {
+          size_t at = size_t(placeInKind[i]) * count / std::max<uint32_t>(currentOfKind[kind], 1);
+          from = at > kWindow ? at - kWindow : 0;
+          to = std::min(count, at + kWindow + 1);
+        }
+        for (size_t b = from; b < to; b++) {
+          const uint32_t j = bucket->second[b];
           auto& o = g.older[j];
           if (olderUsed[j] || !o.submitted || o.mesh != d.mesh || o.group != d.group ||
               o.constants.size() != d.constants.size()) {

@@ -35,6 +35,7 @@
 #include <cstring>
 #include <memory>
 #include <map>
+#include <tuple>
 #include <set>
 #include <mutex>
 #include <array>
@@ -703,10 +704,18 @@ struct Entry {
   int64_t ns;
   uint32_t count;
 };
+// A critical section waited for: who held it as the wait began, and where.
+struct Held {
+  uint32_t holder;  // (its handle: the thread names end with it, "(F8000080)"; 0 unknown)
+  uint32_t holderCall, cs;
+  int64_t ns;
+  uint32_t count;
+};
 struct Buffer {
   std::mutex mutex;
   uint32_t tid = 0;
   std::unordered_map<uint64_t, Entry> entries;
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Held> held;  // (holder, its call, lock)
 };
 std::mutex g_mutex;
 std::vector<std::shared_ptr<Buffer>> g_buffers;
@@ -755,7 +764,7 @@ uint32_t CurrentThreadId() {
 #endif
 }
 
-void Observe(const char* name, uint32_t lr, uint32_t, int64_t ns) {
+Buffer& Mine() {
   thread_local std::shared_ptr<Buffer> mine;
   if (!mine) {
     mine = std::make_shared<Buffer>();
@@ -763,6 +772,20 @@ void Observe(const char* name, uint32_t lr, uint32_t, int64_t ns) {
     std::lock_guard lock(g_mutex);
     g_buffers.push_back(mine);
   }
+  return *mine;
+}
+
+void ObserveLock(uint32_t holderHandle, uint32_t holderLr, uint32_t cs, int64_t ns) {
+  Buffer& mine = Mine();
+  uint32_t call = holderLr ? holderLr - 4 : 0;
+  std::lock_guard lock(mine.mutex);
+  auto& held = mine.held[{holderHandle, call, cs}];
+  held.holder = holderHandle, held.holderCall = call, held.cs = cs, held.ns += ns, held.count++;
+}
+
+void Observe(const char* name, uint32_t lr, uint32_t, int64_t ns) {
+  Buffer& buffer = Mine();
+  auto* mine = &buffer;
   std::lock_guard lock(mine->mutex);
   uint32_t call = lr - 4;
   auto& entry = mine->entries[(uint64_t(call) << 32) ^ uint64_t(uintptr_t(name))];
@@ -777,6 +800,7 @@ void Report() {
     const char* off = std::getenv("NG2_PROFILE_KERNEL");  // (0: not timed)
     if (!off || std::strcmp(off, "0") != 0) {
       rex::SetWaitObserver(&Observe);
+      rex::SetLockObserver(&ObserveLock);
     }
     return;
   }
@@ -791,11 +815,11 @@ void Report() {
     double ms;
     std::string text;
   };
-  std::vector<Row> rows;
+  std::vector<Row> rows, heldRows;
   std::lock_guard lock(g_mutex);
   for (auto& buffer : g_buffers) {
     std::lock_guard bufferLock(buffer->mutex);
-    if (buffer->entries.empty()) {
+    if (buffer->entries.empty() && buffer->held.empty()) {
       continue;
     }
     std::string thread = ThreadName(buffer->tid);
@@ -814,6 +838,17 @@ void Report() {
       }
     }
     buffer->entries.clear();
+    for (auto& [key, held] : buffer->held) {
+      double ms = held.ns / 1e6 / seconds;
+      if (ms >= 2.0) {
+        heldRows.push_back({ms, held.holder ? fmt::format("{} for {:08X} (its last call at {:08X}; lock {:08X}) {:.0f} ({:.0f} a second)",
+                                                         thread, held.holder, held.holderCall, held.cs, ms,
+                                                         held.count / seconds)
+                                             : fmt::format("{} for a thread that had let go (lock {:08X}) {:.0f} ({:.0f} a second)",
+                                                         thread, held.cs, ms, held.count / seconds)});
+      }
+    }
+    buffer->held.clear();
   }
   std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
   std::string line;
@@ -822,6 +857,15 @@ void Report() {
   }
   if (!line.empty()) {
     REXLOG_INFO("kernel waits, ms each second:{}", line);
+  }
+  // (critical sections: the waiting thread, the one that held it and its last call)
+  std::sort(heldRows.begin(), heldRows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
+  line.clear();
+  for (size_t i = 0; i < heldRows.size() && i < 12; i++) {
+    line += fmt::format("{}{}", i ? "; " : " ", heldRows[i].text);
+  }
+  if (!line.empty()) {
+    REXLOG_INFO("locks waited for, ms each second:{}", line);
   }
 }
 }  // namespace kernel_waits
@@ -2773,7 +2817,21 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
     // up to 320 wide at 1x for the same reason; the height limit leaves the
     // tall 280x584 and 320x720 ones scaled. The game's own 256x128 pass with
     // depth has a 256x128 depth target, so both stay at the same scale.
-    host->scale = key.width <= 320 && key.height <= 320 ? 1 : g_resolutionScale;
+    // Except the 256x128 pass (#136): the water's reflection, which the
+    // water samples point by point. At 1x under a scaled picture its texels
+    // were several pixels wide and snapped from frame to frame as the camera
+    // turned: patches of the reflection flickered (blocks popping in a slow
+    // pan at Chapter 5's canal 0.26%, scaled 0.02%). Its depth target is
+    // 256x128 too, so both stay at the same scale. NG2_SCALE_REFLECTION=0:
+    // at 1x again.
+    static const bool scaleReflection = [] {
+      const char* v = std::getenv("NG2_SCALE_REFLECTION");
+      return !(v && *v == '0');
+    }();
+    host->scale = key.width <= 320 && key.height <= 320 &&
+                          !(scaleReflection && key.width == 256 && key.height == 128)
+                      ? 1
+                      : g_resolutionScale;
     host->width = key.width * host->scale;
     host->height = key.height * host->scale;
     host->samples = SampleCount(key.msaa);
@@ -6008,7 +6066,11 @@ void WriteTracePicture() {
   const auto* data = static_cast<const uint8_t*>(picture.buffer->map());
   FILE* file = data ? std::fopen(picture.path.c_str(), "wb") : nullptr;
   if (file) {
-    constexpr uint32_t kStep = 4;
+    // NG2_TRACE_PICTURE_STEP=<n>: every n-th pixel kept (4; 1 for the whole picture)
+    static const uint32_t kStep = [] {
+      const char* v = std::getenv("NG2_TRACE_PICTURE_STEP");
+      return v ? uint32_t(std::clamp(std::atoi(v), 1, 16)) : 4u;
+    }();
     uint32_t width = picture.width / kStep, height = picture.height / kStep;
     fmt::print(file, "P6\n{} {}\n255\n", width, height);
     std::vector<uint8_t> row(width * 3);
@@ -7229,6 +7291,11 @@ void CreatePipelines() {
 }
 
 }  // namespace
+
+// As F7: the trace starts at the next present (the pad script's "trace").
+void RequestTrace() {
+  g_traceRequest = true;
+}
 
 bool IsNativeRenderer() {
   // The native renderer unless NG2_RENDERER=xenos (the SDK's GPU emulation,

@@ -19,7 +19,8 @@
 //
 // Buttons: up down left right start back lthumb rthumb lb rb a b x y, lt rt
 // (triggers fully pressed), lleft lright lup ldown / rleft rright rup rdown
-// (a stick at full throw). Times are decimal. Every step is logged as it
+// (a stick at full throw; "rright@20" at 20%); "trace" presses F7 (the renderer's trace) as the
+// step fires, so a trace starts at the same point of a scripted run. Times are decimal. Every step is logged as it
 // fires; a step whose window passed while the game wasn't reading the pad
 // (a load) is pressed late for one read rather than dropped.
 //
@@ -44,6 +45,10 @@
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
 #include <rex/logging.h>
+
+namespace ng2::video {
+void RequestTrace();  // src/gpu/video.cpp: as F7 (the "trace" step)
+}
 
 namespace ng2 {
 
@@ -145,6 +150,9 @@ class ScriptInputDriver : public rex::input::InputDriver {
       if (!step.announced) {
         step.announced = true;
         REXLOG_INFO("pad: t={} ms \"{}\"{}", t, step.text, late ? " (late)" : "");
+        if (step.trace) {
+          video::RequestTrace();
+        }
       }
       pad.buttons |= step.buttons;
       pad.lt = std::max(pad.lt, step.lt);
@@ -229,6 +237,7 @@ class ScriptInputDriver : public rex::input::InputDriver {
     uint64_t at = 0, hold = 150;
     std::string text;
     bool announced = false;
+    bool trace = false;  // "trace": F7 as the step fires
   };
 
   static bool AddButton(std::string_view name, Step& step) {
@@ -249,7 +258,7 @@ class ScriptInputDriver : public rex::input::InputDriver {
         {"lleft", 0, -32767}, {"lright", 0, 32767}, {"lup", 1, 32767},  {"ldown", 1, -32767},
         {"rleft", 2, -32767}, {"rright", 2, 32767}, {"rup", 3, 32767},  {"rdown", 3, -32767},
     };
-    auto same = [name](const char* word) {
+    auto same = [&name](const char* word) {
       return std::strlen(word) == name.size() &&
              std::equal(name.begin(), name.end(), word, [](char a, char b) {
                return std::tolower(static_cast<unsigned char>(a)) == b;
@@ -261,11 +270,35 @@ class ScriptInputDriver : public rex::input::InputDriver {
         return true;
       }
     }
+    // "<stick>@<percent>": that stick part of the way ("rright@20", a slow turn)
+    int percent = 100;
+    const bool scaled = name.find('@') != std::string_view::npos;
+    if (size_t at = name.find('@'); at != std::string_view::npos) {
+      std::string_view digits = name.substr(at + 1);
+      name = name.substr(0, at);
+      percent = 0;
+      for (char c : digits) {
+        if (c < '0' || c > '9' || percent > 100) {
+          return false;
+        }
+        percent = percent * 10 + (c - '0');
+      }
+      if (digits.empty() || percent > 100) {
+        return false;
+      }
+    }
     for (const auto& s : kSticks) {
       if (same(s.name)) {
-        step.axes[s.axis] = s.value;
+        step.axes[s.axis] = int16_t(s.value * percent / 100);
         return true;
       }
+    }
+    if (scaled) {
+      return false;  // "@" only goes with a stick
+    }
+    if (same("trace")) {
+      step.trace = true;
+      return true;
     }
     if (same("lt")) {
       step.lt = 0xFF;
