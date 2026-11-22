@@ -30,6 +30,23 @@
 // Unlock Costumes: the costume list (sub_823E1448) adds a costume per
 // difficulty the same check says is cleared; it is yes there too.
 //
+// One Hit Kill: in sub_82412508 (r3 the hit's record, r4 the attacker's),
+// the damage goes through sub_82413B08(damage, record, segment), whose
+// return is the damage taken from that health segment (u16s at the
+// character's +0x5930, 0xFFFF unused; a damage at least the segment's
+// empties it). For a hit by the player on a character no player controls
+// (+0x59D3 0xFF), it returns the most and empties the other segments: the
+// game then finds the health gone and kills it as usual. A hit that does no
+// damage (or one on a character that can't be hurt now, which returns
+// before) is left as it is.
+//
+// Instant Charge: a player's charge (Ultimate Techniques) is in a 108-byte
+// block at 0x84C3DA40 + 108 * the character's +0x59D3: +0 its level, +20
+// the frames held (0 when not charging), +22 and +24 the frames for levels
+// 1 and 2. The player's update (sub_8238B2D8) raises the level when the
+// count reaches one of those, else counts on; each frame in play, a count
+// that has started is set to the next level's.
+//
 // Neither writes the unlocks to the profile (a game played on a difficulty
 // or in a costume they open is saved as usual): switched off, the menus
 // are as before.
@@ -50,6 +67,8 @@ REXCVAR_DEFINE_BOOL(cheat_infinite_ninpo, false, "Cheats", "Casting ninpo doesn'
 REXCVAR_DEFINE_BOOL(cheat_unlock_difficulties, false, "Cheats",
                     "Every difficulty in New Game and Mission Mode");
 REXCVAR_DEFINE_BOOL(cheat_unlock_costumes, false, "Cheats", "Every costume");
+REXCVAR_DEFINE_BOOL(cheat_one_hit_kill, false, "Cheats", "Any hit that does damage kills the enemy");
+REXCVAR_DEFINE_BOOL(cheat_instant_charge, false, "Cheats", "Ultimate Techniques charge at once");
 
 namespace {
 
@@ -72,9 +91,41 @@ void WithoutPlayerDamage(PPCContext& ctx, uint8_t* base, void (*damage)(PPCConte
 
 }  // namespace
 
+constexpr uint32_t kPlayerRecord = 0x84C3DC60;  // the player's record (below)
+constexpr uint32_t kRecordSize = 24;
+constexpr uint32_t kSegments = 0x5930, kSegmentCount = 8, kPlayerIndex = 0x59D3;
+uint32_t g_oneHitTarget = 0;  // the character a hit by the player is on, in sub_82412508
+
 REX_EXTERN(__imp__sub_82412508);
 REX_HOOK_RAW(sub_82412508) {
+  uint32_t player = ng2::guest::Load32(kPlayerRecord);
+  uint32_t target = ctx.r3.u32 ? ng2::guest::Load32(ctx.r3.u32) : 0;
+  uint32_t attacker = ctx.r4.u32 ? ng2::guest::Load32(ctx.r4.u32) : 0;
+  // The player's hits: its own record's (kicks, throws) and the next one's,
+  // its weapon's (whose character is the weapon's, not the player's).
+  bool byPlayer = attacker == player || ctx.r4.u32 == kPlayerRecord + kRecordSize;
+  bool oneHit = REXCVAR_GET(cheat_one_hit_kill) && player && byPlayer && target &&
+                target != player && ng2::guest::Virtual(target)[kPlayerIndex] == 0xFF;
+  g_oneHitTarget = oneHit ? target : 0;
   WithoutPlayerDamage(ctx, base, __imp__sub_82412508);
+  g_oneHitTarget = 0;
+}
+REX_EXTERN(__imp__sub_82413B08);
+REX_HOOK_RAW(sub_82413B08) {
+  uint32_t damage = ctx.r3.u32 & 0xFFFF;
+  uint32_t record = ctx.r4.u32, segment = ctx.r5.u32 & 0xFF;
+  __imp__sub_82413B08(ctx, base);
+  uint32_t target = g_oneHitTarget;
+  if (!target || damage == 0 || !record || ng2::guest::Load32(record) != target) {
+    return;
+  }
+  for (uint32_t i = 0; i < kSegmentCount; i++) {
+    uint32_t at = target + kSegments + 2 * i;
+    if (i != segment && ng2::guest::Load16(at) != 0xFFFF) {
+      std::memset(ng2::guest::Virtual(at), 0, 2);
+    }
+  }
+  ctx.r3.u64 = 0xFFFF;
 }
 REX_EXTERN(__imp__sub_82412EA8);
 REX_HOOK_RAW(sub_82412EA8) {
@@ -89,10 +140,10 @@ REX_HOOK_RAW(sub_824131E0) {
 // game reads its character straight from 0x84C3DC60. The game's own test that
 // a record's character is the player (sub_82412508): the record's +10 is 0,
 // the character's +0x59D3 isn't 0xFF and its +0x59BF is 0.
-constexpr uint32_t kPlayerRecord = 0x84C3DC60;
 constexpr uint32_t kNinpo = 0x5942, kNinpoMost = 0x5940;
 
 void FillPlayerNinpo();
+void ChargePlayer();
 bool HudInPlay();  // extras.cpp
 
 // The New Game path list is made with the title menu (sub_8366F4D0, at
@@ -186,6 +237,35 @@ void CheatsFrame() {
   // In play only: before it the record holds something else.
   if (REXCVAR_GET(cheat_infinite_ninpo) && (ng2::aspect::HudShown() || HudInPlay())) {
     FillPlayerNinpo();
+  }
+  if (REXCVAR_GET(cheat_instant_charge) && (ng2::aspect::HudShown() || HudInPlay())) {
+    ChargePlayer();
+  }
+}
+
+// A charge the player has started, to the next level's count (the game
+// raises the level on its next update).
+void ChargePlayer() {
+  constexpr uint32_t kCharges = 0x84C3DA40, kChargeSize = 108;
+  uint32_t player = ng2::guest::Load32(kPlayerRecord);
+  if (player < 0x40000000u || player >= 0xA0000000u ||
+      ng2::guest::Virtual(kPlayerRecord)[10] != 0 || ng2::guest::Virtual(player)[0x59BF] != 0) {
+    return;
+  }
+  uint8_t index = ng2::guest::Virtual(player)[0x59D3];
+  if (index >= 4) {
+    return;
+  }
+  uint32_t block = kCharges + kChargeSize * index;
+  uint16_t level = ng2::guest::Load16(block), count = ng2::guest::Load16(block + 20);
+  uint16_t first = ng2::guest::Load16(block + 22), second = ng2::guest::Load16(block + 24);
+  if (count == 0 || first == 0 || second <= first || level >= 2) {
+    return;
+  }
+  uint16_t to = level == 0 ? first : second;
+  if (count < to) {
+    uint16_t value = rex::byte_swap(to);
+    std::memcpy(ng2::guest::Virtual(block + 20), &value, 2);
   }
 }
 

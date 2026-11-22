@@ -19,6 +19,7 @@
 // in clip space: four vertices 16 bytes apart).
 
 #include "aspect.h"
+#include "menu_mouse.h"
 
 #include <cmath>
 #include <cstdint>
@@ -196,12 +197,24 @@ void LogBoxes() {
   REXLOG_INFO("2D buckets{}:{}", g_hud ? " (HUD)" : "", line);
 }
 
+std::atomic<uint64_t> g_menuDrawnFrame{0};  // (+1: 0 is never)
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+bool MenuBucket(int bucket);
+
 // Draws an item with its bucket known.
 void DrawTagged(PPCContext& ctx, uint8_t* base, void (*draw)(PPCContext&, uint8_t*)) {
   auto it = g_itemBucket.find(ctx.r3.u32);
   int saved = g_drawBucket;
   uint32_t savedItem = g_drawItem;
   g_drawBucket = it == g_itemBucket.end() ? -1 : it->second;
+  // (not bucket 20: play draws there too)
+  if (g_drawBucket >= 0 && g_drawBucket != 20 && MenuBucket(g_drawBucket)) {
+    g_menuDrawnFrame.store(ng2::menu_mouse::Frame() + 1, std::memory_order_relaxed);
+  }
   g_drawItem = ctx.r3.u32;
   draw(ctx, base);
   g_drawBucket = saved;
@@ -344,6 +357,11 @@ bool HudShown() {
   return g_hudShown.load(std::memory_order_relaxed);
 }
 
+bool MenuShown() {
+  uint64_t at = g_menuDrawnFrame.load(std::memory_order_relaxed);
+  return at && ng2::menu_mouse::Frame() + 1 - at <= 2;
+}
+
 float SqueezeX() {
   return CurrentSqueeze().x;
 }
@@ -466,11 +484,87 @@ REX_HOOK_RAW(sub_822F8850) {
   }
 }
 
+// NINJA CINEMA's "Storage Device" hint (the PC has one storage device):
+// outside play, in the hints' bucket (40), its label (the hint labels'
+// texture's row from v 0.75 to 0.8125, the same row in every language) and
+// the button drawn beside it (the X cell of the prompts' atlas, u 0-0.125,
+// v 0-0.25) aren't drawn. A vertex: x, y, 0, colour, u, v.
+std::atomic<int64_t> g_storageLabelMs{-1000000};
+std::atomic<float> g_storageLabelX{0.0f}, g_storageLabelY{0.0f};
+bool StorageDeviceHint(uint32_t vertices) {
+  constexpr uint32_t kStride = 24, kU = 16, kV = 20;
+  if (g_drawBucket != 40 || g_hudShown.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+  for (uint32_t i = 0; i < 4; i++) {
+    uint32_t at = vertices + i * kStride;
+    float x = LoadFloat(at), y = LoadFloat(at + 4), u = LoadFloat(at + kU), v = LoadFloat(at + kV);
+    x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+    u0 = std::min(u0, u), u1 = std::max(u1, u), v0 = std::min(v0, v), v1 = std::max(v1, v);
+  }
+  auto near = [](float a, float b) { return std::abs(a - b) < 0.001f; };
+  float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+  // (and where NINJA CINEMA has it: the hint line's right end)
+  if (near(u0, 0.0f) && near(u1, 1.0f) && near(v0, 0.75f) && near(v1, 0.8125f) && std::abs(cx - 1007.0f) < 60.0f &&
+      std::abs(cy - 586.0f) < 40.0f) {
+    g_storageLabelX.store(cx), g_storageLabelY.store(cy), g_storageLabelMs.store(NowMs());
+    return true;
+  }
+  if (near(u0, 0.0f) && near(u1, 0.125f) && near(v0, 0.0f) && near(v1, 0.25f) &&
+      NowMs() - g_storageLabelMs.load() < 200 && std::abs(cx - g_storageLabelX.load()) < 80.0f &&
+      std::abs(cy - g_storageLabelY.load()) < 40.0f) {
+    return true;
+  }
+  return false;
+}
+
+// The menus' arrows, each a quad of the whole of its texture: either side
+// of the title's sideways lists (Load Game's slots, the costumes, the New
+// Game paths; bucket 85, about 66x57), and the inventory's (bucket 50): its
+// tabs' left and right (about 67x92) and its list's up and down (about
+// 115x52). Where they are is told to menu_mouse.cpp, which presses that way
+// for a click on one, and turns the wheel sideways while only sideways ones
+// are up.
+void NoteCarouselArrow(uint32_t vertices) {
+  constexpr uint32_t kStride = 24, kU = 16, kV = 20;
+  if (g_drawBucket != 85 && g_drawBucket != 50) {
+    return;
+  }
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+  for (uint32_t i = 0; i < 4; i++) {
+    uint32_t at = vertices + i * kStride;
+    float x = LoadFloat(at), y = LoadFloat(at + 4), u = LoadFloat(at + kU), v = LoadFloat(at + kV);
+    x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+    u0 = std::min(u0, u), u1 = std::max(u1, u), v0 = std::min(v0, v), v1 = std::max(v1, v);
+  }
+  float w = x1 - x0, h = y1 - y0;
+  if (u0 > 0.01f || v0 > 0.01f || u1 < 0.99f || v1 < 0.99f) {
+    return;
+  }
+  using Way = ng2::menu_mouse::Way;
+  bool right = (x0 + x1) * 0.5f > 640.0f;
+  if (g_drawBucket == 85 && w >= 58.0f && w <= 76.0f && h >= 50.0f && h <= 64.0f) {
+    ng2::menu_mouse::NoteArrow(right ? Way::kRight : Way::kLeft, x0, y0, x1, y1);
+  } else if (g_drawBucket == 50 && w >= 58.0f && w <= 76.0f && h >= 82.0f && h <= 102.0f) {
+    ng2::menu_mouse::NoteArrow(right ? Way::kRight : Way::kLeft, x0, y0, x1, y1);
+  } else if (g_drawBucket == 50 && w >= 100.0f && w <= 130.0f && h >= 40.0f && h <= 64.0f) {
+    bool down = (y0 + y1) * 0.5f > 450.0f;
+    ng2::menu_mouse::NoteArrow(down ? Way::kDown : Way::kUp, x0, y0, x1, y1);
+  }
+}
+
 // A sprite's or gauge's quad, in 1280x720 pixels.
 REX_EXTERN(__imp__sub_8368EFF8);
 REX_HOOK_RAW(sub_8368EFF8) {
   Squeeze s = CurrentSqueeze();
   uint32_t vertices = ctx.r4.u32;
+  if (vertices && StorageDeviceHint(vertices)) {
+    return;  // (not drawn)
+  }
+  if (vertices) {
+    NoteCarouselArrow(vertices);
+  }
   if (!s.active() || !vertices) {
     if (vertices) {
       NoteQuad(vertices, 24);

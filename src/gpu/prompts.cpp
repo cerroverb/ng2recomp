@@ -14,7 +14,9 @@
 // frame with Generation() in their hash, so a change shows at once.
 
 #include "prompts.h"
+#include "../menu_mouse.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -148,6 +150,38 @@ Set Chosen() {
   }
 }
 
+// The key a cell shows: in a menu, the menus' own for A, B and Y (Return,
+// Backspace, Delete: menu_mouse.cpp) and no mouse button (the mouse's are
+// the menus' there), else the first one bound.
+std::string ShownKey(const char* bind) {
+  if (!ng2::menu_mouse::InMenu()) {
+    return FirstKey(bind);
+  }
+  std::string_view name = bind;
+  if (name == "keybind_a") {
+    return "Return";
+  }
+  if (name == "keybind_b") {
+    return "Backspace";
+  }
+  if (name == "keybind_y") {
+    return "Delete";
+  }
+  std::string keys = rex::cvar::GetFlagByName(bind);
+  for (size_t at = 0; at <= keys.size();) {
+    size_t comma = std::min(keys.find(',', at), keys.size());
+    std::string key = keys.substr(at, comma - at);
+    if (size_t plus = key.rfind('+'); plus != std::string::npos && plus + 1 < key.size()) {
+      key = key.substr(plus + 1);
+    }
+    if (!key.empty() && key != "LMB" && key != "RMB" && key != "MMB") {
+      return key;
+    }
+    at = comma + 1;
+  }
+  return FirstKey(bind);
+}
+
 std::atomic<uint32_t> g_generation{0};
 std::mutex g_mutex;
 Set g_shown = Set::kXbox;          // (g_mutex)
@@ -155,7 +189,7 @@ std::string g_shownKeys;           // (g_mutex) the keyboard set's keys
 std::string BoundKeys() {
   std::string keys;
   for (const CellButton& cell : kCellButtons) {
-    keys += FirstKey(cell.bind) + ',';
+    keys += ShownKey(cell.bind) + ',';
   }
   return keys;
 }
@@ -202,7 +236,7 @@ bool Apply(uint32_t width, uint32_t height, Kind kind, uint8_t* data, uint64_t b
           }
         }
       }
-      const KeyPictures& key = Key(FirstKey(kCellButtons[c].bind));
+      const KeyPictures& key = Key(ShownKey(kCellButtons[c].bind));
       Shape shape = kCellButtons[c].shape;
       const uint8_t* pixels = shape == Shape::kTall ? key.tall : shape == Shape::kWide ? key.wide : key.square;
       uint32_t w = shape == Shape::kTall ? kTallW : shape == Shape::kWide ? kWideW : kSquareW;

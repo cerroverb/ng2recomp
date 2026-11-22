@@ -132,9 +132,12 @@ REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (hal
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
                     "Shift drawing by half a pixel where the game uses D3D's pixel centers, "
                     "as the console does");
-// Extras' Texture LOD Bias: the game's own mip bias (-1.5 on most textures),
+// Graphics' Texture LOD Bias: the game's own mip bias (-1.5 on most textures),
 // or 0 or -1 for every texture (less shimmer at higher render scales).
-REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1");
+REXCVAR_DEFINE_BOOL(smooth_normal_maps, false, "Video",
+                    "Normal maps filtered between their mips too (trilinear)");
+REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras",  // (its old page: the saved settings keep it)
+                     "0: the game's, 1: 0, 2: -1");
 // Input Latency: Low waits, before drawing a frame, until the last one is
 // on screen (VK_KHR_present_wait), so no finished frame queues for the
 // display (FIFO's three images let two): about one or two refreshes less
@@ -1048,6 +1051,9 @@ struct GuestShader {
   std::vector<std::pair<uint8_t, uint8_t>> elements;
   // Pixel shaders: color outputs written (bit n = oCn).
   uint32_t colorOutputs = 0;
+  // Pixel shaders: the sampler slots of their normal maps (bit n = slot n),
+  // by the names in the container's constant table.
+  uint32_t normalMapSlots = 0;
 };
 std::unordered_map<uint32_t, std::unique_ptr<GuestShader>> g_guestShaders;
 std::unique_ptr<uint8_t[]> g_spirvCache;
@@ -3699,7 +3705,7 @@ RenderTextureAddressMode ConvertClamp(xenos::ClampMode mode) {
   }
 }
 
-uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch, bool smoothNormals = false) {
   RenderSamplerDesc desc;
   desc.addressU = ConvertClamp(fetch.clamp_x);
   desc.addressV = ConvertClamp(fetch.clamp_y);
@@ -3716,6 +3722,14 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   desc.minLOD = float(fetch.base_address ? uint32_t(fetch.mip_min_level)
                                          : std::max(uint32_t(fetch.mip_min_level), 1u));
   desc.maxLOD = fetch.mip_filter == xenos::TextureFilter::kBaseMap ? desc.minLOD : FLT_MAX;
+  // Normal Map Filtering, Trilinear: a normal map filtered between its mips too
+  // (trilinear), so the line where one mip gives way to the next doesn't
+  // slide over lit surfaces and their highlights.
+  if (smoothNormals && fetch.mip_filter != xenos::TextureFilter::kBaseMap) {
+    desc.magFilter = RenderFilter::LINEAR;
+    desc.minFilter = RenderFilter::LINEAR;
+    desc.mipmapMode = RenderMipmapMode::LINEAR;
+  }
   desc.mipLODBias = std::clamp(float(fetch.lod_bias) / 32.0f, -15.0f, 15.0f);
   if (int32_t bias = REXCVAR_GET(texture_lod_bias); bias == 1 || bias == 2) {
     desc.mipLODBias = bias == 1 ? 0.0f : -1.0f;
@@ -5494,7 +5508,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     if (descriptor) {
       shared.textureIndices[0][slot] = descriptor;  // 2D
       shared.textureIndices[3][slot] = descriptor;  // 1D (sampled as Nx1 2D)
-      shared.samplerIndices[slot] = GetSampler(fetch);
+      shared.samplerIndices[slot] =
+          GetSampler(fetch, REXCVAR_GET(smooth_normal_maps) && ps && (ps->normalMapSlots >> slot & 1));
     }
   }
   // The title menu's labels are 8-bit pictures looked up in a 256x1 palette
@@ -8521,6 +8536,41 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
   }
 }
 
+// A pixel shader's normal-map sampler slots, from its constant table
+// (D3DXSHADER_CONSTANTTABLE after a size word, at the container's +16;
+// 20-byte constant infos, offsets from the table): samplers named
+// NormalSampler or BumpSampler.
+uint32_t NormalMapSlots(uint32_t container) {
+  constexpr uint16_t kSamplerSet = 3;
+  constexpr uint32_t kTableHeader = 28, kInfoSize = 20, kNameMax = 32;
+  uint32_t offset = guest::Load32(container + 16);
+  uint32_t size = offset ? guest::Load32(container + offset) : 0;  // (the table's, after it)
+  if (!offset || offset > 0x10000 || size < kTableHeader || size > 0x10000) {
+    return 0;
+  }
+  uint32_t table = container + offset + 4;
+  uint32_t constants = guest::Load32(table + 12);
+  uint32_t infos = guest::Load32(table + 16);
+  if (constants > 256 || infos + uint64_t(constants) * kInfoSize > size) {
+    return 0;
+  }
+  uint32_t slots = 0;
+  for (uint32_t i = 0; i < constants; i++) {
+    uint32_t info = table + infos + i * kInfoSize;
+    uint32_t nameAt = guest::Load32(info);
+    if (guest::Load16(info + 4) != kSamplerSet || nameAt >= size) {
+      continue;
+    }
+    const char* chars = reinterpret_cast<const char*>(guest::Virtual(table + nameAt));
+    std::string_view name(chars, strnlen(chars, std::min(kNameMax, size - nameAt)));
+    uint32_t index = guest::Load16(info + 6);
+    if ((name == "NormalSampler" || name == "BumpSampler") && index < 32) {
+      slots |= 1u << index;
+    }
+  }
+  return slots;
+}
+
 void RunCreateShader(uint32_t object, uint32_t container, bool pixel) {
   std::lock_guard lock(g_mutex);
   if (!g_device || !object || !container) {
@@ -8538,6 +8588,7 @@ void RunCreateShader(uint32_t object, uint32_t container, bool pixel) {
   if (pixel) {
     uint32_t header = container + guest::Load32(container + 24);
     shader->colorOutputs = guest::Load32(header + 28) & 0xF;
+    shader->normalMapSlots = NormalMapSlots(container);
   } else {
     // Declared vertex elements (address, usage, usage index) in container order.
     uint32_t header = container + guest::Load32(container + 24);

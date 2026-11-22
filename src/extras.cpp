@@ -44,6 +44,12 @@
 // flags) at a new game and at each stage's start; All Crystal Skulls counts
 // all 30 as found; Max HP and Ninpo reads the life and ninpo upgrades as
 // full when a stage's character is made from the save.
+//
+// More Blood: a hit's blood (sub_826A54D0's blood objects) sprays through
+// sub_824C2388 (from sub_824C2980 and its kin at 0x824C....) and throws drops
+// that leave stains where they land (the stain emitters sub_82508400 and
+// sub_82508700, whose stains per emission are sub_824C1040(min, max)). On,
+// each spray is made twice and each emission leaves twice the stains.
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +62,7 @@
 #include <rex/ppc/context.h>
 
 #include "gpu/guest.h"
+#include "menu_mouse.h"
 
 REXCVAR_DEFINE_BOOL(skip_death_screen, false, "Extras",
                     "Straight to the game over menu after dying, without the death screen");
@@ -64,6 +71,7 @@ REXCVAR_DEFINE_BOOL(auto_chapter_screen, false, "Extras",
 REXCVAR_DEFINE_INT32(hud_mode, 0, "Extras", "0: shown, 1: fades out when not fighting, 2: hidden");
 REXCVAR_DEFINE_BOOL(post_effects, true, "Extras", "The blur and white flashes (off: none)");
 REXCVAR_DEFINE_BOOL(smooth_hud, false, "Extras", "The HUD's and menus' pictures always filtered");
+REXCVAR_DEFINE_BOOL(more_blood, false, "Extras", "Twice the blood sprays and stains");
 REXCVAR_DEFINE_INT32(shadows, 0, "Video", "0: the game's (512x512 in fights), 1: hi-res (1024x1024 always)");
 REXCVAR_DEFINE_BOOL(hires_font, false, "Extras",
                     "Text drawn from glyphs twice the size (from the next start)");
@@ -307,13 +315,15 @@ void Ng2ExtrasPad(PPCRegister& r5) {
       press = true;
     }
   }
+  // The mouse's clicks and wheel in a menu (menu_mouse.cpp).
+  uint32_t bits = (press ? kStart : 0) | ng2::menu_mouse::PadBits();
   // Into every pad's words (0x44 apart): the game over menu reads the
   // player's own pad, not the merged one.
-  if (press) {
+  if (bits) {
     for (uint32_t pad = 0; pad < 4; pad++) {
       for (uint32_t w = 0; w < 5; w++) {
         uint32_t word = r5.u32 + 0x44 * pad + 4 * w;
-        Store32(word, Load32(word) | kStart);
+        Store32(word, Load32(word) | bits);
       }
     }
   }
@@ -537,3 +547,29 @@ void Ng2MaxNinpo(PPCRegister& r10) {
     r10.u64 = 2000;
   }
 }
+
+// More Blood: by caller, so other effects through the same functions are
+// left.
+REX_EXTERN(__imp__sub_824C2388);
+REX_HOOK_RAW(sub_824C2388) {  // a spray
+  uint32_t from = uint32_t(ctx.lr);
+  if (!REXCVAR_GET(more_blood) || from < 0x824C0000 || from >= 0x824D0000) {
+    __imp__sub_824C2388(ctx, base);
+    return;
+  }
+  PPCContext args = ctx;
+  __imp__sub_824C2388(ctx, base);
+  PPCContext result = ctx;
+  ctx = args;
+  __imp__sub_824C2388(ctx, base);
+  ctx = result;
+}
+REX_EXTERN(__imp__sub_824C1040);
+REX_HOOK_RAW(sub_824C1040) {  // a count from min to max
+  uint32_t from = uint32_t(ctx.lr);
+  __imp__sub_824C1040(ctx, base);
+  if (REXCVAR_GET(more_blood) && (from == 0x825084A4 || from == 0x825087A4)) {
+    ctx.r3.u64 = ctx.r3.u32 * 2;  // a stain emitter's stains
+  }
+}
+

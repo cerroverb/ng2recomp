@@ -44,6 +44,10 @@
 #include "gpu/guest.h"
 #include "gpu/menu_label.h"
 #include "recomp_settings.h"
+#include "overlay.h"
+#include "gpu/prompts.h"
+#include "rebind.h"
+#include "menu_mouse.h"
 
 #include "aspect.h"
 
@@ -113,6 +117,12 @@ constexpr uint32_t kOnOffRow = 0x600;  // a choice row's flag: 1 shows its first
 constexpr uint32_t kPlayTimeText = 0x859F5574;  // UTF-16, from sub_836D0E90
 constexpr uint32_t kPageRows = 0x10;           // a page object's row count
 constexpr uint32_t kModelValues = 0x8532EE30;  // + 0x40 * page + 8 * row
+// A page shows up to 8 settings, then Restore Defaults: the model has 8
+// values a page (a page object holds 10 rows: widgets at +0x140, labels
+// +0x168, ... by sub_836D03E8). A longer page scrolls: its rows are made
+// again for the settings shown.
+constexpr uint32_t kTitleSlots = 8;
+constexpr uint32_t kMaxPageRows = 32;  // a page's settings
 constexpr uint32_t kStringTable = 0x83BD1DC0;  // for sub_823E1238(table, language, id)
 
 // Options strings: table 2 (id 0x20000 + index), strings back to back in
@@ -128,15 +138,18 @@ constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your sav
 // Frame Interpolation's description (placed with the labels).
 constexpr std::u16string_view kInterpNote = u"Experimental: pictures between the game's frames.";
 // The Music Test's track names: room for our texts.
-constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
-constexpr uint32_t kSlotCount = 0x98;  // past the last index used
+// Spare ids: the table's unused 0x63-0x96, then ids well past its end
+// (0x300 on; it has texts at 0x97 and after), which only the text lookup's
+// hook answers.
+constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97, kPastTable = 0x300;
+constexpr uint32_t kSlotCount = 0x380;
 
 enum class Kind {
   kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples, kAspect,
   kSensitivity
 };
 // Mouse Sensitivity's choices (mnk_sensitivity).
-constexpr double kSensitivities[] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0};
+constexpr double kSensitivities[] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0};
 struct Setting {
   std::u16string_view label;
   std::array<std::u16string_view, 10> choices;
@@ -190,9 +203,9 @@ constexpr Setting kSettings[] = {
     // The prompts follow the device in use (gpu/prompts.cpp).
     {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard", u"Steam Deck"}, 6,
      "button_prompts", Kind::kLevel},
-    {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2"}, 6, "mnk_sensitivity",
+    {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2", u"3", u"4", u"6", u"8"}, 10, "mnk_sensitivity",
      Kind::kSensitivity},
-    // Extras (extras.cpp, and the renderer's Texture LOD Bias).
+    // Extras (extras.cpp); Texture LOD Bias is the renderer's, on Graphics.
     {u"Skip Death Screen", {u"On", u"Off"}, 2, "skip_death_screen", Kind::kOnOff},
     {u"Auto Chapter Screen", {u"On", u"Off"}, 2, "auto_chapter_screen", Kind::kOnOff},
     {u"HUD", {u"Shown", u"Fade Out", u"Hidden"}, 3, "hud_mode", Kind::kLevel},
@@ -222,6 +235,12 @@ constexpr Setting kSettings[] = {
     // Master Edition's camera (camera.cpp); camera control in OT and UT.
     {u"Modern Camera", {u"On", u"Off"}, 2, "modern_camera", Kind::kOnOff},
     {u"OT/UT Free Camera", {u"On", u"Off"}, 2, "free_camera_ot_ut", Kind::kOnOff},
+    // Normal maps filtered between their mips (gpu/video.cpp).
+    {u"Normal Map Filtering", {u"Trilinear", u"Game"}, 2, "smooth_normal_maps", Kind::kOnOff},
+    {u"One Hit Kill", {u"On", u"Off"}, 2, "cheat_one_hit_kill", Kind::kOnOff},
+    {u"Instant Charge", {u"On", u"Off"}, 2, "cheat_instant_charge", Kind::kOnOff},
+    // Extras (extras.cpp).
+    {u"More Blood", {u"On", u"Off"}, 2, "more_blood", Kind::kOnOff},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -248,13 +267,15 @@ struct Page {
   uint32_t page;   // its Options page (category + 1)
   uint32_t size;   // its page object's
   uint32_t restore;  // the Restore Defaults row's widget
-  std::array<PageRow, 8> rows;
+  std::array<PageRow, kMaxPageRows> rows;
   uint32_t count;
   bool ourRestore = false;  // its Restore Defaults row made by us (the page has none)
   // The page the screen shows (its builder's, the menu model's page, its
   // cursor and values), when not the one the Options loop runs (page): 0, the
   // same.
   uint32_t view = 0;
+  // Its rows are a table of ours (the Controls page), none of the game's.
+  bool custom = false;
 };
 constexpr uint32_t ViewOf(const Page& page) {
   return page.view ? page.view : page.page;
@@ -266,32 +287,37 @@ constexpr uint32_t ViewOf(const Page& page) {
 // (and a Restore Defaults row after them, for a page without one)
 constexpr uint32_t kRestoreSize = 0xE0;
 constexpr uint32_t kOurRestore = (uint32_t(std::size(kSettings)) * kListSize + 15) & ~15u;
-constexpr uint32_t kTitleRowsSize = (kOurRestore + kRestoreSize + 0xFFF) & ~0xFFFu;
+constexpr uint32_t kTitleRowsSize = (kOurRestore + 2 * kRestoreSize + 0xFFF) & ~0xFFFu;
 constexpr PageRow Row(uint32_t setting) {
   return {setting, setting * kListSize, true, true, true};
 }
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{Row(0), Row(3), Row(1), Row(30), Row(2), Row(20)}},
-     6},
+     {{Row(0), Row(3), Row(1), Row(21), Row(33), Row(30), Row(2), Row(20)}},
+     8},
     {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
-     {{Row(8), Row(9), Row(11), Row(24), Row(25), Row(26)}},
-     6},
+     {{Row(8), Row(9), Row(34), Row(35), Row(11), Row(24), Row(25), Row(26)}},
+     8},
     {u"Interface", 4, 0x26A0, 0xAA0,
      {{Row(19), Row(23), Row(22), Row(7), Row(15), Row(16)}},
      6},
     // The Audio Settings page (5, builder sub_836D54F8, which stores its
     // page number at +12; Restore Defaults at +0x1380).
-    {u"Extras", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(17), Row(18), Row(21)}}, 5},
+    {u"Extras", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(17), Row(18), Row(36)}}, 5},
     // Shown on the Copyright Information page (6: what the category list
     // shows for its sixth category; builder sub_836D57B8), run as page 11
     // (the Options loop runs page 6 inline, 11 through sub_823E7C40); no
     // Restore Defaults of its own: ours.
     {u"Gameplay", 11, 0x400, kOurRestore, {{Row(27), Row(10), Row(31), Row(32)}}, 4, true, 6},
+    // On the Options screen's page object for Return to Main Menu (8), an
+    // empty page it makes and never shows (ShowControlsPage), run as page 7
+    // (Restore Default's: its handler sub_823E82E0); its Restore Defaults is
+    // ours.
+    {u"Controls", 7, 0x1E0, kOurRestore + kRestoreSize, {}, 0, true, 8, true},
 };
-static_assert(kOurRestore + kRestoreSize <= kTitleRowsSize);
+static_assert(kOurRestore + 2 * kRestoreSize <= kTitleRowsSize);
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
 
@@ -421,7 +447,10 @@ void PlaceTexts() {
   texts.erase(std::unique(texts.begin(), texts.end()), texts.end());
   uint32_t slot = kSpareFirst;
   for (std::u16string_view text : texts) {
-    if (slot >= kSpareEnd) {
+    if (slot == kSpareEnd) {
+      slot = kPastTable;
+    }
+    if (slot >= kSlotCount) {
       REXLOG_WARN("recomp settings: no room for a text");
       break;
     }
@@ -479,7 +508,20 @@ void SaveSettings() {
     }
   }
   for (const auto& [name, value] : g_written) {
-    std::string entry = name + " = " + value;
+    // (a text setting quoted: the keys' lists)
+    const auto* info = rex::cvar::GetFlagInfo(name);
+    std::string shown = value;
+    if (info && info->type == rex::cvar::FlagType::String) {
+      shown = "\"";
+      for (char c : value) {
+        if (c == '"' || c == '\\') {
+          shown += '\\';
+        }
+        shown += c;
+      }
+      shown += '"';
+    }
+    std::string entry = name + " = " + shown;
     size_t firstTable = lines.size();
     bool replaced = false;
     for (size_t i = 0; i < lines.size(); i++) {
@@ -546,6 +588,7 @@ void PutBackGame() {
 }
 
 void Close() {
+  ng2::rebind::CancelKeyCapture();  // (a Controls cell left waiting)
   std::fill(std::begin(g_listWidgets), std::end(g_listWidgets), 0u);
   if (!g_open) {
     return;
@@ -854,8 +897,19 @@ void RestoreDefault(const Setting& setting) {
 
 }  // namespace
 
+// rebind.cpp's settings: as ours, and saved at once outside our menus (the
+// game's own Controller Settings changed them).
+bool g_controlsToSave = false;  // set outside our menus: saved at the frame's end (WindowFrame)
+void StoreControl(const char* name, const std::string& value) {
+  SetSetting(name, value);
+  if (!g_open && !g_inGameOurs) {
+    g_controlsToSave = true;
+  }
+}
+
 void SetConfigPath(const std::filesystem::path& path) {
   g_configPath = path;
+  ng2::rebind::SetStore(StoreControl);
 }
 
 void SetAppContext(rex::ui::WindowedAppContext* context) {
@@ -1006,13 +1060,49 @@ REX_HOOK_RAW(sub_8366F2E8) {
   __imp__sub_8366F2E8(ctx, base);
 }
 
+// The row of a column of rows the pointer is on (in the 1280x720 UI: the
+// column's left and right, the first row's center, the rows' pitch), or -1.
+int PointedRow(float left, float right, float top, float pitch, int count) {
+  float x, y;
+  if (!ng2::menu_mouse::Pointer(&x, &y) || x < left || x > right) {
+    return -1;
+  }
+  float row = std::floor((y - top) / pitch + 0.5f);
+  return row >= 0.0f && row < float(count) ? int(row) : -1;
+}
+
+// The title menu's entries (the pointer picks one): centers and pitch.
+constexpr float kTitleMenuLeft = 500.0f, kTitleMenuRight = 780.0f;
+constexpr float kTitleMenuTop = 432.0f, kTitleMenuPitch = 35.2f;
+
 // The title menu's input: Confirm on the exit entry quits. (Each frame the
 // menu is up: perf_overlay.cpp shows the version then.)
 void TitleMenuFrame();
 REX_EXTERN(__imp__sub_8366FBC0);
 REX_HOOK_RAW(sub_8366FBC0) {
+  // The pointer on an entry: the cursor there (before the menu's update,
+  // which lights it); a click on none confirms nothing (its A taken out of
+  // the pads' presses for this update).
+  if (ng2::menu_mouse::ClickedThisFrame()) {
+    uint32_t count = std::min<uint32_t>(ng2::guest::Load32(kTitleEntryCount), 8);
+    if (PointedRow(kTitleMenuLeft, kTitleMenuRight, kTitleMenuTop, kTitleMenuPitch, int(count)) < 0) {
+      constexpr uint32_t kA = 0x10;
+      for (uint32_t pad = 0; pad < 5; pad++) {  // (the four, then the merged one)
+        uint32_t at = kPadPressed + pad * 0x44;
+        Store32(at, ng2::guest::Load32(at) & ~kA);
+      }
+    }
+  }
+  if (ng2::menu_mouse::PointerActive()) {
+    uint32_t count = std::min<uint32_t>(ng2::guest::Load32(kTitleEntryCount), 8);
+    int row = PointedRow(kTitleMenuLeft, kTitleMenuRight, kTitleMenuTop, kTitleMenuPitch, int(count));
+    if (row >= 0 && uint32_t(row) != ng2::guest::Load32(kTitleCursor)) {
+      Store32(kTitleCursor, uint32_t(row));
+    }
+  }
   __imp__sub_8366FBC0(ctx, base);
   TitleMenuFrame();
+  ng2::menu_mouse::NoteMenuInput();
   using ng2::guest::Load32;
   uint32_t player = *ng2::guest::Virtual(kPlayerPad);
   uint32_t cursor = Load32(kTitleCursor);
@@ -1061,10 +1151,30 @@ namespace {
 
 // The values of a page's rows (ours, then Restore Defaults' 0), below the
 // guest stack.
+// The title's page scrolls: the first setting shown, by page (kPages'
+// order), and where its rows were made.
+uint32_t g_titleScroll[std::size(kPages)] = {};
+uint32_t g_titleObject[std::size(kPages)] = {}, g_titleModel[std::size(kPages)] = {};
+// The widgets in a page's rows, as made when Options opened: a scroll puts
+// other settings in them.
+uint32_t g_titleSlotWidgets[std::size(kPages)][kTitleSlots] = {};
+uint32_t PageIndex(const Page& page) {
+  return uint32_t(&page - kPages);
+}
+// The settings a page shows (Restore Defaults after them, in that row).
+uint32_t TitleShown(const Page& page) {
+  return std::min(page.count, kTitleSlots);
+}
+// The setting at a shown row (page.count: Restore Defaults).
+uint32_t TitleLine(const Page& page, uint32_t row) {
+  return row < TitleShown(page) ? g_titleScroll[PageIndex(page)] + row : page.count;
+}
+constexpr uint32_t kPageValues = 8;
 uint32_t StoreValues(PPCContext& ctx, const Page* page) {
   uint32_t values = ctx.r1.u32 - 0x80;
-  for (uint32_t i = 0; i < 8; i++) {
-    Store32(values + 4 * i, page && i < page->count ? ValueOf(kSettings[page->rows[i].setting]) : 0);
+  for (uint32_t i = 0; i < kPageValues; i++) {
+    uint32_t line = page ? TitleLine(*page, i) : 0;
+    Store32(values + 4 * i, page && line < page->count ? ValueOf(kSettings[page->rows[line].setting]) : 0);
   }
   return values;
 }
@@ -1156,6 +1266,8 @@ bool HasOurRows(const Page& page) {
 // second argument, the menu model + 0x10).
 void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object, uint32_t model) {
   using ng2::guest::Load32;
+  g_titleScroll[PageIndex(page)] = 0;
+  g_titleObject[PageIndex(page)] = object, g_titleModel[PageIndex(page)] = model;
   Store32(object + kPageRows, 0);
   float y = 0.0f;
   auto place = [&](uint32_t widget) {
@@ -1163,8 +1275,8 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     StoreFloat(widget + kWidgetX, 0.0f);
     StoreFloat(widget + kWidgetY, y);
   };
-  for (uint32_t i = 0; i < page.count; i++) {
-    const PageRow& row = page.rows[i];
+  for (uint32_t i = 0; i < TitleShown(page); i++) {
+    const PageRow& row = page.rows[TitleLine(page, i)];
     const Setting& setting = kSettings[row.setting];
     uint32_t widget = (row.ours ? g_titleRows : object) + row.widget;
     uint32_t value = ValueOf(setting);
@@ -1172,6 +1284,7 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
       MakeList(ctx, base, widget, row.ours);
     }
     place(widget);
+    g_titleSlotWidgets[PageIndex(page)][i] = widget;
     if (row.list) {
       for (uint32_t k = 0; k < 10; k++) {
         Store32(widget + kListTexts + 4 * k, ListString(ctx, base, Choice(setting, k)));
@@ -1197,19 +1310,22 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     y += float(CallGuestFloat(ctx, base, row.list ? __imp__sub_836CF198 : __imp__sub_836CF3B0,
                               {widget}));
   }
-  uint32_t restore = (page.ourRestore ? g_titleRows : object) + page.restore;
-  if (page.ourRestore) {
-    MakeRestore(ctx, base, restore);
+  if (!page.custom) {
+    uint32_t restore = (page.ourRestore ? g_titleRows : object) + page.restore;
+    if (page.ourRestore) {
+      MakeRestore(ctx, base, restore);
+    }
+    place(restore);
+    CallGuest(ctx, base, __imp__sub_836D03E8, {object, TextId(kRestoreText), restore});
   }
-  place(restore);
-  CallGuest(ctx, base, __imp__sub_836D03E8, {object, TextId(kRestoreText), restore});
   // The rows' values in the model, as the handler will keep them; the
   // game's are put back on closing.
   uint32_t slots = kModelValues + 0x40 * ViewOf(page);
   uint8_t* bytes = ng2::guest::Virtual(slots);
-  g_savedGuest.emplace_back(slots, std::vector<uint8_t>(bytes, bytes + 0x40));
-  for (uint32_t i = 0; i < 8; i++) {
-    uint32_t value = i < page.count ? ValueOf(kSettings[page.rows[i].setting]) : 0;
+  g_savedGuest.emplace_back(slots, std::vector<uint8_t>(bytes, bytes + 8 * kPageValues));
+  for (uint32_t i = 0; i < kPageValues; i++) {
+    uint32_t line = TitleLine(page, i);
+    uint32_t value = line < page.count ? ValueOf(kSettings[page.rows[line].setting]) : 0;
     Store32(slots + 8 * i, value);
     Store32(slots + 8 * i + 4, value);
   }
@@ -1278,17 +1394,309 @@ void RefreshWindowSizes(PPCContext& ctx, uint8_t* base) {
   }
 }
 
+}  // namespace
+
+namespace {
+
+// A scrolled page's rows: the settings now shown put in the widgets the
+// page was made with (their choices, value and label; the page object keeps
+// each row's label text at +0x190 + 4 * row, its id at +0x168).
+void RefillPage(PPCContext& ctx, uint8_t* base, const Page& page) {
+  constexpr uint32_t kRowLabelIds = 0x168, kRowLabelTexts = 0x190;
+  uint32_t object = g_titleObject[PageIndex(page)];
+  for (uint32_t i = 0; i < TitleShown(page); i++) {
+    uint32_t widget = g_titleSlotWidgets[PageIndex(page)][i];
+    if (!object || !widget) {
+      return;
+    }
+    for (uint32_t j = 0; j < page.count; j++) {
+      if (g_listWidgets[page.rows[j].setting] == widget) {
+        g_listWidgets[page.rows[j].setting] = 0;
+      }
+    }
+    uint32_t setting = page.rows[TitleLine(page, i)].setting;
+    const Setting& that = kSettings[setting];
+    uint32_t value = ValueOf(that);
+    for (uint32_t k = 0; k < 10; k++) {
+      Store32(widget + kListTexts + 4 * k, ListString(ctx, base, Choice(that, k)));
+    }
+    Store32(widget + kListShown, ng2::guest::Load32(widget + kListTexts + 4 * value));
+    Store32(widget + kWidgetValue, value);
+    g_listWidgets[setting] = widget;
+    uint32_t id = TextId(that.label);
+    Store32(object + kRowLabelIds + 4 * i, id);
+    if (uint32_t text = g_overrides[(id - kTable) % kSlotCount].load(std::memory_order_acquire)) {
+      Store32(object + kRowLabelTexts + 4 * i, text);
+    }
+  }
+}
+
+// The Controls page: a table of ours (the overlay's texts) in the page's
+// place, on the title's Options screen and in the in-game list, as the NGB
+// recomp's: an action a row, with its two keys and its controller button
+// (rebind.h), then Default Controls. Confirm on a cell waits for a key, or a
+// button (two together for Ninpo and Water Run); X clears it, Y gives the
+// row its defaults.
+constexpr uint32_t kMergedPad = 0x83C08100;  // the pads' buttons: +0 held, +8 pressed
+constexpr uint32_t kButtonMasks[8] = {0x10, 0x20, 0x40, 0x80, 0x1000, 0x2000, 0x4000, 0x8000};
+constexpr uint32_t kPadX = 0x40;
+constexpr std::u16string_view kButtonTags[8] = {u"@[pad:Rd]", u"@[pad:Rr]", u"@[pad:Rl]", u"@[pad:Ru]",
+                                                u"@[pad:L1]", u"@[pad:R1]", u"@[pad:L2]", u"@[pad:R2]"};
+constexpr std::u16string_view kButtonNames[8] = {u"A", u"B", u"X", u"Y", u"LB", u"RB", u"LT", u"RT"};
+constexpr int kControlRows = ng2::rebind::kActions + 1;  // (the last: Default Controls)
+struct ControlsState {
+  int row = 0, column = 0;  // column: 0 and 1 the keys, 2 the controller's
+  int capture = 0;          // waiting for 1 a key, 2 a button
+  uint32_t ignore = 0;      // buttons held when the wait began, until let go
+  int first = -1;           // a pair's first button, held
+  bool letGo = false;       // after a button was taken: nothing until all are let go
+  std::chrono::steady_clock::time_point since, firstAt;
+};
+ControlsState g_controls;
+
+void EndControlsCapture() {
+  ng2::rebind::CancelKeyCapture();
+  g_controls.capture = 0;
+}
+
+// The table's place in the 1280x720 UI.
+constexpr float kTableNameX = 456.0f, kTableCellX[3] = {740.0f, 880.0f, 1020.0f};
+constexpr float kTableTop = 128.0f, kTablePitch = 21.5f;
+
+// The table, shown for this frame (focused: the cursor is in it).
+uint32_t g_inGameLayer = 0;  // the in-game list's rows' layer (its draw)
+void ShowControls(bool focused, uint32_t layer = 0) {
+  namespace rebind = ng2::rebind;
+  constexpr float kNameX = kTableNameX, kTop = kTableTop, kPitch = kTablePitch, kHelpY = 606.0f;
+  constexpr const float (&kCellX)[3] = kTableCellX;
+  constexpr int kSize = 0x12;
+  constexpr float kDim = 0.5f, kRowLit = 0.8f, kFixed = 0.25f;
+  const ControlsState& c = g_controls;
+  std::vector<ng2::overlay::Text> texts;
+  auto put = [&](float x, float y, std::u16string text, float shade) {
+    texts.push_back({x, y, std::move(text), shade, kSize});
+  };
+  bool keyboardPrompts = ng2::prompts::CurrentSet() == ng2::prompts::Set::kKeyboard;
+  for (int row = 0; row < kControlRows; row++) {
+    float y = kTop + kPitch * float(row);
+    bool lit = focused && row == c.row;
+    if (row == rebind::kActions) {
+      put(kNameX, y, u"Default Controls", lit ? 1.0f : kDim);
+      continue;
+    }
+    put(kNameX, y, rebind::Name(row), lit ? kRowLit : kDim);
+    for (int column = 0; column < 3; column++) {
+      bool on = lit && column == c.column && !(column == 2 && rebind::PadFixed(row));
+      std::u16string text;
+      if (on && c.capture) {
+        text = c.capture == 1 ? u"Press a key" : u"Press a button";
+      } else if (column < 2) {
+        std::string key = rebind::Key(row, column);
+        text.assign(key.begin(), key.end());
+      } else if (rebind::PadFixed(row)) {
+        text = rebind::PadFixedText(row);
+      } else if (int binding = rebind::Pad(row); binding != rebind::kNone) {
+        // (the buttons' pictures, or their names while the prompts are the
+        // keyboard's: its pictures would be keys)
+        const auto& names = keyboardPrompts ? kButtonNames : kButtonTags;
+        text = names[rebind::First(binding)];
+        if (rebind::IsPair(binding)) {
+          text += u" + ";
+          text += names[rebind::Second(binding)];
+        }
+      }
+      if (text.empty()) {
+        text = u"-";
+      }
+      if (on && !c.capture) {
+        text = u"‹ " + text + u" ›";
+      }
+      // (the controller's own, not to be set here: greyed)
+      bool fixed = column == 2 && rebind::PadFixed(row);
+      put(kCellX[column], y, std::move(text), fixed ? kFixed : on ? 1.0f : lit ? kRowLit : kDim);
+    }
+  }
+  if (focused) {
+    put(kNameX, kHelpY,
+        c.capture == 1   ? u"Press a key or mouse button (Esc leaves it)"
+        : c.capture == 2 ? (rebind::PadPairs(c.row) ? u"Press a button, or two together"
+                                                    : u"Press the controller's button")
+        : c.row == rebind::kActions ? u"@[pad:Rd] Every action as it was"
+                                    : u"@[pad:Rd] Set   @[pad:Rl] Clear   @[pad:Ru] Default",
+        kRowLit);
+  }
+  ng2::overlay::SetPanel(std::move(texts), layer, layer != 0);
+}
+
+// The table's input for a frame; true when Back leaves it.
+bool RunControls(PPCContext& ctx, uint8_t* base) {
+  namespace rebind = ng2::rebind;
+  using ng2::guest::Load32;
+  using Clock = std::chrono::steady_clock;
+  ControlsState& c = g_controls;
+  double sound = LoadFloat(kCursorSound);
+  auto play = [&](uint32_t which) { CallGuest(ctx, base, __imp__sub_8242AFC0, {which}, sound); };
+  bool back = CallGuest(ctx, base, __imp__sub_823E42B0, {kPadState, 0, 0xFF, 0}) != 0;
+  uint32_t held = Load32(kMergedPad), pressed = Load32(kMergedPad + 8);
+  if (c.capture == 1) {
+    if (back) {
+      rebind::CancelKeyCapture();
+    }
+    std::string key;
+    if (!rebind::PollKeyCapture(key)) {
+      if (!key.empty()) {
+        rebind::SetKey(c.row, c.column, key);
+      }
+      play(key.empty() ? 2 : 3);
+      c.capture = 0;
+    }
+    return false;
+  }
+  if (c.capture == 2) {
+    c.ignore &= held;
+    uint32_t now = held & ~c.ignore;
+    int found = -1;
+    for (int b = 0; b < 8; b++) {
+      if ((now & kButtonMasks[b]) && b != c.first && found < 0) {
+        found = b;
+      }
+    }
+    int binding = rebind::kNone;
+    bool done = false;
+    if (!rebind::PadPairs(c.row)) {
+      done = found >= 0;
+      binding = found;
+    } else if (c.first < 0) {
+      if (found >= 0) {
+        c.first = found, c.firstAt = Clock::now();  // a second may join it
+      }
+    } else if (found >= 0) {
+      done = true, binding = rebind::Pair(c.first, found);
+    } else if (!(held & kButtonMasks[c.first]) || Clock::now() - c.firstAt > std::chrono::milliseconds(1500)) {
+      done = true, binding = c.first;  // let go, or held a while, alone
+    }
+    if (done) {
+      rebind::SetPad(c.row, binding);
+      play(3);
+      c.capture = 0;
+      c.letGo = true;
+    } else if (c.first < 0 && Clock::now() - c.since > std::chrono::seconds(5)) {
+      play(2);
+      c.capture = 0;  // none in time: as it was
+    }
+    return false;
+  }
+  if (c.letGo) {
+    uint32_t any = 0;
+    for (uint32_t mask : kButtonMasks) {
+      any |= mask;
+    }
+    if (held & any) {
+      return false;
+    }
+    c.letGo = false;
+  }
+  if (back) {
+    return true;
+  }
+  uint32_t pad = Load32(kPadState);
+  uint32_t player = *ng2::guest::Virtual(kPlayerPad);
+  auto direction = [&](uint32_t which) {
+    return CallGuest(ctx, base, __imp__sub_823E3828, {pad, player, 1, 0, which}) != 0;
+  };
+  int row = c.row, column = c.column;
+  if (direction(0)) {
+    row = (row + kControlRows - 1) % kControlRows;
+  }
+  if (direction(1)) {
+    row = (row + 1) % kControlRows;
+  }
+  // (a fixed row's controller cell isn't one to stop on: two columns there)
+  int columns = row < rebind::kActions && rebind::PadFixed(row) ? 2 : 3;
+  column = std::min(column, columns - 1);
+  if (direction(3)) {
+    column = (column + columns - 1) % columns;
+  }
+  if (direction(2)) {
+    column = (column + 1) % columns;
+  }
+  // The pointer on a cell: that one (on a name: the row, its cell kept).
+  float px, py;
+  if (ng2::menu_mouse::PointerActive() && ng2::menu_mouse::Pointer(&px, &py)) {
+    int pointed = PointedRow(kTableNameX - 16.0f, kTableCellX[2] + 140.0f, kTableTop, kTablePitch, kControlRows);
+    if (pointed >= 0) {
+      row = pointed;
+      int pointedColumn = px >= kTableCellX[2] - 10.0f ? 2 : px >= kTableCellX[1] - 10.0f ? 1
+                        : px >= kTableCellX[0] - 10.0f ? 0 : -1;
+      bool fixed = row < rebind::kActions && rebind::PadFixed(row);
+      if (pointedColumn >= 0 && !(pointedColumn == 2 && fixed)) {
+        column = pointedColumn;
+      } else if (fixed) {
+        column = std::min(column, 1);
+      }
+    }
+  }
+  if (row != c.row || column != c.column) {
+    play(2);
+    c.row = row, c.column = column;
+  }
+  // (a click off the table confirms nothing)
+  bool clickOff = ng2::menu_mouse::ClickedThisFrame() &&
+                  PointedRow(kTableNameX - 16.0f, kTableCellX[2] + 140.0f, kTableTop, kTablePitch, kControlRows) < 0;
+  bool confirm = !clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, 0, 0, 0}) != 0;
+  if (c.row == rebind::kActions) {
+    if (confirm) {
+      rebind::Defaults();
+      play(3);
+    }
+  } else if (confirm) {
+    if (c.column < 2) {
+      c.capture = 1;
+      rebind::StartKeyCapture();
+      play(3);
+    } else if (!rebind::PadFixed(c.row)) {
+      c.capture = 2, c.ignore = held, c.first = -1, c.since = Clock::now();
+      play(3);
+    }
+  } else if (pressed & kPadX) {
+    if (c.column < 2) {
+      rebind::SetKey(c.row, c.column, "");
+    } else {
+      rebind::SetPad(c.row, rebind::kNone);
+    }
+    play(3);
+  } else if (CallGuest(ctx, base, __imp__sub_823E43B0, {kPadState})) {
+    rebind::Default(c.row);
+    play(3);
+  }
+  return false;
+}
+
+// The title's page rows (the pointer picks one), and their values' place.
+constexpr float kPageLeft = 440.0f, kPageRight = 1110.0f, kPageTop = 145.0f, kPagePitch = 44.0f;
+constexpr float kValueLeft = 770.0f, kValueCenter = 916.0f;
+
 // A page's input, while ours is open: up and down pick a row, left and right
 // change it, Y sets its default, Confirm on Restore Defaults sets them all,
 // Back returns to the category list.
 void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
   using ng2::guest::Load32;
   uint32_t number = ViewOf(page);  // (the page shown)
-  uint32_t rowCount = page.count + 1;
+  uint32_t rowCount = TitleShown(page) + 1;
   uint32_t cursorAddress = kCursors + 4 * number;
   uint32_t cursor = std::min(Load32(cursorAddress), rowCount - 1);
+  uint32_t& scroll = g_titleScroll[PageIndex(page)];
   double sound = LoadFloat(kCursorSound);
-  if (CallGuest(ctx, base, __imp__sub_823E42B0, {kPadState, cursor, 0xFF, 0})) {
+  if (page.custom) {
+    // The Controls table: its own input.
+    bool leave = RunControls(ctx, base);
+    ShowControls(!leave);
+    if (leave) {
+      Store32(kPage, kCategoryPage);
+      Store32(kDepth, Load32(kDepth) - 1);
+      CallGuest(ctx, base, __imp__sub_836A5AA0, {kLeave, 0});
+    }
+  } else if (CallGuest(ctx, base, __imp__sub_823E42B0, {kPadState, cursor, 0xFF, 0})) {
     Store32(kPage, kCategoryPage);
     Store32(kDepth, Load32(kDepth) - 1);
     CallGuest(ctx, base, __imp__sub_836A5AA0, {kLeave, 0});
@@ -1298,21 +1706,42 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
     auto pressed = [&](uint32_t direction) {
       return CallGuest(ctx, base, __imp__sub_823E3828, {pad, player, 1, 0, direction}) != 0;
     };
-    uint32_t moved = cursor;
+    // Up and down go by the page's lines (its settings, Restore Defaults);
+    // past the settings shown, the page scrolls.
+    uint32_t lines = page.count + 1;
+    uint32_t line = TitleLine(page, cursor), moved = line;
     if (pressed(0)) {
-      moved = (moved + rowCount - 1) % rowCount;
+      moved = (moved + lines - 1) % lines;
     }
     if (pressed(1)) {
-      moved = (moved + 1) % rowCount;
+      moved = (moved + 1) % lines;
     }
-    if (moved != cursor) {
+    // The pointer on a row: that one (the rows shown, then Restore Defaults).
+    if (ng2::menu_mouse::PointerActive()) {
+      if (int row = PointedRow(kPageLeft, kPageRight, kPageTop, kPagePitch, int(rowCount)); row >= 0) {
+        moved = TitleLine(page, uint32_t(row));
+      }
+    }
+    if (moved != line) {
       CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
-      cursor = moved;
+      uint32_t was = scroll;
+      if (moved < page.count && moved < scroll) {
+        scroll = moved;
+      } else if (moved < page.count && moved >= scroll + kTitleSlots) {
+        scroll = moved + 1 - kTitleSlots;
+      }
+      cursor = moved == page.count ? TitleShown(page) : moved - scroll;
       Store32(cursorAddress, cursor);
+      if (scroll != was) {
+        RefillPage(ctx, base, page);
+      }
     }
-    if (cursor == page.count) {
+    // (a click on no row confirms nothing)
+    bool clickOff = ng2::menu_mouse::ClickedThisFrame() &&
+                    PointedRow(kPageLeft, kPageRight, kPageTop, kPagePitch, int(rowCount)) < 0;
+    if (cursor == TitleShown(page)) {
       // Restore Defaults; the enabled[] list is only read for the list page.
-      if (CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
+      if (!clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
         for (uint32_t i = 0; i < page.count; i++) {
           RestoreDefault(kSettings[page.rows[i].setting]);
         }
@@ -1320,14 +1749,20 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
         CallGuest(ctx, base, __imp__sub_836A5AA0, {kEnter, 0});
       }
     } else {
-      const Setting& setting = kSettings[page.rows[cursor].setting];
+      const Setting& setting = kSettings[page.rows[TitleLine(page, cursor)].setting];
       uint32_t value = ValueOf(setting);
       uint32_t changed = value;
-      bool left = pressed(3);
+      bool left = pressed(3), right = pressed(2);
+      // A click on the value: its left half back, its right half on.
+      float x, y;
+      if (ng2::menu_mouse::ClickedThisFrame() && ng2::menu_mouse::Pointer(&x, &y) &&
+          PointedRow(kValueLeft, kPageRight, kPageTop, kPagePitch, int(rowCount)) == int(cursor)) {
+        (x < kValueCenter ? left : right) = true;
+      }
       if (left) {
         changed = (changed + setting.count - 1) % setting.count;
       }
-      if (pressed(2)) {
+      if (right) {
         changed = (changed + 1) % setting.count;
       }
       if (changed != value) {
@@ -1347,7 +1782,8 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
     ScheduleWindow();
   }
   CallGuest(ctx, base, __imp__sub_836A4B90,
-            {kMenuModel, ShownPage(Load32(kLastPage)), number, kCursors, StoreValues(ctx, &page), 8});
+            {kMenuModel, ShownPage(Load32(kLastPage)), number, kCursors, StoreValues(ctx, &page),
+             kPageValues});
 }
 
 }  // namespace
@@ -1356,6 +1792,7 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
 // game's as they were.
 REX_EXTERN(__imp__sub_823E59A0);
 REX_HOOK_RAW(sub_823E59A0) {
+  ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
   constexpr uint32_t kSaved = 12;  // (pages up to 11)
   uint32_t saved[kSaved];
   for (uint32_t i = 0; i < kSaved; i++) {
@@ -1379,6 +1816,7 @@ REX_HOOK_RAW(sub_823E59A0) {
 // Confirm opens one's page, Back leaves Options.
 REX_EXTERN(__imp__sub_823E5D88);
 REX_HOOK_RAW(sub_823E5D88) {
+  ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
   if (!g_open) {
     __imp__sub_823E5D88(ctx, base);
     return;
@@ -1390,7 +1828,17 @@ REX_HOOK_RAW(sub_823E5D88) {
   for (uint32_t i = 0; i < 8; i++) {
     Store32(enabled + 4 * i, i < kPageCount);
   }
-  if (CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, enabled, 0})) {
+  // The pointer on a category: that one (before Confirm, which a click is);
+  // a click on none confirms nothing.
+  constexpr float kCategoryLeft = 90.0f, kCategoryRight = 340.0f, kCategoryTop = 145.0f, kCategoryPitch = 60.0f;
+  int pointedCategory = PointedRow(kCategoryLeft, kCategoryRight, kCategoryTop, kCategoryPitch, int(kPageCount));
+  bool clickOff = ng2::menu_mouse::ClickedThisFrame() && pointedCategory < 0;
+  if (ng2::menu_mouse::PointerActive() && pointedCategory >= 0 && uint32_t(pointedCategory) != cursor) {
+    CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, LoadFloat(kCursorSound));
+    cursor = uint32_t(pointedCategory);
+    Store32(kCursors, cursor);
+  }
+  if (!clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, enabled, 0})) {
     Store32(kPage, kPages[cursor].page);
     Store32(kDepth, Load32(kDepth) + 1);
     CallGuest(ctx, base, __imp__sub_836A5AA0, {kEnter, 0});
@@ -1414,6 +1862,9 @@ REX_HOOK_RAW(sub_823E5D88) {
       CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, LoadFloat(kCursorSound));
     }
     Store32(kCursors, moved);
+    if (kPages[moved].custom) {
+      ShowControls(false);
+    }
   }
   CallGuest(ctx, base, __imp__sub_836A4B90,
             {kMenuModel, ShownPage(Load32(kLastPage)), ShownPage(page), kCursors, StoreValues(ctx, nullptr), 8});
@@ -1491,6 +1942,7 @@ REX_HOOK_RAW(sub_836D03E8) {
 
 // The pages' handlers, replaced while ours is open.
 void Handle(PPCContext& ctx, uint8_t* base, void (*handler)(PPCContext&, uint8_t*)) {
+  ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
   const Page* page = PageOf(ng2::guest::Load32(kPage));
   if (g_open && page) {
     RunPage(ctx, base, *page);
@@ -1504,6 +1956,11 @@ REX_HOOK_RAW(sub_823E66B8) {
 }
 REX_EXTERN(__imp__sub_823E6D00);
 REX_HOOK_RAW(sub_823E6D00) {
+  // (the game's Controller Settings, when it's the game's page: its layout
+  // changed there is taken as the Controls page's, rebind.cpp)
+  if (!g_open) {
+    ng2::rebind::GameControllerPage();
+  }
   Handle(ctx, base, __imp__sub_823E6D00);
 }
 REX_EXTERN(__imp__sub_823E7268);
@@ -1522,25 +1979,60 @@ REX_EXTERN(__imp__sub_823E7C40);
 REX_HOOK_RAW(sub_823E7C40) {
   Handle(ctx, base, __imp__sub_823E7C40);  // Screen Settings (page 11)
 }
+REX_EXTERN(__imp__sub_823E82E0);
+REX_HOOK_RAW(sub_823E82E0) {
+  Handle(ctx, base, __imp__sub_823E82E0);  // Restore Default's question (page 7)
+}
+
+// The Options screen, as it opens (sub_836D5D08(screen, model)): its pages
+// are made (their builders run, ours among them), and a table of the page
+// shown for each category is filled (+8 + 4 * category). While ours is open
+// the seventh category's (Restore Default's question, not a page) is the
+// page object for Return to Main Menu (+0x81A0, empty and never shown),
+// with Controls' rows; the game fills the table again each time it opens.
+REX_EXTERN(__imp__sub_836D5D08);
+REX_HOOK_RAW(sub_836D5D08) {
+  constexpr uint32_t kSpareObject = 0x81A0, kShownTable = 8;
+  uint32_t screen = ctx.r3.u32, model = ctx.r4.u32;
+  __imp__sub_836D5D08(ctx, base);
+  const Page* controls = PageOf(7);
+  if (!g_open || !screen || !controls || !MakeTitleRowsOnce(ctx, base)) {
+    return;
+  }
+  uint32_t object = screen + kSpareObject;
+  Store32(object + 8, controls->view - 1);
+  Store32(object + 12, controls->view);
+  BuildPage(ctx, base, *controls, object, model);
+  Store32(screen + kShownTable + 4 * 6, object);
+}
 
 // The button hints under a page (sub_836D6898(&flags): 0x10 Change Storage
 // Device, 8 Test Volume, 4 Restore Defaults, 2 Confirm, 1 Back), by the
 // game's page and row: on ours, Restore Defaults and Back on every row.
 REX_EXTERN(__imp__sub_836D6898);
 bool InGameOursShown();
+bool InGameConfirmShown();
 REX_HOOK_RAW(sub_836D6898) {
   uint32_t flags = ctx.r3.u32;
   bool title = g_open && PageOf(ng2::guest::Load32(kPage));
   // In the in-game menu the game's hints follow its own rows' slots (Save
-  // Method's: Change Storage Device): there, with ours shown, Confirm and
-  // Back as the game gives them, nothing of its own rows'.
+  // Method's: Change Storage Device): there, with ours shown, Back, and
+  // Confirm where it does something (a category, Restore Defaults).
   bool inGame = !title && InGameOursShown() && !ng2::aspect::HudShown();
   if ((!title && !inGame) || !flags) {
+    // (the PC has one storage device: no Change Storage Device hint)
+    uint32_t game = flags ? ng2::guest::Load32(flags) : 0;
+    if (game & 0x10) {
+      Store32(flags, game & ~0x10u);
+    }
     __imp__sub_836D6898(ctx, base);
+    if (game & 0x10) {
+      Store32(flags, game);
+    }
     return;
   }
   uint32_t game = ng2::guest::Load32(flags);
-  uint32_t ours = title ? 0x5 : (game & 0x10) || !(game & 0x3) ? 0x1 : (game & 0x3);
+  uint32_t ours = title ? 0x5 : InGameConfirmShown() ? 0x3 : 0x1;
   Store32(flags, ours);
   __imp__sub_836D6898(ctx, base);
   Store32(flags, game);
@@ -1564,9 +2056,10 @@ REX_HOOK_RAW(sub_836D6AC8) {
     return;
   }
   constexpr uint32_t kRestoreDescription = kTable | 0x9A, kEmpty = kTable | 0x34;
-  uint32_t row = Load32(model + 8 * (Load32(model + 8) + 2));
+  uint32_t row = TitleLine(*page, Load32(model + 8 * (Load32(model + 8) + 2)));
   std::string_view name = row < page->count ? kSettings[page->rows[row].setting].name : "";
-  SetDescriptionText(row == page->count                 ? kRestoreDescription
+  SetDescriptionText(page->custom                       ? kEmpty
+                     : row == page->count               ? kRestoreDescription
                      : name == "cheat_all_weapons"      ? (kTable | kNoteSlot)
                      : name == "frame_interpolation"    ? TextId(kInterpNote)
                                                         : kEmpty);
@@ -1592,6 +2085,13 @@ REX_HOOK_RAW(sub_836D0E90) {
 // Each frame (perf_overlay.cpp): a key's fullscreen choice, and a window
 // position once it's been still for a second, written to the settings.
 void ng2::recomp_settings::WindowFrame() {
+  // The Controls' settings changed outside our menus (the game's own
+  // Controller Settings): saved, once for all of them.
+  if (g_controlsToSave && !g_open && !g_inGameOurs && !g_configPath.empty()) {
+    SaveSettings();
+    g_written.clear();
+    g_controlsToSave = false;
+  }
   bool save = false;
   if (int to = g_toggledTo.exchange(-1); to >= 0) {
     g_written["fullscreen"] = to ? "true" : "false";
@@ -1639,6 +2139,14 @@ void ng2::recomp_settings::ApplyWindowAtStart() {
   }
 }
 
+// The in-game list's places in the 1280x720 UI (the pointer picks a row):
+// the categories' column (ours) or the game's rows, the page's column, a
+// value's place.
+constexpr float kInGameLeft = 90.0f, kInGameCategoryRight = 380.0f, kGameListRight = 600.0f;
+constexpr float kInGamePageLeft = 440.0f, kInGamePageRight = 1110.0f;
+constexpr float kInGameTop = 143.0f, kInGamePitch = 41.0f;
+constexpr float kInGameValueLeft = 790.0f, kInGameValueCenter = 888.0f;
+
 // RECOMP SETTINGS in gameplay: the Back button's "IN-GAME MANUAL AND OPTIONS"
 // list (docs/menus.md) gets a RECOMP SETTINGS row after its twelve. Choosing
 // it lays the list out as the title's RECOMP SETTINGS screen until Back: the
@@ -1684,7 +2192,14 @@ constexpr std::u16string_view kEntryText = u"Recomp Settings";
 // Restore Defaults, drawn to the right of the categories (where the title
 // screen has its pages), then empty rows.
 constexpr uint32_t kFirstPageRow = kPageCount;
-constexpr uint32_t kEmptyRows = kGameRows - kFirstPageRow - 1;  // for the shortest page
+// The page column: its settings in the list's slots after the categories
+// (a page with more scrolls), and Restore Defaults in the 13th slot, our
+// entry's (the list's model has no value for a row there, and Restore
+// Defaults needs none). The setting slots a page doesn't fill are empty
+// rows of no height, so Restore Defaults follows its last setting.
+constexpr uint32_t kPageSlots = kGameRows - kFirstPageRow;
+constexpr uint32_t kRestoreSlot = kGameRows;
+constexpr uint32_t kEmptyRows = kPageSlots + 1;  // for a page of no rows at all (Controls)
 constexpr float kPageColumn = 344.0f;  // the title's pages are this far right of its categories
 constexpr uint32_t kCursorMark = 0x4ED0, kCursorMarkSlot = 0x4EC0;  // in the list
 constexpr uint32_t kMarkX = 0x30, kMarkY = 0x34;  // the mark's place, from the list's
@@ -1708,6 +2223,7 @@ uint32_t g_settingRows[std::size(kSettings)] = {};
 uint32_t g_valueText[std::size(kSettings)] = {};  // rows with too many choices show one
 uint32_t g_categoryRows[kPageCount] = {}, g_restoreRow = 0, g_emptyRows[kEmptyRows] = {};
 uint32_t g_category = 0;       // the category shown
+uint32_t g_scroll = 0;         // the page's first line shown (of its settings, then Restore Defaults)
 bool g_inPage = false;         // the cursor is in its settings (else on the categories)
 uint32_t g_gameRows[kGameRows] = {};
 uint32_t g_suppress = 0;        // directions (bit per sub_823E3828 direction) and Confirm (bit 4)
@@ -1734,7 +2250,8 @@ uint32_t GuestText(std::u16string_view text, uint32_t room = 0) {
   return at;
 }
 
-void SetGuestText(uint32_t at, std::u16string_view text) {
+void SetGuestText(uint32_t at, std::u16string_view text, size_t room = SIZE_MAX) {
+  text = text.substr(0, std::min(text.size(), room));
   std::vector<uint8_t> bytes = Utf16BE(text);
   bytes.push_back(0), bytes.push_back(0);
   std::memcpy(ng2::guest::Virtual(at), bytes.data(), bytes.size());
@@ -1887,7 +2404,7 @@ void SetUpSettingRow(PPCContext& ctx, uint8_t* base, uint32_t setting, uint32_t 
   CallGuest(ctx, base, __imp__sub_83692EC0, {row, kAnyText, g_ids, one ? 1u : that.count, 0});
   Store32(row + kRowLabel, g_labelText[setting]);
   if (one) {
-    SetGuestText(g_valueText[setting], ArrowText(that));
+    SetGuestText(g_valueText[setting], ArrowText(that), kValueRoom);
     Store32(row + kChoiceText, g_valueText[setting]);
   } else {
     for (uint32_t k = 0; k < that.count; k++) {
@@ -1910,24 +2427,43 @@ bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
-// The in-game list has a slot for a page's Restore Defaults after its rows
-// unless they fill the column (the title's pages still have it).
-bool InGameRestore(const Page& page) {
-  return kFirstPageRow + page.count < kGameRows;
+// A page's lines in the in-game list: its settings, then Restore Defaults.
+uint32_t PageLines(const Page& page) {
+  return page.count + 1;
 }
-static_assert(std::all_of(std::begin(kPages), std::end(kPages),
-                          [](const Page& p) { return kFirstPageRow + p.count <= kGameRows; }));
 
-// Restore Defaults after a page's rows, and the empty rows after it.
-void SetUpPageEnd(PPCContext& ctx, uint8_t* base, uint32_t restoreSlot) {
-  if (restoreSlot < kGameRows) {
-    InitRow(ctx, base, g_restoreRow, restoreSlot);
-    Store32(g_restoreRow + kRowLabel, g_restoreText);
+// The first setting shown so that line (a setting, or Restore Defaults:
+// the settings stay) is, from the first shown before.
+uint32_t ScrollTo(const Page& page, uint32_t line, uint32_t scroll) {
+  if (page.count <= kPageSlots) {
+    return 0;
   }
-  for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
-    InitRow(ctx, base, g_emptyRows[i], restoreSlot + 1 + i, true);
-    Store32(g_emptyRows[i] + kRowLabel, g_emptyText);
+  if (line < page.count && line < scroll) {
+    return line;
   }
+  if (line < page.count && line >= scroll + kPageSlots) {
+    return line + 1 - kPageSlots;
+  }
+  return std::min(scroll, page.count - kPageSlots);
+}
+
+// The shown page's setting at a setting slot (s of kPageSlots), or past
+// its settings.
+uint32_t LineAt(uint32_t slot) {
+  return g_scroll + slot;
+}
+
+// A line's slot in the list, and back.
+uint32_t SlotOf(const Page& page, uint32_t line) {
+  return line == page.count ? kRestoreSlot : kFirstPageRow + line - g_scroll;
+}
+uint32_t LineOf(const Page& page, uint32_t slot) {
+  return slot == kRestoreSlot ? page.count
+                              : std::min(g_scroll + slot - std::min(slot, kFirstPageRow), page.count);
+}
+// The line on screen (from the page's top) of a slot.
+uint32_t ShownLine(const Page& page, uint32_t slot) {
+  return slot == kRestoreSlot ? std::min(page.count, kPageSlots) : slot - kFirstPageRow;
 }
 
 bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
@@ -1952,18 +2488,22 @@ void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
 // The shown page's values into its rows (by their slots).
 void PushValues(PPCContext& ctx, uint8_t* base) {
   const Page& page = kPages[g_category];
-  for (uint32_t j = 0; j < page.count; j++) {
+  for (uint32_t s = 0; s < kPageSlots; s++) {
+    uint32_t j = LineAt(s);
+    if (j >= page.count) {
+      continue;
+    }
     uint32_t i = page.rows[j].setting;
     if (g_valueText[i]) {
-      SetGuestText(g_valueText[i], ArrowText(kSettings[i]));
+      SetGuestText(g_valueText[i], ArrowText(kSettings[i]), kValueRoom);
     }
     CallGuest(ctx, base, __imp__sub_83691458,
-              {kFirstPageRow + j, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
+              {kFirstPageRow + s, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
   }
 }
 
-void SetListRows(const uint32_t* rows) {
-  for (uint32_t i = 0; i < kGameRows; i++) {
+void SetListRows(const uint32_t* rows, uint32_t count = kGameRows) {
+  for (uint32_t i = 0; i < count; i++) {
     Store32(g_list + kRowsAt + 4 * i, rows[i]);
   }
 }
@@ -2010,16 +2550,17 @@ float PageRowShiftY() {
   return -float(kFirstPageRow) * LoadFloat(kLineHeight);
 }
 
-void ShiftSprite(uint32_t sprite, bool fromZero) {
+void ShiftSprite(uint32_t sprite, bool fromZero, uint32_t linesUp = 0) {
   float x = fromZero ? 0.0f : LoadFloat(sprite + kSpriteOffset);
   float y = fromZero ? 0.0f : LoadFloat(sprite + kSpriteOffset + 4);
   StoreFloat(sprite + kSpriteOffset, x + kPageColumn);
-  StoreFloat(sprite + kSpriteOffset + 4, y + PageRowShiftY());
+  StoreFloat(sprite + kSpriteOffset + 4, y + PageRowShiftY() - float(linesUp) * LoadFloat(kLineHeight));
 }
 
-// Right after the row's setup (for a choice row).
-void PlacePageRow(uint32_t row, bool choices) {
-  ShiftSprite(row + kRowSprite, true);
+// Right after the row's setup (for a choice row). A row is drawn at its
+// slot's line; linesUp moves it above that.
+void PlacePageRow(uint32_t row, bool choices, uint32_t linesUp = 0) {
+  ShiftSprite(row + kRowSprite, true, linesUp);
   if (choices) {
     uint32_t count = std::min<uint32_t>(ng2::guest::Load32(row + kChoiceCount), kChoicesShown);
     for (uint32_t k = 0; k < count; k++) {
@@ -2031,11 +2572,12 @@ void PlacePageRow(uint32_t row, bool choices) {
   }
 }
 
-// Our layout in the list, with a category's page (its rows set up again
-// for the slots they're shown in); or the game's rows back. Moving between
-// categories leaves the category rows as they are, as the title's list.
+// Our layout in the list, with a category's page from its line scroll
+// (its rows set up again for the slots they're shown in); or the game's
+// rows back. Moving between categories or scrolling leaves the category
+// rows as they are, as the title's list.
 void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category = 0,
-                    bool categoriesShown = false) {
+                    bool categoriesShown = false, uint32_t scroll = 0) {
   if (!ours) {
     ArrangeGameRows();
     g_inGameOurs = false;
@@ -2044,42 +2586,58 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category
   }
   g_category = category;
   const Page& page = kPages[category];
-  uint32_t rows[kGameRows];
+  g_scroll = ScrollTo(page, scroll, scroll);
+  uint32_t rows[kRestoreSlot + 1];
   for (uint32_t i = 0; i < kPageCount; i++) {
     rows[i] = g_categoryRows[i];
   }
-  for (uint32_t j = 0; j < page.count; j++) {
-    SetUpSettingRow(ctx, base, page.rows[j].setting, kFirstPageRow + j);
-    rows[kFirstPageRow + j] = g_settingRows[page.rows[j].setting];
-    PlacePageRow(rows[kFirstPageRow + j], true);
+  uint32_t empty = 0;
+  for (uint32_t s = 0; s < kPageSlots; s++) {
+    uint32_t slot = kFirstPageRow + s, j = LineAt(s);
+    if (j < page.count) {
+      SetUpSettingRow(ctx, base, page.rows[j].setting, slot);
+      rows[slot] = g_settingRows[page.rows[j].setting];
+      PlacePageRow(rows[slot], true);
+    } else {
+      uint32_t row = g_emptyRows[empty++];
+      InitRow(ctx, base, row, slot, true);
+      Store32(row + kRowLabel, g_emptyText);
+      rows[slot] = row;
+    }
   }
-  uint32_t restoreSlot = kFirstPageRow + page.count;
-  SetUpPageEnd(ctx, base, restoreSlot);
-  if (InGameRestore(page)) {
-    rows[restoreSlot] = g_restoreRow;
-    PlacePageRow(g_restoreRow, false);
+  if (page.custom) {
+    // (the Controls table has its own Default Controls)
+    uint32_t row = g_emptyRows[empty++];
+    InitRow(ctx, base, row, kRestoreSlot, true);
+    Store32(row + kRowLabel, g_emptyText);
+    rows[kRestoreSlot] = row;
+  } else {
+    InitRow(ctx, base, g_restoreRow, kRestoreSlot);
+    Store32(g_restoreRow + kRowLabel, g_restoreText);
+    rows[kRestoreSlot] = g_restoreRow;
+    // (Restore Defaults right after the last setting.)
+    PlacePageRow(g_restoreRow, false, kPageSlots - ShownLine(page, kRestoreSlot));
   }
-  for (uint32_t i = restoreSlot + 1; i < kGameRows; i++) {
-    rows[i] = g_emptyRows[i - restoreSlot - 1];
-  }
-  SetListRows(rows);
-  // The 13th stays: the move off our row still names index 12.
+  SetListRows(rows, kRestoreSlot + 1);
   g_inGameOurs = true;
   ng2::video::SetInGameRecompHeader(true);
   // Event 1 (as the list's rows get when it opens), to ours only: the
   // list's own sends it to its view too, which closes the menu.
-  for (uint32_t i = categoriesShown ? kFirstPageRow : 0; i < kGameRows; i++) {
+  for (uint32_t i = categoriesShown ? kFirstPageRow : 0; i <= kRestoreSlot; i++) {
     CallGuest(ctx, base, __imp__sub_83692378, {rows[i], 1, kInGameModel});
   }
   // A row shows a value once it changes: the slots may hold another
   // page's, so each is changed twice.
-  for (uint32_t j = 0; j < page.count; j++) {
-    CallGuest(ctx, base, __imp__sub_83691458, {kFirstPageRow + j, 0xFF});
+  for (uint32_t s = 0; s < kPageSlots; s++) {
+    if (LineAt(s) < page.count) {
+      CallGuest(ctx, base, __imp__sub_83691458, {kFirstPageRow + s, 0xFF});
+    }
   }
   PushValues(ctx, base);
 }
 
 void LeaveInGameRows(PPCContext& ctx, uint8_t* base) {
+  EndControlsCapture();
   ShowInGameRows(ctx, base, false);
   Store32(kInGameCursors, kEntryIndex);
   NotifyCursor(ctx, base, kEntryIndex);
@@ -2112,6 +2670,7 @@ REX_EXTERN(__imp__sub_836952B8);
 REX_HOOK_RAW(sub_836952B8) {
   uint32_t list = ctx.r3.u32;
   __imp__sub_836952B8(ctx, base);
+  EndControlsCapture();
   if (g_inGameOurs && !g_written.empty() && !g_configPath.empty()) {
     SaveSettings();  // the list was made again while ours was shown
     g_written.clear();
@@ -2140,14 +2699,16 @@ REX_HOOK_RAW(sub_836927A8) {
   uint32_t row = ctx.r3.u32;
   uint32_t state = ng2::guest::Load32(row + 4);
   __imp__sub_836927A8(ctx, base);
-  if (!g_inGameOurs || (state != 1 && state != 3)) {
+  if (!g_inGameOurs) {
     return;
   }
   for (uint32_t i = 0; i < std::size(kSettings); i++) {
     if (g_settingRows[i] == row) {
       if (g_valueText[i]) {
+        // Hidden on every update: a row set up again (a scroll moves it to
+        // another slot) has its mark back over its label until then.
         StoreFloat(row + kChoiceMark + kSpriteOffset + 4, -10000.0f);
-      } else {
+      } else if (state == 1 || state == 3) {
         ShiftSprite(row + kChoiceMark, false);
       }
     }
@@ -2159,7 +2720,7 @@ REX_EXTERN(__imp__sub_83695610);
 REX_HOOK_RAW(sub_83695610) {  // reset
   uint32_t list = ctx.r3.u32;
   __imp__sub_83695610(ctx, base);
-  if (list == g_list && !g_inGameOurs) {
+  if (list == g_list) {
     uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
     CallAt(ctx, base, Method(row, 1), {row});
   }
@@ -2171,22 +2732,25 @@ REX_HOOK_RAW(sub_83695668) {  // update
   if (list != g_list) {
     return;
   }
+  uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
+  CallAt(ctx, base, Method(row, 2), {row});
   if (!g_inGameOurs) {
-    uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
-    CallAt(ctx, base, Method(row, 2), {row});
     return;
   }
   // The cursor mark at our row: a category, or a page row in the right
   // column (the list placed it by the heights of the rows above its slot).
   float origin = LoadFloat(kMarkOrigin), height = LoadFloat(kLineHeight);
-  uint32_t line = g_inPage ? ng2::guest::Load32(kInGameCursors) - kFirstPageRow : g_category;
+  uint32_t line = g_inPage ? ShownLine(kPages[g_category], ng2::guest::Load32(kInGameCursors)) : g_category;
   StoreFloat(list + kCursorMark + kMarkX, origin + (g_inPage ? kPageColumn : 0.0f));
   StoreFloat(list + kCursorMark + kMarkY, std::floor(origin + float(line) * height));
+  if (g_inPage && kPages[g_category].custom) {
+    StoreFloat(list + kCursorMark + kMarkY, -10000.0f);  // the Controls table lights its own cell
+  }
 }
 REX_HOOK_RAW(sub_83695800) {  // event 1 to every row
   uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
   __imp__sub_83695800(ctx, base);
-  if (list == g_list && !g_inGameOurs) {
+  if (list == g_list) {
     uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
     CallGuest(ctx, base, __imp__sub_83692378, {row, 1, model});
   }
@@ -2195,8 +2759,14 @@ REX_EXTERN(__imp__sub_83695748);
 REX_HOOK_RAW(sub_83695748) {  // draw: the rows one under another
   uint32_t list = ctx.r3.u32;
   uint64_t layer = ctx.r4.u64, position = ctx.r5.u64;
+  if (list == g_list) {
+    g_inGameLayer = uint32_t(layer);
+  }
   __imp__sub_83695748(ctx, base);
-  if (list == g_list && !g_inGameOurs) {
+  if (list == g_list && g_inGameOurs && kPages[g_category].custom) {
+    ng2::overlay::QueuePanel(ctx, base);  // the Controls table, with the list
+  }
+  if (list == g_list) {
     uint32_t bits = uint32_t(position);
     float y;
     std::memcpy(&y, &bits, sizeof(y));
@@ -2212,13 +2782,19 @@ REX_HOOK_RAW(sub_83695748) {  // draw: the rows one under another
 
 // Pad queries held back from the game's handler while ours acts.
 REX_HOOK_RAW(sub_823E3828) {
+  ng2::menu_mouse::NoteMenuInput();
   if (g_suppress & (1u << ctx.r7.u32)) {
     ctx.r3.u64 = 0;
     return;
   }
   __imp__sub_823E3828(ctx, base);
 }
+REX_HOOK_RAW(sub_823E42B0) {
+  ng2::menu_mouse::NoteMenuInput();
+  __imp__sub_823E42B0(ctx, base);
+}
 REX_HOOK_RAW(sub_823E4158) {
+  ng2::menu_mouse::NoteMenuInput();
   if (g_suppress & 0x10) {
     ctx.r3.u64 = 0;
     return;
@@ -2230,6 +2806,7 @@ REX_HOOK_RAW(sub_823E4158) {
 // they're shown.
 REX_EXTERN(__imp__sub_823E8720);
 REX_HOOK_RAW(sub_823E8720) {
+  ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
   using ng2::guest::Load32;
   uint32_t state = Load32(kInGameState);
   if (!g_list || state != 0) {
@@ -2246,8 +2823,55 @@ REX_HOOK_RAW(sub_823E8720) {
   double sound = LoadFloat(kCursorSound);
 
   if (g_inGameOurs) {
+    bool scrolled = false;
     bool back = CallGuest(ctx, base, __imp__sub_823E42B0, {kPadState, cursor, 0xFF, 0}) != 0;
-    if (!g_inPage) {
+    // The pointer on a category shows its page (leaving the page's rows for
+    // the categories); on the page's column, the cursor goes into it.
+    int pointedLine = -1;
+    // (a click on no row of ours confirms nothing)
+    bool clickOff = ng2::menu_mouse::ClickedThisFrame() &&
+                    PointedRow(kInGameLeft, kInGameCategoryRight, kInGameTop, kInGamePitch, int(kPageCount)) < 0 &&
+                    PointedRow(kInGamePageLeft, kInGamePageRight, kInGameTop, kInGamePitch,
+                               int(std::min(kPages[g_category].count, kPageSlots)) + 1) < 0;
+    if (ng2::menu_mouse::PointerActive() && !g_controls.capture) {
+      int category = PointedRow(kInGameLeft, kInGameCategoryRight, kInGameTop, kInGamePitch, int(kPageCount));
+      if (category >= 0) {
+        if (g_inPage || uint32_t(category) != g_category) {
+          CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
+          if (uint32_t(category) != g_category) {
+            ShowInGameRows(ctx, base, true, uint32_t(category), true);
+          }
+          g_inPage = false;
+          cursor = g_category;
+        }
+      } else if (!kPages[g_category].custom) {
+        const Page& page = kPages[g_category];
+        int line = PointedRow(kInGamePageLeft, kInGamePageRight, kInGameTop, kInGamePitch,
+                              int(std::min(page.count, kPageSlots)) + 1);
+        if (line >= 0) {
+          // (the line shown there: a setting, or Restore Defaults after them)
+          pointedLine = uint32_t(line) == std::min(page.count, kPageSlots) ? int(page.count)
+                                                                         : int(g_scroll) + line;
+          if (!g_inPage) {
+            CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
+            g_inPage = true;
+            cursor = SlotOf(page, uint32_t(pointedLine));
+          }
+        }
+      } else if (!g_inPage && PointedRow(kInGamePageLeft, kTableCellX[2] + 140.0f, kTableTop, kTablePitch,
+                                         ng2::rebind::kActions + 1) >= 0) {
+        CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
+        g_inPage = true;  // the Controls table
+      }
+    }
+    if (g_inPage && kPages[g_category].custom) {
+      // The Controls table: its own input.
+      if (RunControls(ctx, base)) {
+        CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
+        g_inPage = false;
+        cursor = g_category;
+      }
+    } else if (!g_inPage) {
       // The categories: up and down show one's page, Confirm or right go
       // into it, Back leaves.
       if (back) {
@@ -2267,7 +2891,7 @@ REX_HOOK_RAW(sub_823E8720) {
         ShowInGameRows(ctx, base, true, category, true);
       }
       cursor = g_category;
-      if (pressed(2) || CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
+      if (pressed(2) || (!clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0}))) {
         CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
         g_inPage = true;
         cursor = kFirstPageRow;
@@ -2279,9 +2903,10 @@ REX_HOOK_RAW(sub_823E8720) {
     } else {
       // A page: up and down pick a row, left and right change it, Y sets its
       // default, Confirm on Restore Defaults sets the page's.
+      // A page longer than its column scrolls with the cursor.
       const Page& page = kPages[g_category];
-      uint32_t rowCount = page.count + (InGameRestore(page) ? 1 : 0);
-      uint32_t row = std::min(cursor - std::min(cursor, kFirstPageRow), rowCount - 1);
+      uint32_t rowCount = PageLines(page);
+      uint32_t row = LineOf(page, cursor);
       uint32_t moved = row;
       if (pressed(0)) {
         moved = (moved + rowCount - 1) % rowCount;
@@ -2289,13 +2914,21 @@ REX_HOOK_RAW(sub_823E8720) {
       if (pressed(1)) {
         moved = (moved + 1) % rowCount;
       }
+      if (pointedLine >= 0) {
+        moved = uint32_t(pointedLine);
+      }
       if (moved != row) {
         CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
         row = moved;
+        uint32_t scroll = ScrollTo(page, row, g_scroll);
+        if (scroll != g_scroll) {
+          ShowInGameRows(ctx, base, true, g_category, true, scroll);
+          scrolled = true;
+        }
       }
-      cursor = kFirstPageRow + row;
+      cursor = SlotOf(page, row);
       if (row == page.count) {
-        if (CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
+        if (!clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
           CallGuest(ctx, base, __imp__sub_8242AFC0, {3}, sound);
           for (uint32_t i = 0; i < page.count; i++) {
             RestoreDefault(kSettings[page.rows[i].setting]);
@@ -2304,10 +2937,18 @@ REX_HOOK_RAW(sub_823E8720) {
       } else {
         const Setting& setting = kSettings[page.rows[row].setting];
         uint32_t value = ValueOf(setting), changed = value;
-        if (pressed(3)) {
+        bool left = pressed(3), right = pressed(2);
+        // A click on the value: its left half back, its right half on.
+        float x, y;
+        if (ng2::menu_mouse::ClickedThisFrame() && ng2::menu_mouse::Pointer(&x, &y) && x >= kInGameValueLeft &&
+            x <= kInGamePageRight && PointedRow(kInGameValueLeft, kInGamePageRight, kInGameTop, kInGamePitch,
+                                                int(kPageSlots) + 1) == int(cursor - kFirstPageRow)) {
+          (x < kInGameValueCenter ? left : right) = true;
+        }
+        if (left) {
           changed = (changed + setting.count - 1) % setting.count;
         }
-        if (pressed(2)) {
+        if (right) {
           changed = (changed + 1) % setting.count;
         }
         if (changed != value) {
@@ -2326,7 +2967,17 @@ REX_HOOK_RAW(sub_823E8720) {
       SaveSettings();  // (once a press; g_written keeps them for Back's save too)
     }
     g_unsaved = false;
+    if (kPages[g_category].custom) {
+      ShowControls(g_inPage, g_inGameLayer);
+    }
     NotifyCursor(ctx, base, cursor);
+    if (scrolled) {
+      // The page's rows moved under the cursor (its slot may be the same):
+      // each lights or not by the cursor, as the cursor event does.
+      for (uint32_t slot = kFirstPageRow; slot <= kRestoreSlot; slot++) {
+        CallGuest(ctx, base, __imp__sub_83692378, {Load32(g_list + kRowsAt + 4 * slot), 2, kInGameModel});
+      }
+    }
     PushValues(ctx, base);
     return;
   }
@@ -2335,6 +2986,27 @@ REX_HOOK_RAW(sub_823E8720) {
   // off it are made here, in the order shown, the rest by the game's
   // handler in its own indices.
   bool up = pressed(0), down = pressed(1);
+  // The pointer on a row: the cursor there (the rows in the order shown:
+  // the manual's, taller, then the others 41 apart).
+  float px, py;
+  if (ng2::menu_mouse::ClickedThisFrame() && ng2::menu_mouse::Pointer(&px, &py) &&
+      (px < kInGameLeft || px > kGameListRight || py < 110.0f || py > 185.0f + 41.0f * float(kGameRows))) {
+    g_suppress |= 0x10;  // (a click off the rows confirms nothing)
+  }
+  if (ng2::menu_mouse::PointerActive() && ng2::menu_mouse::Pointer(&px, &py) && px >= kInGameLeft &&
+      px <= kGameListRight) {
+    int shown = py >= 110.0f && py < 164.0f ? 0 : PointedRow(kInGameLeft, kGameListRight, 185.0f - 41.0f, 41.0f, int(kGameRows) + 1);
+    if (shown >= 1 || (shown == 0 && py < 164.0f)) {
+      uint32_t to = ToGameIndex(uint32_t(shown));
+      if (to != cursor) {
+        CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
+        Store32(cursorAddress, to);
+        cursor = to;
+        g_suppress |= 0x3;  // the game's handler doesn't move it again
+        up = down = false;
+      }
+    }
+  }
   uint32_t shown = ToShown(cursor), toShown = shown;
   if (shown == kEntryShownAt) {
     toShown = up ? kEntryShownAt - 1 : down ? kEntryShownAt + 1 : shown;
@@ -2350,7 +3022,7 @@ REX_HOOK_RAW(sub_823E8720) {
   }
   if (cursor == kEntryIndex) {
     g_suppress |= 0xC;  // no left and right either
-    if (CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
+    if (!(g_suppress & 0x10) && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, cursor, 0, 0})) {
       CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, sound);
       g_inPage = false;
       ShowInGameRows(ctx, base, true, 0);
@@ -2417,4 +3089,13 @@ REX_HOOK_RAW(sub_836941B0) {
 
 bool InGameOursShown() {
   return g_inGameOurs;
+}
+
+bool InGameConfirmShown() {
+  if (!g_inPage) {
+    return true;
+  }
+  const Page& page = kPages[g_category];
+  uint32_t line = LineOf(page, ng2::guest::Load32(kInGameCursors));
+  return page.custom || line == page.count;
 }

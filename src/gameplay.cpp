@@ -105,10 +105,15 @@ bool InCutscene() {
 
 }  // namespace ng2::gameplay
 
+namespace ng2::rebind {
+void ApplyPad();  // rebind.cpp
+}
+
 // The input update, once a frame: the pads read, the scripts still to run.
 REX_EXTERN(__imp__sub_822F2E38);
 REX_HOOK_RAW(sub_822F2E38) {
   PutBack();
+  ng2::rebind::ApplyPad();
   __imp__sub_822F2E38(ctx, base);
   ng2::video::NoteInputRead();
   if (!REXCVAR_GET(skip_cutscenes) || !SkipPressed()) {

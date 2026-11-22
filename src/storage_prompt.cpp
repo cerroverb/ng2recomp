@@ -4,7 +4,8 @@
 // - The PC has one storage device, so the game's "Change Storage Device"
 //   prompts (Load Game's button line, the Options pages' hints, NINJA
 //   CINEMA's) are left out, in every language: for each id the English text
-//   is looked at once, and where it holds "@[pad:..] Change Storage Device",
+//   is looked at once, and where it holds "@[pad:..] Change Storage Device"
+//   (or NINJA CINEMA's "@[pad:..] Storage Device"),
 //   that button's segment (from its tag to the next tag) is cut out of the
 //   string handed out, where it lies (the table's own copy, so once). Untagged
 //   labels of the same words are left alone.
@@ -32,6 +33,7 @@ namespace {
 
 constexpr uint32_t kEnglish = 1;  // the lookup's languages: 0 Japanese, 1 English, ...
 constexpr std::u16string_view kPrompt = u"Change Storage Device";
+constexpr std::u16string_view kShortPrompt = u"Storage Device";  // (NINJA CINEMA's)
 constexpr std::u16string_view kTag = u"@[";           // any tag
 constexpr std::u16string_view kButton = u"@[pad:";    // a button's
 constexpr uint32_t kMaxChars = 1024;
@@ -77,7 +79,8 @@ std::u16string PromptTag(const uint8_t* s) {
     while (text < length && At(s + 2 * text) == u' ') {
       text++;
     }
-    if (text + kPrompt.size() <= length && Matches(s + 2 * text, kPrompt)) {
+    if ((text + kPrompt.size() <= length && Matches(s + 2 * text, kPrompt)) ||
+        (text + kShortPrompt.size() <= length && Matches(s + 2 * text, kShortPrompt))) {
       std::u16string found;
       for (uint32_t i = tag; i <= close && i < length; i++) {
         found += At(s + 2 * i);
@@ -145,6 +148,17 @@ REX_HOOK_RAW(sub_837578C8) {
     }
   }
   uint32_t id = ctx.r4.u32;
+  // RECOMP SETTINGS' texts, in every language, without the game's lookup:
+  // some of their ids are past the end of the game's table.
+  if (uint32_t ours = ng2::recomp_settings::RecompText(id)) {
+    ctx.r3.u64 = ours;
+    return;
+  }
+  // (an id of ours past the table not given a text: the table's empty one,
+  // not a read past its end)
+  if (id >= 0x20300 && id < 0x20380) {
+    ctx.r4.u64 = id = 0x20034;
+  }
   // The English text first (once per id, once it's loaded), for the prompt's
   // tag. (Map nodes stay put: the pointer outlives the lock.)
   const std::u16string* tag = nullptr;
@@ -170,8 +184,5 @@ REX_HOOK_RAW(sub_837578C8) {
   __imp__sub_837578C8(ctx, base);
   if (tag && !tag->empty() && ctx.r3.u32) {
     CutSegment(ctx.r3.u32, *tag);
-  }
-  if (uint32_t ours = ng2::recomp_settings::RecompText(id)) {
-    ctx.r3.u64 = ours;  // RECOMP SETTINGS' texts, in every language
   }
 }

@@ -19,6 +19,9 @@ float Aspect();
 
 // The gameplay HUD was drawn in the last 2D pass.
 bool HudShown();
+// A menu's 2D was drawn lately (its buckets: the title's, the in-game
+// list): the mouse is the menus' (menu_mouse.cpp).
+bool MenuShown();
 
 // A draw now is the 2D pass's (HUD, menus; render thread).
 bool In2DPass();

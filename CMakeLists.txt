@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 VERSION 0.6.14 LANGUAGES CXX)
+project(ng2 VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,6 +62,8 @@ set(NG2_SOURCES
     src/debug_waits.cpp
     src/room_jump.cpp
     src/cheats.cpp
+    src/rebind.cpp
+    src/menu_mouse.cpp
     src/frame_wait.cpp
     src/dlc.cpp
     src/mods.cpp

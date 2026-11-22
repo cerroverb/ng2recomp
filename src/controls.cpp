@@ -48,6 +48,13 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include "aspect.h"
+#include "gpu/guest.h"
+#include "menu_mouse.h"
+#include "rebind.h"
+
+bool HudInPlay();  // extras.cpp
+
 namespace ng2::controls {
 
 namespace {
@@ -152,7 +159,30 @@ void Frame() {
   auto* runtime = rex::Runtime::instance();
   auto* input = runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
   bool overlay = input && input->IsOverlayOpen();
-  bool keyboard = device == Device::kKeyboard && !overlay;
+  ng2::menu_mouse::FrameStart();
+  // A menu up: the pointer free and shown, its buttons and wheel the
+  // menus' (menu_mouse.cpp).
+  // (not in play: the title's screens, loading; or a menu over play)
+  bool menu = !(ng2::aspect::HudShown() || HudInPlay()) || ng2::aspect::MenuShown() ||
+              ng2::menu_mouse::MenuInputLately();
+  // (not under the SDK's own overlay, F3/F4: its clicks are its own)
+  ng2::menu_mouse::SetMenu(menu && !overlay);
+  // There the pointer shows once the mouse is used, and hides again when a
+  // controller's button is pressed (the merged pad's presses, unless the
+  // mouse's own).
+  constexpr uint32_t kMergedPressed = 0x83C08100 + 8;
+  // (and again only once it's used in the next menu: not over cutscenes
+  // and loading screens after mouse look in play)
+  static bool mouseShown = false;
+  bool pad = device != Device::kKeyboard && device != Device::kUnknown;
+  if (ng2::menu_mouse::TakeMouseUsed()) {
+    mouseShown = true;
+  } else if (!menu || (pad && ng2::guest::Load32(kMergedPressed) != 0 && !ng2::menu_mouse::PressedThisFrame())) {
+    mouseShown = false;
+  }
+  bool noLook = overlay || menu;  // (no mouse look in a menu either way)
+  overlay |= menu && mouseShown;
+  bool keyboard = device == Device::kKeyboard && !noLook;
   rex::input::mnk::SetMouseLookActive(keyboard);
   keyboardInUse.store(keyboard);
   overlayOpen.store(overlay);
@@ -175,6 +205,12 @@ void Frame() {
     auto* window = runtime ? runtime->display_window() : nullptr;
     if (!window) {
       return;
+    }
+    static bool captureListener = false;
+    if (!captureListener) {
+      ng2::rebind::AddCaptureListener(window);  // the Controls page's keys
+      ng2::menu_mouse::AddListener(window);
+      captureListener = true;
     }
     using Visibility = rex::ui::Window::CursorVisibility;
     if (overlayOpen.load()) {

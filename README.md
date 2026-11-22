@@ -158,7 +158,9 @@ each defaults to the game's own behaviour.
 
 - **Graphics**: Render Scale (1x–8x, with the resolution it draws at, as "2x 2240x1168");
   Anti-Aliasing (off, or 2x MSAA as on the console, 4x, 8x); Texture Filtering (the game's, or
-  4x–16x anisotropic); Shadows (the game's, or Hi-Res: the 1024x1024 shadow map in fights
+  4x–16x anisotropic); Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render
+  scales); Normal Map Filtering (the game's, or trilinear: normal maps filtered between their mip
+  levels too, so no bands slide over lit surfaces); Shadows (the game's, or Hi-Res: the 1024x1024 shadow map in fights
   too, where the game drops to 512x512); Bloom (on, reduced, off); Post-Effects (off: no blur, no white
   flashes)
 - **Display**: Window Mode (windowed, borderless, fullscreen) and Window Size; Aspect Ratio (16:9,
@@ -171,7 +173,8 @@ each defaults to the game's own behaviour.
   In the Steam Deck's Game Mode (and any game run through gamescope) Auto acts as Timer: there it
   gave me uneven frame pacing. Input Latency Low there keeps the game's frames on the display's
   refreshes by itself, whichever Frame Pacing is set
-- **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
+- **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); One Hit Kill (any
+  hit that does damage kills the enemy); Instant Charge (Ultimate Techniques charge at once); Unlock Costumes;
   All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
   new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
   items found); All Crystal Skulls; Max HP and Ninpo (the life and ninpo upgrades full while it's
@@ -179,10 +182,10 @@ each defaults to the game's own behaviour.
 - **Interface**: HUD (shown, fading out when not fighting, hidden); Hi-Res Font (text drawn from
   glyphs twice the size, sharper above 720p; from the next start); Smooth HUD and Menus (the 2D
   always filtered); Show FPS; Button Prompts (Auto follows the device in use, with the Steam Deck's
-  own buttons on a Deck; Xbox, PlayStation, Nintendo, Keyboard, Steam Deck); Mouse Sensitivity
+  own buttons on a Deck; Xbox, PlayStation, Nintendo, Keyboard, Steam Deck); Mouse Sensitivity (0.25 to 8)
 - **Extras**: Skip Intro; Skip Cutscenes (any, watched or not); Skip Death Screen (straight to the
   game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves);
-  Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render scales)
+  More Blood (twice the blood sprays and stains)
 - **Gameplay**: Input Latency (Low: no finished frame waits for the screen; needs
   VK_KHR_present_wait; under gamescope, as in the Steam Deck's Game Mode, it needs
   VK_EXT_present_timing, which SteamOS has from 3.10, and acts as Standard without it); Unlock Difficulties (every path in New Game and Mission Mode, at once
@@ -190,9 +193,12 @@ each defaults to the game's own behaviour.
   freer camera that follows less tightly); OT/UT Free Camera
   (the camera stays under your control during Obliteration Techniques, Ultimate Techniques and
   throws)
-
-In the in-game menu, a page with six settings has no Restore Defaults row (the list has no room
-for it); the title menu's has.
+- **Controls**: a table of the game's actions, each with two keys (or mouse buttons) and a
+  controller button. Confirm on a cell, then press the key or the button (Ninpo and Water Run take
+  one button or two held together); X clears a cell, Y gives the row its defaults, and Default
+  Controls brings everything back. A key or button given to an action leaves the one that had it.
+  The sticks, the d-pad, START and BACK stay the controller's, and the menus keep A and B (Return
+  and Backspace on the keyboard). The game's own prompts show the buttons chosen
 
 The game's own Options (camera, controller, sound, screen) are where they always were.
 
@@ -243,6 +249,11 @@ touched last, and its prompts change to match (or stay on one set: Button Prompt
 The mouse moves the camera only while the keyboard and mouse are in use, and the pointer hides while
 a controller is.
 
+In the menus the mouse points and clicks: the left button confirms, the right one goes back, the
+wheel moves through a list (or cycles the slots on Load Game, the costumes and the New Game paths),
+and the arrows on screen can be clicked. Return and Backspace confirm and go back there too, and
+Delete deletes a save.
+
 | Key | Action | Key | Action |
 |---|---|---|---|
 | W A S D | move | mouse | camera |
@@ -255,8 +266,7 @@ a controller is.
 | arrows | d-pad | Return / Backspace | A / B |
 | Numpad 8 4 5 6 | camera (keys) | | |
 
-The keys can be changed in `ng2.toml` (`keybind_a = "Space,C,Return"` and so on: a list of keys
-for each button; a key in two lists presses both, as the game's two-button moves need).
+These are the defaults: RECOMP SETTINGS' Controls page sets each action's keys and controller button.
 
 ## Known issues
 
@@ -276,11 +286,9 @@ folder, zipped. For a crash or a freeze, attach the log (`ng2.log`, above).
 
 ## To do
 
-- Mouse support in the menus
 - A native audio engine
 - More gameplay settings
 - More visual settings
-- Rebindable controls in RECOMP SETTINGS (for now the keys are set in `ng2.toml`)
 - An Android port
 
 ## Building from source

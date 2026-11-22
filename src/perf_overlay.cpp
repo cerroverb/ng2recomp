@@ -11,6 +11,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <mutex>
+#include <vector>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -26,6 +28,7 @@
 #include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
+#include "overlay.h"
 #include "recomp_settings.h"
 
 REXCVAR_DEFINE_BOOL(show_fps, false, "Video",
@@ -42,7 +45,8 @@ constexpr uint32_t kTextChars = 32;
 constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_836CEDE8
 // From the frame's anchor (about 953, 650 in the 1280x720 UI) to the top
 // left corner (left edge, line center).
-constexpr float kX = 32.0f - 953.0f, kY = 16.0f - 650.0f;
+constexpr float kAnchorX = 953.0f, kAnchorY = 650.0f;
+constexpr float kX = 32.0f - kAnchorX, kY = 16.0f - kAnchorY;
 constexpr uint32_t kLayer = 0x15;  // aspect.cpp keeps this layer's text in the top left corner
 constexpr uint32_t kAllocAttributes = 0xB2800000;
 // A text frame like the one the Options pages' arrow lists show their value
@@ -180,6 +184,88 @@ void QueueText(PPCContext& ctx, uint8_t* base, uint32_t item, uint32_t* resource
   CallGuest(ctx, base, __imp__sub_83691AD8, {item, kLayer});
 }
 
+// A panel of texts of ours (overlay.h): each a text item of its own, made
+// as needed, queued each frame while the panel is kept set.
+constexpr uint32_t kPanelChars = 96;
+struct PanelItem {
+  uint32_t item = 0, resource = 0;
+};
+std::mutex g_panelMutex;
+std::vector<ng2::overlay::Text> g_panel;  // (guarded)
+uint64_t g_panelFrame = ~0ull;            // the frame it was last set in (guarded)
+uint32_t g_panelLayer = 0;                // (guarded)
+bool g_panelQueued = false;               // by QueuePanel (guarded)
+std::mutex g_panelItemsMutex;
+std::vector<PanelItem> g_panelItems;      // (g_panelItemsMutex)
+
+void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued) {
+  std::vector<ng2::overlay::Text> texts;
+  uint32_t layer = kLayer;
+  std::lock_guard items(g_panelItemsMutex);
+  {
+    std::lock_guard lock(g_panelMutex);
+    uint64_t now = g_frameNumber.load(std::memory_order_relaxed);
+    if (g_panelQueued != queued) {
+      return;
+    }
+    if (!queued && (g_panelFrame == ~0ull || g_panelFrame + 2 < now)) {
+      return;  // not set lately: its menu is gone
+    }
+    texts = g_panel;
+    layer = g_panelLayer ? g_panelLayer : kLayer;
+  }
+  uint32_t frame = FindTextFrame();
+  if (!frame) {
+    return;
+  }
+  for (size_t i = 0; i < texts.size(); i++) {
+    if (i >= g_panelItems.size()) {
+      uint32_t item = CallGuest(ctx, base, __imp__sub_83835960,
+                                {kItemSize + kPanelChars * 2, kAllocAttributes});
+      if (!item) {
+        return;
+      }
+      std::memset(ng2::guest::Virtual(item), 0, kItemSize + kPanelChars * 2);
+      CallGuest(ctx, base, __imp__sub_83704630, {item});
+      CallGuest(ctx, base, __imp__sub_8242C048, {item + kTextPart});
+      Store32(item + kText, item + kItemSize);
+      Store32(item + kTextPart + 8, (ng2::guest::Load32(item + kTextPart + 8) & 0xFFFC3FFF) | 0x4000);
+      Store32(item + 0xF0, 1);
+      g_panelItems.push_back({item, 0});
+    }
+    PanelItem& made = g_panelItems[i];
+    const ng2::overlay::Text& text = texts[i];
+    uint8_t* chars = ng2::guest::Virtual(made.item + kItemSize);
+    std::memset(chars, 0, kPanelChars * 2);
+    for (size_t k = 0; k < text.text.size() && k + 1 < kPanelChars; k++) {
+      chars[2 * k] = uint8_t(text.text[k] >> 8);
+      chars[2 * k + 1] = uint8_t(text.text[k]);
+    }
+    StoreFloat(made.item + kTextPosition, text.x - kAnchorX);
+    StoreFloat(made.item + kTextPosition + 4, text.y - kAnchorY);
+    if (frame != made.resource) {
+      made.resource = frame;
+      CallGuest(ctx, base, __imp__sub_837047E0, {made.item, frame});
+    }
+    double scale = 0.0;
+    CallGuest(ctx, base, __imp__sub_836CEDE8, {uint32_t(text.size)}, &scale);
+    if (!std::isfinite(scale) || scale <= 0.0) {
+      return;
+    }
+    StoreFloat(made.item + kTextScale, float(scale));
+    StoreFloat(made.item + kTextScale + 4, float(scale));
+    // A focused row's colour, dimmed (four floats).
+    for (uint32_t c = 0; c < 4; c++) {
+      uint32_t bits = ng2::guest::Load32(kTextColor + 4 * c);
+      float value;
+      std::memcpy(&value, &bits, 4);
+      StoreFloat(made.item + 0x40 + 4 * c, c < 3 ? value * text.shade : value);
+    }
+    CallGuest(ctx, base, __imp__sub_83704978, {made.item});
+    CallGuest(ctx, base, __imp__sub_83691AD8, {made.item, layer});
+  }
+}
+
 // The version, while the title menu is up.
 void VersionFrame(PPCContext& ctx, uint8_t* base) {
   uint64_t menu = g_titleMenuFrame.load(std::memory_order_relaxed);
@@ -205,6 +291,18 @@ void TitleMenuFrame() {
 }
 
 void CheatsFrame();  // cheats.cpp
+
+void ng2::overlay::QueuePanel(PPCContext& ctx, uint8_t* base) {
+  PanelFrame(ctx, base, true);
+}
+
+void ng2::overlay::SetPanel(std::vector<Text> texts, uint32_t layer, bool queued) {
+  std::lock_guard lock(g_panelMutex);
+  g_panel = std::move(texts);
+  g_panelLayer = layer;
+  g_panelQueued = queued;
+  g_panelFrame = g_frameNumber.load(std::memory_order_relaxed);
+}
 
 // The game starting a frame: time it, and queue the text for it.
 REX_EXTERN(__imp__sub_822F0EF8);
@@ -239,6 +337,7 @@ REX_HOOK_RAW(sub_822F0EF8) {
   g_last = now;
   g_frameNumber.fetch_add(1, std::memory_order_relaxed);
   VersionFrame(ctx, base);
+  PanelFrame(ctx, base, false);
   // In gameplay only (the HUD up), not on loading screens and menus.
   if (!REXCVAR_GET(show_fps) || !ng2::aspect::HudShown() || (!g_item && !MakeItem(ctx, base))) {
     return;
