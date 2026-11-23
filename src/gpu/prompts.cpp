@@ -14,6 +14,7 @@
 // frame with Generation() in their hash, so a change shows at once.
 
 #include "prompts.h"
+#include "../aspect.h"
 #include "../menu_mouse.h"
 
 #include <algorithm>
@@ -151,8 +152,9 @@ Set Chosen() {
 }
 
 // The key a cell shows: in a menu, the menus' own for A, B and Y (Return,
-// Backspace, Delete: menu_mouse.cpp) and no mouse button (the mouse's are
-// the menus' there), else the first one bound.
+// Backspace, Delete: menu_mouse.cpp; Delete X in the Controls table) and no
+// mouse button (the mouse's are the menus' there), but play's X and Y in the
+// in-game manual; else the first one bound.
 std::string ShownKey(const char* bind) {
   if (!ng2::menu_mouse::InMenu()) {
     return FirstKey(bind);
@@ -164,7 +166,15 @@ std::string ShownKey(const char* bind) {
   if (name == "keybind_b") {
     return "Backspace";
   }
-  if (name == "keybind_y") {
+  // The in-game manual's X and Y: play's keys, mouse buttons too (its pages
+  // show the attacks' buttons; nothing there takes X or Y). Elsewhere Delete
+  // is Y (the load screen's Delete), but X in the Controls table (its Clear).
+  bool deleteClears = ng2::menu_mouse::DeleteClearsNow();
+  bool manual = !deleteClears && ng2::menu_mouse::InStage() && ng2::aspect::ManualShown();
+  if (manual && (name == "keybind_x" || name == "keybind_y")) {
+    return FirstKey(bind);
+  }
+  if (name == (deleteClears ? "keybind_x" : "keybind_y")) {
     return "Delete";
   }
   std::string keys = rex::cvar::GetFlagByName(bind);

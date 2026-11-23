@@ -64,6 +64,10 @@ REXCVAR_DEFINE_BOOL(exclusive_fullscreen, false, "UI/Window",
                     "Fullscreen in the desktop's display mode (exclusive) rather than as a "
                     "borderless window over the desktop");
 
+namespace ng2 {
+bool Base720p();  // base_resolution.cpp
+}  // namespace ng2
+
 namespace {
 // (defined below, with the hooks)
 uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&, uint8_t*),
@@ -137,6 +141,8 @@ constexpr uint32_t kNoteSlot = 0x39;
 constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your saves, even turned off.";
 // Frame Interpolation's description (placed with the labels).
 constexpr std::u16string_view kInterpNote = u"Experimental: pictures between the game's frames.";
+// Base Resolution's (base_resolution.cpp).
+constexpr std::u16string_view kBaseResolutionNote = u"Takes effect after a restart.";
 // The Music Test's track names: room for our texts.
 // Spare ids: the table's unused 0x63-0x96, then ids well past its end
 // (0x300 on; it has texts at 0x97 and after), which only the text lookup's
@@ -150,6 +156,8 @@ enum class Kind {
 };
 // Mouse Sensitivity's choices (mnk_sensitivity).
 constexpr double kSensitivities[] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0};
+// Render Scale's choices (render_scale).
+constexpr double kScales[] = {1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
 struct Setting {
   std::u16string_view label;
   std::array<std::u16string_view, 10> choices;
@@ -177,11 +185,12 @@ constexpr WindowSize kWindowSizes[][kWindowSizeCount] = {
 };
 
 constexpr Setting kSettings[] = {
-    // With what the game's 3D (1120x584) is drawn at, as the NGB recomp's.
+    // With what the game's 3D (1120x584) is drawn at, as the NGB recomp's
+    // (1280x720 with base_resolution_720p: Choice).
     {u"Render Scale",
-     {u"1x 1120x584", u"2x 2240x1168", u"3x 3360x1752", u"4x 4480x2336", u"5x 5600x2920",
-      u"6x 6720x3504", u"7x 7840x4088", u"8x 8960x4672"},
-     8, "render_scale", Kind::kScale},
+     {u"1x 1120x584", u"1.5x 1680x876", u"2x 2240x1168", u"3x 3360x1752", u"4x 4480x2336",
+      u"5x 5600x2920", u"6x 6720x3504", u"7x 7840x4088", u"8x 8960x4672"},
+     9, "render_scale", Kind::kScale},
     {u"Texture Filtering", {u"Default", u"4x", u"8x", u"16x"}, 4, "anisotropic_filtering",
      Kind::kFiltering},
     {u"Bloom", {u"Off", u"Reduced", u"On"}, 3, "bloom", Kind::kLevel},
@@ -241,6 +250,9 @@ constexpr Setting kSettings[] = {
     {u"Instant Charge", {u"On", u"Off"}, 2, "cheat_instant_charge", Kind::kOnOff},
     // Extras (extras.cpp).
     {u"More Blood", {u"On", u"Off"}, 2, "more_blood", Kind::kOnOff},
+    // The size the game's 3D is drawn at before Render Scale (experimental,
+    // base_resolution.cpp; after a restart).
+    {u"Base Resolution", {u"1280x720", u"1120x584"}, 2, "base_resolution_720p", Kind::kOnOff},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -251,6 +263,22 @@ const WindowSize* WindowSizes() {
 std::u16string_view Choice(const Setting& setting, uint32_t k) {
   if (setting.kind == Kind::kWindowSize) {
     return WindowSizes()[std::min(k, kWindowSizeCount - 1)].text;
+  }
+  // Base Resolution applies at the next start: the choice that isn't the one
+  // running says so.
+  if (std::string_view(setting.name) == "base_resolution_720p") {
+    static constexpr std::u16string_view kNow[] = {u"1280x720", u"1120x584"};
+    static constexpr std::u16string_view kLater[] = {u"1280x720 (Restart)", u"1120x584 (Restart)"};
+    uint32_t running = ng2::Base720p() ? 0 : 1;
+    k = std::min<uint32_t>(k, 1);
+    return k == running ? kNow[k] : kLater[k];
+  }
+  // (base_resolution_720p: the game's 3D at 1280x720)
+  if (setting.kind == Kind::kScale && ng2::Base720p()) {
+    static constexpr std::u16string_view k720p[] = {
+        u"1x 1280x720",  u"1.5x 1920x1080", u"2x 2560x1440", u"3x 3840x2160", u"4x 5120x2880",
+        u"5x 6400x3600", u"6x 7680x4320",   u"7x 8960x5040", u"8x 10240x5760"};
+    return k720p[std::min<uint32_t>(k, 8)];
   }
   return setting.choices[std::min(k, setting.count - 1)];
 }
@@ -293,8 +321,8 @@ constexpr PageRow Row(uint32_t setting) {
 }
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{Row(0), Row(3), Row(1), Row(21), Row(33), Row(30), Row(2), Row(20)}},
-     8},
+     {{Row(0), Row(37), Row(3), Row(1), Row(21), Row(33), Row(30), Row(2), Row(20)}},
+     9},
     {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
@@ -428,7 +456,7 @@ void Override(uint32_t slot, std::u16string_view text) {
 // Each of our texts a spare id of the Options table (its strings unused by
 // Options), given our text by the lookup.
 void PlaceTexts() {
-  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote};
+  std::vector<std::u16string_view> texts{kRestoreText, kInterpNote, kBaseResolutionNote};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
     // List values are strings of ours (ListString); only choice rows'
@@ -620,8 +648,16 @@ int32_t GetInt(std::string_view name) {
 
 uint32_t ValueOf(const Setting& setting) {
   switch (setting.kind) {
-    case Kind::kScale:
-      return uint32_t(std::clamp(GetInt(setting.name), 1, int32_t(setting.count)) - 1);
+    case Kind::kScale: {
+      double value = std::atof(GetSetting(setting.name).c_str());
+      uint32_t nearest = 0;
+      for (uint32_t i = 0; i < std::size(kScales); i++) {
+        if (std::abs(kScales[i] - value) < std::abs(kScales[nearest] - value)) {
+          nearest = i;
+        }
+      }
+      return nearest;
+    }
     case Kind::kFiltering: {
       int32_t filtering = GetInt(setting.name);
       return filtering >= 5 ? 3 : filtering == 4 ? 2 : filtering == 3 ? 1 : 0;
@@ -821,7 +857,7 @@ void SetSetting(const char* name, const std::string& text) {
 void SetValue(const Setting& setting, uint32_t value) {
   switch (setting.kind) {
     case Kind::kScale:
-      SetSetting(setting.name, std::to_string(value + 1));
+      SetSetting(setting.name, fmt::format("{}", kScales[std::min<size_t>(value, std::size(kScales) - 1)]));
       break;
     case Kind::kFiltering:
       SetSetting(setting.name, std::to_string(kFiltering[value]));
@@ -910,6 +946,102 @@ void StoreControl(const char* name, const std::string& value) {
 void SetConfigPath(const std::filesystem::path& path) {
   g_configPath = path;
   ng2::rebind::SetStore(StoreControl);
+}
+
+// Older versions wrote the keys' settings unquoted (key_jump = Space): not
+// TOML, so the whole file failed to load and every setting started at its
+// default. Before it is loaded: each top-level line of a text setting whose
+// value isn't quoted gets its quotes, written back only if something changed.
+std::string g_repairNote;  // logged once logging is up (ReportConfigRepair)
+void RepairConfig(const std::filesystem::path& given) {
+  // (a symlinked config: its target written, as SaveSettings does)
+  std::error_code canonicalError;
+  std::filesystem::path path = std::filesystem::canonical(given, canonicalError);
+  if (canonicalError) {
+    path = given;
+  }
+  std::ifstream in(path);
+  if (!in) {
+    return;
+  }
+  std::vector<std::string> lines;
+  uint32_t fixed = 0;
+  bool inTable = false;
+  for (std::string line; std::getline(in, line);) {
+    std::string_view view = line;
+    size_t start = view.find_first_not_of(" \t");
+    if (start != std::string_view::npos && view[start] == '[') {
+      inTable = true;
+    }
+    size_t eq = view.find('=');
+    if (!inTable && start != std::string_view::npos && view[start] != '#' && eq != std::string_view::npos) {
+      std::string_view name = view.substr(start, eq - start);
+      name = name.substr(0, name.find_last_not_of(" \t") + 1);
+      std::string_view value = view.substr(eq + 1);
+      size_t v = value.find_first_not_of(" \t");
+      const auto* info = rex::cvar::GetFlagInfo(std::string(name));
+      // (an empty value too: "key =" isn't TOML either; arrays and tables
+      // left alone)
+      bool alreadyTOML = v != std::string_view::npos && (value[v] == '"' || value[v] == '\'' ||
+                                                         value[v] == '[' || value[v] == '{');
+      if (info && info->type == rex::cvar::FlagType::String && !alreadyTOML) {
+        std::string text(v == std::string_view::npos ? std::string_view() : value.substr(v));
+        // (a comment after the value stays one)
+        std::string comment;
+        if (size_t hash = text.rfind('#', 0) == 0 ? 0 : text.find(" #"); hash != std::string::npos) {
+          comment = text.substr(hash);
+          text.resize(hash);
+        }
+        text.erase(text.find_last_not_of(" \t\r") + 1);
+        std::string quoted = "\"";
+        for (char c : text) {
+          if (c == '"' || c == '\\') {
+            quoted += '\\';
+          }
+          quoted += c;
+        }
+        quoted += '"';
+        line = std::string(name) + " = " + quoted + comment;
+        fixed++;
+      }
+    }
+    lines.push_back(std::move(line));
+  }
+  in.close();
+  if (!fixed) {
+    return;
+  }
+  std::filesystem::path temp = path;
+  temp += ".tmp";
+  std::error_code ec;
+  {
+    std::ofstream out(temp, std::ios::trunc);
+    for (const std::string& line : lines) {
+      out << line << '\n';
+    }
+    out.close();  // (a full disk fails here, not at the writes)
+    if (!out) {
+      ec = std::make_error_code(std::errc::io_error);
+    }
+  }
+  if (!ec) {
+    std::filesystem::rename(temp, path, ec);
+  }
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(temp, ignored);
+  }
+  g_repairNote = ec ? fmt::format("recomp settings: couldn't repair {} ({}); its settings don't load",
+                                  rex::path_to_utf8(path), ec.message())
+                    : fmt::format("recomp settings: {} unquoted text setting(s) quoted in {} (it "
+                                  "didn't load before)",
+                                  fixed, rex::path_to_utf8(path));
+}
+
+void ReportConfigRepair() {
+  if (!g_repairNote.empty()) {
+    REXLOG_WARN("{}", g_repairNote);
+  }
 }
 
 void SetAppContext(rex::ui::WindowedAppContext* context) {
@@ -1080,6 +1212,7 @@ constexpr float kTitleMenuTop = 432.0f, kTitleMenuPitch = 35.2f;
 void TitleMenuFrame();
 REX_EXTERN(__imp__sub_8366FBC0);
 REX_HOOK_RAW(sub_8366FBC0) {
+  ng2::menu_mouse::NoteStage(false);  // (the title's: no stage)
   // The pointer on an entry: the cursor there (before the menu's update,
   // which lights it); a click on none confirms nothing (its A taken out of
   // the pads' presses for this update).
@@ -1302,7 +1435,7 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     } else {
       Store32(widget + kOnOffRow, 0);
       for (uint32_t k = 0; k < setting.count; k++) {
-        CallGuest(ctx, base, __imp__sub_836CF1A8, {widget, TextId(setting.choices[k])});
+        CallGuest(ctx, base, __imp__sub_836CF1A8, {widget, TextId(Choice(setting, k))});
       }
     }
     Store32(widget + kWidgetValue, value);
@@ -1435,7 +1568,7 @@ void RefillPage(PPCContext& ctx, uint8_t* base, const Page& page) {
 // place, on the title's Options screen and in the in-game list, as the NGB
 // recomp's: an action a row, with its two keys and its controller button
 // (rebind.h), then Default Controls. Confirm on a cell waits for a key, or a
-// button (two together for Ninpo and Water Run); X clears it, Y gives the
+// button (two together for Ninpo and Wind Run); X (Delete) clears it, Y gives the
 // row its defaults.
 constexpr uint32_t kMergedPad = 0x83C08100;  // the pads' buttons: +0 held, +8 pressed
 constexpr uint32_t kButtonMasks[8] = {0x10, 0x20, 0x40, 0x80, 0x1000, 0x2000, 0x4000, 0x8000};
@@ -1467,6 +1600,9 @@ constexpr float kTableTop = 128.0f, kTablePitch = 21.5f;
 uint32_t g_inGameLayer = 0;  // the in-game list's rows' layer (its draw)
 void ShowControls(bool focused, uint32_t layer = 0) {
   namespace rebind = ng2::rebind;
+  // (shown before it takes input: Delete is its Clear from its first frame,
+  // never Y's Default)
+  ng2::menu_mouse::DeleteClears();
   constexpr float kNameX = kTableNameX, kTop = kTableTop, kPitch = kTablePitch, kHelpY = 606.0f;
   constexpr const float (&kCellX)[3] = kTableCellX;
   constexpr int kSize = 0x12;
@@ -1532,6 +1668,7 @@ void ShowControls(bool focused, uint32_t layer = 0) {
 bool RunControls(PPCContext& ctx, uint8_t* base) {
   namespace rebind = ng2::rebind;
   using ng2::guest::Load32;
+  ng2::menu_mouse::DeleteClears();  // (Delete: Clear here, as X)
   using Clock = std::chrono::steady_clock;
   ControlsState& c = g_controls;
   double sound = LoadFloat(kCursorSound);
@@ -2062,6 +2199,7 @@ REX_HOOK_RAW(sub_836D6AC8) {
                      : row == page->count               ? kRestoreDescription
                      : name == "cheat_all_weapons"      ? (kTable | kNoteSlot)
                      : name == "frame_interpolation"    ? TextId(kInterpNote)
+                     : name == "base_resolution_720p"   ? TextId(kBaseResolutionNote)
                                                         : kEmpty);
   uint32_t shown = Load32(model);
   if (shown == 1) {
@@ -2369,7 +2507,7 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
       g_valueText[i] = GuestText(u"", kValueRoom);  // "< value >"
     } else {
       for (uint32_t k = 0; k < setting.count; k++) {
-        g_choiceTexts[i][k] = GuestText(setting.choices[k]);
+        g_choiceTexts[i][k] = GuestText(Choice(setting, k));
       }
     }
   }
@@ -2467,6 +2605,34 @@ uint32_t ShownLine(const Page& page, uint32_t slot) {
 }
 
 bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
+
+// A setting's note (the title's pages show it as the row's description), or
+// "": under the in-game list, which has no description line, while its row
+// is the cursor's.
+std::u16string_view NoteOf(std::string_view name) {
+  return name == "cheat_all_weapons"      ? kAllWeaponsNote
+         : name == "frame_interpolation"  ? kInterpNote
+         : name == "base_resolution_720p" ? kBaseResolutionNote
+                                          : std::u16string_view();
+}
+bool g_inGameNote = false;  // shown this frame (queued with the list's draw)
+void ShowInGameNote() {
+  std::u16string_view note;
+  if (g_inPage && g_category < kPageCount) {
+    const Page& page = kPages[g_category];
+    uint32_t line = LineOf(page, ng2::guest::Load32(kInGameCursors));
+    if (line < page.count) {
+      note = NoteOf(kSettings[page.rows[line].setting].name);
+    }
+  }
+  g_inGameNote = !note.empty();
+  if (g_inGameNote) {
+    constexpr float kNoteX = 456.0f, kNoteY = 606.0f;  // (where the Controls table's help goes)
+    std::vector<ng2::overlay::Text> texts;
+    texts.push_back({kNoteX, kNoteY, std::u16string(note), 0.85f});
+    ng2::overlay::SetPanel(std::move(texts), g_inGameLayer, true);
+  }
+}
 
 void SendCursorEvent(PPCContext& ctx, uint8_t* base, uint32_t view) {
   CallGuest(ctx, base, __imp__sub_83692378, {view, 2, kInGameModel});
@@ -2578,6 +2744,7 @@ void PlacePageRow(uint32_t row, bool choices, uint32_t linesUp = 0) {
 // rows as they are, as the title's list.
 void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category = 0,
                     bool categoriesShown = false, uint32_t scroll = 0) {
+  g_inGameNote = false;  // (shown again by the next update, if its row has one)
   if (!ours) {
     ArrangeGameRows();
     g_inGameOurs = false;
@@ -2763,8 +2930,8 @@ REX_HOOK_RAW(sub_83695748) {  // draw: the rows one under another
     g_inGameLayer = uint32_t(layer);
   }
   __imp__sub_83695748(ctx, base);
-  if (list == g_list && g_inGameOurs && kPages[g_category].custom) {
-    ng2::overlay::QueuePanel(ctx, base);  // the Controls table, with the list
+  if (list == g_list && g_inGameOurs && (kPages[g_category].custom || g_inGameNote)) {
+    ng2::overlay::QueuePanel(ctx, base);  // the Controls table or a note, with the list
   }
   if (list == g_list) {
     uint32_t bits = uint32_t(position);
@@ -2969,6 +3136,8 @@ REX_HOOK_RAW(sub_823E8720) {
     g_unsaved = false;
     if (kPages[g_category].custom) {
       ShowControls(g_inPage, g_inGameLayer);
+    } else {
+      ShowInGameNote();
     }
     NotifyCursor(ctx, base, cursor);
     if (scrolled) {

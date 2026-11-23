@@ -13,6 +13,9 @@
 
 #include "video.h"
 #include "../aspect.h"
+namespace ng2 {
+bool Base720p();  // base_resolution.cpp
+}  // namespace ng2
 #include "../movie/movie.h"
 #include "prompts.h"
 #include "win_display.h"
@@ -107,9 +110,9 @@ extern const size_t g_depth_copy_ms_ps_size;
 extern const uint8_t g_debug_ps[];
 extern const size_t g_debug_ps_size;
 
-REXCVAR_DEFINE_INT32(render_scale, 1, "Video",
-                     "Internal resolution: render targets at this many times the game's size "
-                     "each way (1-8)")
+REXCVAR_DEFINE_DOUBLE(render_scale, 1.0, "Video",
+                      "Internal resolution: render targets at this many times the game's size "
+                      "each way (1, 1.5, 2-8; 1.5 is 1920x1080 with base_resolution_720p)")
     .range(1, 8);
 REXCVAR_DEFINE_BOOL(vsync, true, "Video",
                     "Wait for the display's refresh to present (older setting: present_mode "
@@ -127,6 +130,9 @@ REXCVAR_DEFINE_INT32(antialiasing, 2, "Video",
                      "MSAA samples for the render targets the game multisamples (its main "
                      "picture): 0 off, 2 as the game, 4 or 8")
     .range(0, 8);
+REXCVAR_DEFINE_BOOL(cutout_msaa, true, "Video",
+                    "With MSAA: cut-out textures (fences, foliage) tested per sample, their "
+                    "edges smoothed like geometry's, instead of each pixel all in or out");
 REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (half), 2 on")
     .range(0, 2);
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
@@ -222,7 +228,11 @@ struct HostTexture {
   std::unique_ptr<RenderTextureView> view;  // for the texture heap
   uint32_t descriptor = 0;                    // in the texture heap, 0 = none
   bool float7e3 = false;  // a color target last bound as 2_10_10_10_FLOAT
-  uint32_t scale = 1;     // host pixels per guest pixel (render targets, resolves)
+  // Host pixels per guest pixel, in halves (render targets, resolves): 2 is
+  // 1x, 3 is 1.5x. A guest coordinate is HostCoord(x, halfScale) host pixels.
+  // Texture descriptors carry halfScale - 2 above bit 20 (0: 1x, as an
+  // ordinary texture's, which carries nothing there).
+  uint32_t halfScale = 2;
   bool prompts = false;   // the button atlas or its palette (prompts.cpp)
 };
 
@@ -1077,6 +1087,35 @@ struct CachedTexture {
   uint64_t changedFrame = 0;
 };
 std::unordered_map<uint64_t, CachedTexture> g_textures;
+// A guest coordinate (pixel edge) at a target's scale, in host pixels: at a
+// half scale, odd ones land on a host pixel's centre, which the rasterizer
+// gives to the shape starting there (top-left rule): rounded down, the same
+// for every edge (sizes, rects, scissors), so they agree with what draws
+// cover and rects that meet in guest pixels still meet.
+uint32_t HostCoord(uint32_t guest, uint32_t halfScale) {
+  return guest * halfScale / 2;
+}
+int32_t HostCoord(int32_t guest, uint32_t halfScale) {
+  return guest >= 0 ? int32_t(uint32_t(guest) * halfScale / 2)
+                    : -int32_t((uint32_t(-guest) * halfScale + 1) / 2);
+}
+float ScaleOf(uint32_t halfScale) {
+  return float(halfScale) * 0.5f;
+}
+// render_scale in halves: the nearest of Render Scale's choices (1, 1.5,
+// then whole numbers to 8; a tie the smaller), as its menu row shows it.
+uint32_t RenderScaleHalves() {
+  double v = REXCVAR_GET(render_scale);
+  static constexpr uint32_t kChoices[] = {2, 3, 4, 6, 8, 10, 12, 14, 16};
+  uint32_t best = kChoices[0];
+  for (uint32_t c : kChoices) {
+    if (std::abs(c * 0.5 - v) < std::abs(best * 0.5 - v)) {
+      best = c;
+    }
+  }
+  return best;
+}
+
 // Host textures replaced while a frame may still use them: freed once that
 // frame's fence has passed.
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
@@ -1084,7 +1123,27 @@ uint64_t g_frameCount = 0;
 // Render scale: render targets and the textures resolved from them have this
 // many host pixels per guest pixel each way (render_scale, applied between
 // frames by ApplyRenderScale).
-uint32_t g_resolutionScale = 1;
+uint32_t g_resolutionScale = 2;  // in halves (render_scale x 2)
+// The game's final 1280x720 picture (its 3D scene scaled up, the post effects'
+// last pass and the HUD) at no more than the window shows: the scale that
+// covers the window (Present: g_windowScale), up to the render scale. At 3x on
+// a 1080p screen it was 3840x2160, drawn and copied out to be shrunk to
+// 1920x1080 (#139: ~1.5 ms a frame on a laptop RTX 4050); at 2x, 2560x1440.
+// NG2_FINAL_FULL_SCALE=1: at the render scale, as before.
+uint32_t g_finalScale = 2;  // in halves
+std::atomic<uint32_t> g_windowScale{0};  // in halves; 0: no window size yet
+bool FinalTarget(uint32_t width, uint32_t height) {
+  return width == 1280 && height == 720;
+}
+uint32_t FinalScaleFor(uint32_t scale) {
+  // (base_resolution_720p: the 3D scene is 1280x720 too, at the render scale)
+  static const bool full = [] {
+    const char* v = std::getenv("NG2_FINAL_FULL_SCALE");
+    return (v && *v == '1') || ::ng2::Base720p();
+  }();
+  uint32_t window = g_windowScale.load(std::memory_order_relaxed);
+  return full || window == 0 ? scale : std::min(scale, window);
+}
 // MSAA samples for the targets the game multisamples (antialiasing, applied
 // with the render scale).
 uint32_t g_antialiasing = 2;
@@ -2834,12 +2893,15 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
       const char* v = std::getenv("NG2_SCALE_REFLECTION");
       return !(v && *v == '0');
     }();
-    host->scale = key.width <= 320 && key.height <= 320 &&
+    // (base_resolution_720p: its bloom chain is 320x180 and 322x182, up to 400)
+    const uint32_t small = ::ng2::Base720p() ? 400 : 320;
+    host->halfScale = key.width <= small && key.height <= small &&
                           !(scaleReflection && key.width == 256 && key.height == 128)
-                      ? 1
-                      : g_resolutionScale;
-    host->width = key.width * host->scale;
-    host->height = key.height * host->scale;
+                      ? 2
+                  : FinalTarget(key.width, key.height) ? g_finalScale
+                                                       : g_resolutionScale;
+    host->width = HostCoord(key.width, host->halfScale);
+    host->height = HostCoord(key.height, host->halfScale);
     host->samples = SampleCount(key.msaa);
     host->format = depth ? RenderFormat::D32_FLOAT_S8_UINT : ColorTargetFormat(guestFormat);
     RenderTextureDesc desc = RenderTextureDesc::Texture2D(
@@ -2853,8 +2915,8 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
       // size and scale: each draw asks again.)
       static std::set<uint64_t> failed;
       static uint32_t failedScale = 0;
-      if (failedScale != host->scale) {
-        failed.clear(), failedScale = host->scale;
+      if (failedScale != host->halfScale) {
+        failed.clear(), failedScale = host->halfScale;
       }
       if (failed.insert(uint64_t(host->width) << 32 | host->height).second) {
         REXLOG_ERROR("video: no {}x{} render target", host->width, host->height);
@@ -2864,7 +2926,7 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
     }
     REXLOG_INFO("video: {} target {}x{} edram {:#x} format {} msaa {} (scale {})",
                 depth ? "depth" : "color", key.width, key.height, key.edramBase, guestFormat,
-                key.msaa, host->scale);
+                key.msaa, ScaleOf(host->halfScale));
     slot = std::move(host);
   }
   // 2_10_10_10_FLOAT and its 16_16_16_16 view hold 7e3 color (ResolveByDraw).
@@ -2928,7 +2990,7 @@ uint64_t ResolvedKey(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetc
 uint64_t ResolvedMemoryHash(uint32_t address, uint32_t size);
 
 HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch,
-                                   uint32_t scale) {
+                                   uint32_t scale) {  // (in halves)
   RenderFormat format = ResolveTextureFormat(fetch.format);
   if (format == RenderFormat::UNKNOWN) {
     return nullptr;
@@ -2936,14 +2998,14 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   uint32_t width = fetch.size_2d.width + 1;
   uint32_t height = fetch.size_2d.height + 1;
   auto& slot = g_resolvedTextures[ResolvedKey(address, fetch)];
-  if (slot && slot->scale != scale) {
+  if (slot && slot->halfScale != scale) {
     g_garbage[g_frame].push_back(std::move(slot));  // resolved at another render scale
   }
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
-    host->scale = scale;
-    host->width = width * scale;
-    host->height = height * scale;
+    host->halfScale = scale;
+    host->width = HostCoord(width, scale);
+    host->height = HostCoord(height, scale);
     host->format = format;
     host->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
         host->width, host->height, 1, format, RenderTextureFlag::RENDER_TARGET));
@@ -4241,7 +4303,7 @@ uint32_t AdjustBloom(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t descri
   }
   auto& dest = g_reducedBloom;
   if (dest && (dest->width != source->width || dest->height != source->height ||
-               dest->format != source->format || dest->scale != source->scale)) {
+               dest->format != source->format || dest->halfScale != source->halfScale)) {
     g_garbage[g_frame].push_back(std::move(dest));
   }
   if (!dest) {
@@ -4249,7 +4311,7 @@ uint32_t AdjustBloom(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t descri
     dest->width = source->width;
     dest->height = source->height;
     dest->format = source->format;
-    dest->scale = source->scale;
+    dest->halfScale = source->halfScale;
     dest->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
         dest->width, dest->height, 1, dest->format, RenderTextureFlag::RENDER_TARGET));
     if (!dest->texture) {
@@ -4289,7 +4351,7 @@ uint32_t AdjustBloom(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t descri
   commandList->setScissors(&scissor, 1);
   commandList->drawInstanced(3, 1, 0, 0);
   Transition(*dest, RenderTextureLayout::SHADER_READ);
-  return dest->descriptor | ((dest->scale - 1) << 20);
+  return dest->descriptor | ((dest->halfScale - 2) << 20);
 }
 
 uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -4308,12 +4370,12 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
         it != g_resolvedTextures.end()) {
       NoteCarriedRead(it->second.get());
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
-      return it->second->descriptor | ((it->second->scale - 1) << 20);
+      return it->second->descriptor | ((it->second->halfScale - 2) << 20);
     }
     if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
       NoteCarriedRead(it->second);
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
-      return it->second->descriptor | ((it->second->scale - 1) << 20);
+      return it->second->descriptor | ((it->second->halfScale - 2) << 20);
     }
   }
 
@@ -4600,7 +4662,7 @@ static_assert(offsetof(SharedConstants, debugColor) == 1744);
 // is in depth units, about 2^-24 each on the host's float buffer near 1; the
 // scale is in 1/16 subpixels.
 void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primitive,
-                   uint32_t resolutionScale, float& constant, float& slope) {
+                   float resolutionScale, float& constant, float& slope) {
   float scale = 0.0f, offset = 0.0f;
   auto type = xenos::PrimitiveType(primitive);
   bool polygonal = type != xenos::PrimitiveType::kPointList &&
@@ -4626,7 +4688,7 @@ void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primi
   constant = std::copysign(std::ceil(std::abs(offset) * float(1u << 24)), offset);
   // Per host pixel the depth slope is smaller by the target's scale (Xenia
   // multiplies by its resolution scale too; small targets are drawn at 1x).
-  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit * float(resolutionScale);
+  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit * resolutionScale;
 }
 
 struct PipelineKey {
@@ -4785,6 +4847,8 @@ std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShade
   }
   desc.multisampling.sampleCount = RenderSampleCounts(key.samples);
   desc.alphaToCoverageEnabled = key.alphaToCoverage != 0;
+  // alphaTest 2: a cut-out shaded once per sample (cutout_msaa).
+  desc.sampleShadingEnabled = key.alphaTest == 2;
   RenderSpecConstant specConstant(0, key.alphaTest ? 0x2u : 0u);  // SPEC_CONSTANT_ALPHA_TEST
   desc.specConstants = &specConstant;
   desc.specConstantsCount = 1;
@@ -5007,21 +5071,33 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
       if (key.samples > 1) {
         key.samples = antialiasing < 2 ? 1 : std::max(antialiasing, key.samples);
       }
-      key.slopeDepthBias *= float(g_resolutionScale);
+      key.slopeDepthBias *= ScaleOf(g_resolutionScale);
     }
-    uint64_t hash = XXH3_64bits(&key, sizeof(key));
-    if (!g_listedPipelines.insert(hash).second) {
-      continue;
+    // Multisampled alpha tests recorded before cutout_msaa (the seed, older lists) or with it
+    // off: their per-sample twin too, the reference (only known at the draw) deciding which
+    // is used.
+    bool twin = key.alphaTest == 1 && !key.alphaToCoverage && key.samples > 1 &&
+                key.pixelShader != 1 && REXCVAR_GET(cutout_msaa) &&
+                g_device->getCapabilities().sampleRateShading;
+    for (int pass = 0; pass < (twin ? 2 : 1); pass++) {
+      if (pass == 1) {
+        key.alphaTest = 2;
+      }
+      uint64_t hash = XXH3_64bits(&key, sizeof(key));
+      if (!g_listedPipelines.insert(hash).second) {
+        continue;
+      }
+      const ShaderCacheEntry* vs = FindShaderCacheEntry(key.vertexShader);
+      const ShaderCacheEntry* ps =
+          key.pixelShader == 1 ? nullptr : FindShaderCacheEntry(key.pixelShader);
+      RenderShader* vertexShader = vs ? HostShader(vs) : nullptr;
+      RenderShader* pixelShader = ps ? HostShader(ps) : nullptr;
+      if (!vertexShader || (key.pixelShader != 1 && !pixelShader)) {
+        break;
+      }
+      AskForPipeline(hash, key, vertexShader, pixelShader, true);
+      asked++;
     }
-    const ShaderCacheEntry* vs = FindShaderCacheEntry(key.vertexShader);
-    const ShaderCacheEntry* ps = key.pixelShader == 1 ? nullptr : FindShaderCacheEntry(key.pixelShader);
-    RenderShader* vertexShader = vs ? HostShader(vs) : nullptr;
-    RenderShader* pixelShader = ps ? HostShader(ps) : nullptr;
-    if (!vertexShader || (key.pixelShader != 1 && !pixelShader)) {
-      continue;
-    }
-    AskForPipeline(hash, key, vertexShader, pixelShader, true);
-    asked++;
   }
   std::fclose(f);
   return asked;
@@ -5409,7 +5485,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // smallest); samples must match.
   // (or scales: a tiny target is drawn at 1x, see GetSurface)
   if (target && depth && (depth->width < target->width || depth->height < target->height ||
-                          target->samples != depth->samples || target->scale != depth->scale)) {
+                          target->samples != depth->samples || target->halfScale != depth->halfScale)) {
     depth = nullptr;
   }
 
@@ -5626,7 +5702,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   float targetHeight = float(sizeSource->height);
   // The guest's viewport is in guest pixels; the target has scale host
   // pixels for each.
-  float scale = float(sizeSource->scale);
+  float scale = ScaleOf(sizeSource->halfScale);
   shared.resolutionScale = scale;
   // D3D's pixel centers (PA_SU_VTX_CNTL.pix_center 0) are at integer
   // coordinates: shift everything by half a guest pixel, as Xenia does, or
@@ -5889,9 +5965,27 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
   key.clipDisabled = (Register(device, 0x2204) >> 16) & 1;  // PA_CL_CLIP_CNTL.clip_disable
-  PolygonOffset(device, mode, primitive, sizeSource->scale, key.depthBias, key.slopeDepthBias);
+  PolygonOffset(device, mode, primitive, ScaleOf(sizeSource->halfScale), key.depthBias,
+                key.slopeDepthBias);
   key.alphaTest = colorControl.alpha_test_enable;
   key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
+  // A cut-out (alpha tested against a reference well above 0) drawn
+  // multisampled: its pixel shader runs once per sample (cutout_msaa), so
+  // each sample takes its own texture read and test and MSAA smooths its
+  // edges as it does geometry's, instead of each pixel all in or out (a far
+  // fence's wires broke up and crawled). Only these draws pay the extra
+  // shading; their depth-only passes too, so a later depth-equal color pass
+  // finds the same samples. A reference near 0 ("any alpha at all", mostly
+  // blended effects) keeps the plain test: its edges don't show. (Measured:
+  // foliage tests at 0.25; a Mission 1 fight with ninpo had 17 multisampled
+  // alpha tests, all effects, none at 1/16 or above.)
+  static const bool sampleShading = g_device->getCapabilities().sampleRateShading;
+  if (key.alphaTest && !key.alphaToCoverage && ps && key.samples > 1 && sampleShading &&
+      (uint32_t(colorControl.alpha_func) == 4 || uint32_t(colorControl.alpha_func) == 6) &&
+      shared.alphaThreshold >= 0.1f &&
+      REXCVAR_GET(cutout_msaa)) {
+    key.alphaTest = 2;
+  }
   // =all colors the skinned draws only (bones in fetch slot 94): other
   // shaders include full-screen passes that would cover them.
   bool skinned = (vs->entry->vertexFetchMask[2] >> 30) & 1;
@@ -6035,7 +6129,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // is set) in guest pixels: the HUD clips gauges with it.
   if (guest::Load32(device + kScissorEnable)) {
     auto edge = [&](uint32_t offset, float limit) {
-      float at = float(int32_t(guest::Load32(device + kScissorRect + offset))) * scale;
+      // (rounded as HostCoord: half pixels down)
+      float at = std::floor(float(int32_t(guest::Load32(device + kScissorRect + offset))) * scale);
       return int32_t(std::clamp(at, 0.0f, limit));
     };
     int32_t left = edge(0, targetWidth), top = edge(4, targetHeight);
@@ -6687,6 +6782,18 @@ void Present(HostTexture* frontBuffer) {
         float windowWidth = float(g_swapChain->getWidth());
         float windowHeight = float(g_swapChain->getHeight());
         ng2::aspect::SetWindowShape(g_swapChain->getWidth(), g_swapChain->getHeight());
+        // (the scale the final picture needs: the game's picture, at its aspect
+        // ratio, fitted in the window; not a movie's, whose own shape would
+        // flip it)
+        float gameAspect = ng2::aspect::Aspect();
+        float fitWidth = std::min(windowWidth, windowHeight * gameAspect);
+        float fitHeight = std::min(windowHeight, windowWidth / gameAspect);
+        // (in halves: a 1080p window takes 1.5x, 1920x1080)
+        g_windowScale.store(
+            std::max(2u, uint32_t(std::ceil(std::max(fitWidth / 1280.0f, fitHeight / 720.0f) *
+                                                2.0f -
+                                            0.02f))),
+            std::memory_order_relaxed);
         float width = std::floor(std::min(windowWidth, windowHeight * aspect));
         float height = std::floor(std::min(windowHeight, windowWidth / aspect));
         RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
@@ -7689,7 +7796,8 @@ int64_t DisplayClockNow() {
 
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
-  g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
+  g_resolutionScale = RenderScaleHalves();
+  g_finalScale = g_resolutionScale;  // (until the window's size is known: ApplyRenderScale)
   g_antialiasing = AntialiasingSetting();
   RenderWindow renderWindow{};
   if (!GetRenderWindow(renderWindow)) {
@@ -7864,7 +7972,7 @@ struct ResolveReadbackItem {
   xenos::xe_gpu_texture_fetch_t fetch{};
   TextureFormatInfo info;
   uint32_t width = 0, height = 0;  // guest texels
-  uint32_t scale = 1;
+  uint32_t halfScale = 2;
   uint32_t rowWidth = 0;  // host texels a row of the readback spans
   RenderFormat format = RenderFormat::UNKNOWN;
   const RenderBuffer* buffer = nullptr;
@@ -7948,23 +8056,26 @@ uint16_t FloatToHalf(float f) {
 // One guest texel's bytes (before the endian swap) from its host texels.
 void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data, uint32_t x,
                            uint32_t y, uint8_t* out) {
-  const uint32_t bytes = item.info.bytesPerBlock, scale = item.scale;
+  const uint32_t bytes = item.info.bytesPerBlock, half = item.halfScale;
   auto at = [&](uint32_t hx, uint32_t hy) {
     return data + item.offset + (uint64_t(hy) * item.rowWidth + hx) * bytes;
   };
-  if (scale == 1) {
+  if (half == 2) {
     std::memcpy(out, at(x, y), bytes);
     return;
   }
-  const uint32_t count = scale * scale;
+  // The guest texel's host texels (at a half scale, 1 or 2 each way).
+  const uint32_t x0 = HostCoord(x, half), x1 = std::max(HostCoord(x + 1, half), x0 + 1);
+  const uint32_t y0 = HostCoord(y, half), y1 = std::max(HostCoord(y + 1, half), y0 + 1);
+  const uint32_t count = (x1 - x0) * (y1 - y0);
   switch (item.format) {
     case RenderFormat::R32_FLOAT:
     case RenderFormat::R32G32_FLOAT:
     case RenderFormat::R32G32B32A32_FLOAT: {
       float sum[4] = {};
-      for (uint32_t sy = 0; sy < scale; sy++) {
-        for (uint32_t sx = 0; sx < scale; sx++) {
-          const uint8_t* texel = at(x * scale + sx, y * scale + sy);
+      for (uint32_t hy = y0; hy < y1; hy++) {
+        for (uint32_t hx = x0; hx < x1; hx++) {
+          const uint8_t* texel = at(hx, hy);
           for (uint32_t c = 0; c < bytes / 4; c++) {
             float v;
             std::memcpy(&v, texel + c * 4, 4);
@@ -7979,9 +8090,9 @@ void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data,
     case RenderFormat::R16G16_FLOAT:
     case RenderFormat::R16G16B16A16_FLOAT: {
       float sum[4] = {};
-      for (uint32_t sy = 0; sy < scale; sy++) {
-        for (uint32_t sx = 0; sx < scale; sx++) {
-          const uint8_t* texel = at(x * scale + sx, y * scale + sy);
+      for (uint32_t hy = y0; hy < y1; hy++) {
+        for (uint32_t hx = x0; hx < x1; hx++) {
+          const uint8_t* texel = at(hx, hy);
           for (uint32_t c = 0; c < bytes / 2; c++) {
             uint16_t h;
             std::memcpy(&h, texel + c * 2, 2);
@@ -8000,9 +8111,9 @@ void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data,
     case RenderFormat::R8G8B8A8_UNORM: {
       for (uint32_t c = 0; c < bytes; c++) {
         uint32_t sum = 0;
-        for (uint32_t sy = 0; sy < scale; sy++) {
-          for (uint32_t sx = 0; sx < scale; sx++) {
-            sum += at(x * scale + sx, y * scale + sy)[c];
+        for (uint32_t hy = y0; hy < y1; hy++) {
+          for (uint32_t hx = x0; hx < x1; hx++) {
+            sum += at(hx, hy)[c];
           }
         }
         out[c] = uint8_t((sum + count / 2) / count);
@@ -8014,10 +8125,10 @@ void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data,
     case RenderFormat::R16G16B16A16_UNORM: {
       for (uint32_t c = 0; c < bytes / 2; c++) {
         uint32_t sum = 0;
-        for (uint32_t sy = 0; sy < scale; sy++) {
-          for (uint32_t sx = 0; sx < scale; sx++) {
+        for (uint32_t hy = y0; hy < y1; hy++) {
+          for (uint32_t hx = x0; hx < x1; hx++) {
             uint16_t v;
-            std::memcpy(&v, at(x * scale + sx, y * scale + sy) + c * 2, 2);
+            std::memcpy(&v, at(hx, hy) + c * 2, 2);
             sum += v;
           }
         }
@@ -8027,7 +8138,7 @@ void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data,
       return;
     }
     default:
-      std::memcpy(out, at(x * scale, y * scale), bytes);  // the first host texel
+      std::memcpy(out, at(x0, y0), bytes);  // the first host texel
       return;
   }
 }
@@ -8036,10 +8147,10 @@ void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data,
 // buffer, to be written into guest memory when the frame is done.
 void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch,
                           HostTexture& dest) {
-  if (!ResolveReadbackOn() || !dest.texture || dest.scale == 0) {
+  if (!ResolveReadbackOn() || !dest.texture || dest.halfScale == 0) {
     return;
   }
-  uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
+  uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
   // An F7 trace also writes the small resolves (up to 512x512: a shadow map, a reflection,
   // a ripple map) as the GPU holds them, into its folder.
   // (NG2_TRACE_RESOLVE_MAX=<side>: bigger ones too, the scene's copies)
@@ -8108,7 +8219,7 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
       RenderTextureCopyLocation::Subresource(dest.texture.get()));
   ResolveReadbackItem item;
   item.address = address, item.fetch = fetch, item.info = info;
-  item.width = width, item.height = height, item.scale = dest.scale, item.rowWidth = rowWidth;
+  item.width = width, item.height = height, item.halfScale = dest.halfScale, item.rowWidth = rowWidth;
   item.format = dest.format, item.buffer = r.buffer.get(), item.offset = offset;
   item.toGuest = toGuest;
   if (dump) {
@@ -8194,9 +8305,9 @@ void ApplyResolveReadbacks(uint32_t frame) {
       if (data && !item.dumpPath.empty()) {
         if (FILE* f = std::fopen(item.dumpPath.c_str(), "wb")) {
           uint32_t bytes = RenderFormatSize(item.format);
-          for (uint32_t y = 0; y < item.height * item.scale; y++) {
+          for (uint32_t y = 0; y < HostCoord(item.height, item.halfScale); y++) {
             std::fwrite(data + item.offset + uint64_t(y) * item.rowWidth * bytes, bytes,
-                        item.width * item.scale, f);
+                        HostCoord(item.width, item.halfScale), f);
           }
           std::fclose(f);
         }
@@ -8347,10 +8458,12 @@ void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], ui
   // to clear.
   int32_t limitX = int32_t(target ? target->width : depth->width);
   int32_t limitY = int32_t(target ? target->height : depth->height);
-  int32_t scale = int32_t(target ? target->scale : depth->scale);  // guest to host pixels
+  uint32_t half = target ? target->halfScale : depth->halfScale;  // guest to host pixels
   // As D3D's Clear, within the scissor while the game has it on (a whole
   // target clear then clears the scissor's rect).
-  int32_t guestX = limitX / scale, guestY = limitY / scale;
+  // (the guest size back from the host one: HostCoord rounds half pixels down)
+  int32_t guestX = int32_t((uint32_t(limitX) * 2 + half - 1) / half);
+  int32_t guestY = int32_t((uint32_t(limitY) * 2 + half - 1) / half);
   int32_t clip[4] = {0, 0, guestX, guestY};
   bool scissor = guest::Load32(device + kScissorEnable) != 0;
   if (scissor) {
@@ -8368,10 +8481,10 @@ void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], ui
   std::vector<RenderRect> clearRects;
   for (uint32_t i = 0; i < sourceCount; i++) {
     // Clamped in guest pixels first: huge rects would overflow when scaled.
-    RenderRect rect(std::clamp(sources[i][0], clip[0], std::max(clip[0], clip[2])) * scale,
-                    std::clamp(sources[i][1], clip[1], std::max(clip[1], clip[3])) * scale,
-                    std::clamp(sources[i][2], clip[0], std::max(clip[0], clip[2])) * scale,
-                    std::clamp(sources[i][3], clip[1], std::max(clip[1], clip[3])) * scale);
+    RenderRect rect(HostCoord(std::clamp(sources[i][0], clip[0], std::max(clip[0], clip[2])), half),
+                    HostCoord(std::clamp(sources[i][1], clip[1], std::max(clip[1], clip[3])), half),
+                    HostCoord(std::clamp(sources[i][2], clip[0], std::max(clip[0], clip[2])), half),
+                    HostCoord(std::clamp(sources[i][3], clip[1], std::max(clip[1], clip[3])), half));
     if (rect.right > rect.left && rect.bottom > rect.top) {
       clearRects.push_back(rect);
     }
@@ -8455,7 +8568,7 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
   if (target && destTexture) {
     auto fetch = ReadTextureFetch(destTexture);
     uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
-    HostTexture* dest = GetResolveDestination(address, fetch, target->scale);
+    HostTexture* dest = GetResolveDestination(address, fetch, target->halfScale);
     if (dest) {
       NoteCarriedWrite(dest);
       int32_t x1 = 0, y1 = 0, x2 = int32_t(target->width), y2 = int32_t(target->height);
@@ -8469,10 +8582,11 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
       uint32_t dy = destPoint ? guest::Load32(destPoint + 4) : 0;
       // Guest pixels to the targets' host pixels.
       if (sourceRect) {
-        int32_t scale = int32_t(target->scale);
-        x1 *= scale, y1 *= scale, x2 *= scale, y2 *= scale;
+        uint32_t half = target->halfScale;
+        x1 = HostCoord(x1, half), y1 = HostCoord(y1, half);
+        x2 = HostCoord(x2, half), y2 = HostCoord(y2, half);
       }
-      dx *= target->scale, dy *= target->scale;
+      dx = HostCoord(dx, target->halfScale), dy = HostCoord(dy, target->halfScale);
       if (dx < dest->width && dy < dest->height) {
         x1 = std::max(x1, 0);
         y1 = std::max(y1, 0);
@@ -8709,9 +8823,31 @@ void UpdateGammaTable(uint32_t device) {
 // A new render_scale or antialiasing, between frames: the render targets are
 // made again at the new size and sample count (their contents start over).
 void ApplyRenderScale() {
-  uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
+  uint32_t scale = RenderScaleHalves();
   uint32_t samples = AntialiasingSetting();
+  uint32_t finalScale = FinalScaleFor(scale);
+  if (scale == g_resolutionScale && samples == g_antialiasing && finalScale == g_finalScale) {
+    return;
+  }
   if (scale == g_resolutionScale && samples == g_antialiasing) {
+    // Only the final picture's (the window crossed a size): its targets alone.
+    WaitForGPU();
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end();) {
+      if (!FinalTarget(it->first.width, it->first.height)) {
+        ++it;
+        continue;
+      }
+      const HostTexture* texture = it->second.get();
+      if (auto temp = g_resolveTemps.find(texture); temp != g_resolveTemps.end()) {
+        g_descriptors.Free(temp->second->descriptor);
+        g_resolveTemps.erase(temp);
+      }
+      ForgetTexture(texture);
+      g_descriptors.Free(it->second->descriptor);
+      it = g_surfaces.erase(it);
+    }
+    g_finalScale = finalScale;
+    REXLOG_INFO("video: final picture at {}", ScaleOf(finalScale));
     return;
   }
   WaitForGPU();
@@ -8729,7 +8865,9 @@ void ApplyRenderScale() {
   // made again at the new scale by its next resolve (GetResolveDestination).
   g_resolutionScale = scale;
   g_antialiasing = samples;
-  REXLOG_INFO("video: render scale {}, antialiasing {}", scale, samples);
+  g_finalScale = finalScale;
+  REXLOG_INFO("video: render scale {}, antialiasing {}, final picture at {}", ScaleOf(scale), samples,
+              ScaleOf(finalScale));
 }
 
 void RunSwap(uint32_t device, uint32_t frontBuffer) {

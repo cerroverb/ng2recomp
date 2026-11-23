@@ -61,6 +61,7 @@ class Ng2App : public rex::ReXApp {
       paths.config_path = config;
     }
     ng2::recomp_settings::SetConfigPath(paths.config_path);
+    ng2::recomp_settings::RepairConfig(paths.config_path);  // (before the SDK loads it)
     ng2::video::SetPipelineListPath(paths.config_path.parent_path() / "ng2-pipelines.bin");
     ng2::recomp_settings::SetAppContext(&app_context());
     ng2::controls::SetAppContext(&app_context());
@@ -73,6 +74,7 @@ class Ng2App : public rex::ReXApp {
   // it would bring up a firewall prompt).
   void OnPostInitLogging() override {
     ng2::stderr_log::Start();  // the libraries' and the driver's errors into ng2.log
+    ng2::recomp_settings::ReportConfigRepair();
     for (auto [name, value] : {std::pair{"protect_zero", "false"}, {"net_bind_loopback", "true"}}) {
       const auto* info = rex::cvar::GetFlagInfo(name);
       if (info && info->source == rex::cvar::Source::kDefault) {

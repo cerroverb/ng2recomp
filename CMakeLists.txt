@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 VERSION 0.7.0 LANGUAGES CXX)
+project(ng2 VERSION 0.7.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,38 @@ if(CMAKE_CROSSCOMPILING)
     endif()
     set_target_properties(rex::rexglue PROPERTIES
         IMPORTED_LOCATION "${NG2_HOST_REXGLUE}" IMPORTED_LOCATION_RELEASE "${NG2_HOST_REXGLUE}")
+endif()
+
+# A tree whose code was never generated (a fresh clone): rexglue.cmake lists
+# the generated sources only if they exist as it is read, so a first build
+# would generate them and compile none. They are generated now, once, and
+# taken in as rexglue.cmake would have.
+if(NOT REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
+    get_target_property(NG2_CODEGEN_TOOL rex::rexglue IMPORTED_LOCATION_RELEASE)
+    if(NOT NG2_CODEGEN_TOOL)
+        get_target_property(NG2_CODEGEN_TOOL rex::rexglue IMPORTED_LOCATION)
+    endif()
+endif()
+if(NOT REXGLUE_ENTRYPOINT_GENERATED_SOURCES AND NOT EXISTS "${NG2_CODEGEN_TOOL}")
+    # (no built generator to run now: a Debug-only SDK, or one built in this
+    # tree; the first build generates the code, and CMake run again takes it in)
+    message(WARNING "No ReXGlue code generator to run at configure time: build once, "
+                    "then run CMake again before the second build")
+elseif(NOT REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
+    message(STATUS "Generating the recompiled code (first configure of this tree)")
+    execute_process(
+        COMMAND "${NG2_CODEGEN_TOOL}" codegen "${CMAKE_CURRENT_SOURCE_DIR}/ng2_manifest.toml"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE NG2_CODEGEN_RESULT)
+    if(NOT NG2_CODEGEN_RESULT EQUAL 0 OR
+       NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/sources.cmake")
+        message(FATAL_ERROR "Code generation failed (${NG2_CODEGEN_TOOL}): is game_files/ in place?")
+    endif()
+    include(generated/default/sources.cmake)
+    set(REXGLUE_ENTRYPOINT_GENERATED_SOURCES ${GENERATED_SOURCES})
+    set(REXGLUE_ENTRYPOINT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/default")
+    set_source_files_properties(${REXGLUE_ENTRYPOINT_GENERATED_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "${REXGLUE_RECOMP_OPTIONS}")
 endif()
 
 # Sources
@@ -61,6 +93,8 @@ set(NG2_SOURCES
     src/movie/host_movie.cpp
     src/debug_waits.cpp
     src/room_jump.cpp
+    src/stage_jump.cpp
+    src/base_resolution.cpp
     src/cheats.cpp
     src/rebind.cpp
     src/menu_mouse.cpp
@@ -198,7 +232,7 @@ else()
 endif()
 
 # Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
-# Wayland surface support from patches/plume.
+# Wayland surface support from the plume fork.
 # (the SDK's Vulkan headers, newer than plume's: VK_EXT_present_timing)
 set(PLUME_VULKAN_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk/thirdparty/vulkan-headers/include)
 add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)

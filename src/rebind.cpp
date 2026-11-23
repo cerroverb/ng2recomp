@@ -15,7 +15,7 @@
 //
 // With every binding here at its default the game's layout is left alone.
 // Otherwise the slots are written from these before each input update, with
-// the cached masks: an action on its button's slot, Water Run and Ninpo on a
+// the cached masks: an action on its button's slot, Wind Run and Ninpo on a
 // button's slot too or, bound to two buttons, on the first two pair slots.
 // Those slots' bits are the game's for A+X and B+Y, made by the character's
 // input (sub_823B7470(input, pad record, wanted pair): into the buttons
@@ -57,7 +57,7 @@ REXCVAR_DEFINE_INT32(pad_quick_attack, 2, "Controls", "Quick Attack's button");
 REXCVAR_DEFINE_INT32(pad_strong_attack, 3, "Controls", "Strong Attack's button");
 REXCVAR_DEFINE_INT32(pad_projectile, 1, "Controls", "Projectile Weapon's button");
 REXCVAR_DEFINE_INT32(pad_ninpo, 0x113, "Controls", "Ninpo's button, or two (0x100 + 16 * first + second)");
-REXCVAR_DEFINE_INT32(pad_water_run, 0x102, "Controls", "Water Run's button, or two");
+REXCVAR_DEFINE_INT32(pad_water_run, 0x102, "Controls", "Wind Run's button, or two");
 REXCVAR_DEFINE_INT32(pad_block, 6, "Controls", "Block's button");
 REXCVAR_DEFINE_INT32(pad_center_camera, 7, "Controls", "Center Camera's button");
 REXCVAR_DEFINE_INT32(pad_first_person, 4, "Controls", "1st-Person View's button");
@@ -68,7 +68,7 @@ REXCVAR_DEFINE_STRING(key_quick_attack, "LMB,J", "Controls", "Quick Attack's key
 REXCVAR_DEFINE_STRING(key_strong_attack, "RMB,K", "Controls", "Strong Attack's keys");
 REXCVAR_DEFINE_STRING(key_projectile, "E", "Controls", "Projectile Weapon's keys");
 REXCVAR_DEFINE_STRING(key_ninpo, "F", "Controls", "Ninpo's keys");
-REXCVAR_DEFINE_STRING(key_water_run, "C", "Controls", "Water Run's keys");
+REXCVAR_DEFINE_STRING(key_water_run, "C", "Controls", "Wind Run's keys");
 REXCVAR_DEFINE_STRING(key_block, "Shift", "Controls", "Block's keys");
 REXCVAR_DEFINE_STRING(key_center_camera, "Q,MMB", "Controls", "Center Camera's keys");
 REXCVAR_DEFINE_STRING(key_first_person, "R", "Controls", "1st-Person View's keys");
@@ -106,13 +106,13 @@ constexpr char16_t kButtonLetters[] = {u'A', u'B', u'X', u'Y', u'l', u'r', u'L',
 
 // The game's action ids (0: one of ours only, with no slot).
 enum Id : uint32_t {
-  kNoId = 0, kNinpo = 1, kWaterRun = 2, kJump = 3, kProjectile = 4, kQuick = 5, kStrong = 6,
+  kNoId = 0, kNinpo = 1, kWindRun = 2, kJump = 3, kProjectile = 4, kQuick = 5, kStrong = 6,
   kBlock = 7, kCenterCamera = 8, kInteract = 12, kFirstPerson = 13,
 };
 // The cached masks: the action at each field of a player's.
 constexpr std::pair<uint32_t, Id> kCachedFields[] = {
     {8, kQuick}, {12, kProjectile}, {16, kNinpo},  {24, kStrong},
-    {28, kJump}, {32, kBlock},      {36, kWaterRun}, {72, kCenterCamera},
+    {28, kJump}, {32, kBlock},      {36, kWindRun}, {72, kCenterCamera},
 };
 
 struct Action {
@@ -129,7 +129,7 @@ constexpr Action kTable[kActions] = {
     {u"Strong Attack", "key_strong_attack", "pad_strong_attack", kStrong},
     {u"Projectile Weapon", "key_projectile", "pad_projectile", kProjectile},
     {u"Ninpo", "key_ninpo", "pad_ninpo", kNinpo},
-    {u"Water Run", "key_water_run", "pad_water_run", kWaterRun},
+    {u"Wind Run", "key_water_run", "pad_water_run", kWindRun},
     {u"Block", "key_block", "pad_block", kBlock},
     {u"Center Camera", "key_center_camera", "pad_center_camera", kCenterCamera},
     {u"1st-Person View", "key_first_person", "pad_first_person", kFirstPerson},
@@ -212,7 +212,7 @@ void Store16(uint32_t address, uint16_t value) {
 }
 
 // The pair slots' two buttons while the slots are ours (masks; 0: none):
-// slot 8 Water Run's, slot 9 Ninpo's. Read by the character's input.
+// slot 8 Wind Run's, slot 9 Ninpo's. Read by the character's input.
 std::atomic<uint32_t> g_pairMasks[2][2] = {};
 std::atomic<bool> g_ours{false};
 
@@ -382,7 +382,7 @@ bool PadFixed(int action) {
   return kTable[action].pad == nullptr;
 }
 bool PadPairs(int action) {
-  return kTable[action].id == kNinpo || kTable[action].id == kWaterRun;
+  return kTable[action].id == kNinpo || kTable[action].id == kWindRun;
 }
 int Pad(int action) {
   return PadOf(action);
@@ -574,7 +574,7 @@ void ApplyPad() {
     return;
   }
   // The slots from these settings. A pair the game has goes on its slot
-  // (its own input makes its bit); another on slot 8 (Water Run) or 9
+  // (its own input makes its bit); another on slot 8 (Wind Run) or 9
   // (Ninpo), whichever is free, made here (sub_823B7470's hook) with its
   // prompt letters.
   uint32_t slots[kSlotCount] = {};
@@ -596,7 +596,7 @@ void ApplyPad() {
     if (!IsPair(binding) || BuiltInPairSlot(binding) >= 0) {
       continue;
     }
-    int slot = kTable[a].id == kWaterRun ? 8 : 9;
+    int slot = kTable[a].id == kWindRun ? 8 : 9;
     if (slots[slot]) {
       slot = slot == 8 ? 9 : 8;
     }
@@ -681,4 +681,40 @@ REX_HOOK_RAW(sub_823B7470) {
     }
   }
   Store32(input + 16, made);
+}
+
+// The game's own "an action's button held" (sub_82411598(action): the
+// profile's slots holding it, each tested in the pad's held buttons; asked
+// for Block, which holds essence back while held, and Strong Attack) tests
+// LB's and RB's slots with other buttons' bits (0x400, 0x800, the sticks'
+// clicks), not 0x1000 and 0x2000: an action on LB or RB is never held for
+// it (#142: Block on RB let essence be absorbed), and a stick's click holds
+// it. (The game's own layouts put only Interact and 1st-Person View there.)
+// Answered here as it does, with LB's and RB's buttons: a button's slot by
+// its bit, a pair's by both of its two.
+REX_EXTERN(__imp__sub_82411598);
+REX_HOOK_RAW(sub_82411598) {
+  using namespace ng2::rebind;
+  using ng2::guest::Load32;
+  uint32_t action = ctx.r3.u32;
+  uint32_t profile = Load32(kProfile);
+  if (profile < 0x40000000u || profile >= 0xA0000000u) {
+    __imp__sub_82411598(ctx, base);
+    return;
+  }
+  // Its pad: the demo's (5) while one plays, else the player's.
+  constexpr uint32_t kDemoMode = 0x83BD1C68, kPlayerPad = 0x84C3DA3E;
+  uint32_t pad = Load32(kDemoMode) == 2 ? 5 : ng2::guest::Virtual(kPlayerPad)[0];
+  uint32_t held = Load32(kPadRecords + kPadRecordSize * pad);
+  // The pair slots' two buttons (A+X, B+Y, X+Y, A+B), as it tests them.
+  constexpr uint32_t kPairBits[4] = {0x10 | 0x40, 0x20 | 0x80, 0x40 | 0x80, 0x10 | 0x20};
+  bool isHeld = false;
+  for (uint32_t slot = 0; slot < kSlotCount && !isHeld; slot++) {
+    if (Load32(profile + kSlots + 4 * slot) != action) {
+      continue;
+    }
+    uint32_t bits = slot < 8 ? Load32(kMasks + 4 * slot) : kPairBits[slot - 8];
+    isHeld = bits != 0 && (held & bits) == bits;
+  }
+  ctx.r3.u64 = isHeld ? 1 : 0;
 }

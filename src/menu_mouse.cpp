@@ -25,7 +25,7 @@ namespace ng2::menu_mouse {
 
 namespace {
 
-constexpr uint32_t kA = 0x10, kB = 0x20, kY = 0x80, kUp = 0x1, kDown = 0x2, kLeft = 0x4, kRight = 0x8;  // the game's pad bits
+constexpr uint32_t kA = 0x10, kB = 0x20, kX = 0x40, kY = 0x80, kUp = 0x1, kDown = 0x2, kLeft = 0x4, kRight = 0x8;  // the game's pad bits
 
 std::atomic<bool> g_menu{false};
 // Clicks not yet pressed: each one press of a frame, with a frame let go
@@ -168,6 +168,23 @@ bool MenuInputLately() {
   return at && Frame() + 1 - at <= 2;
 }
 
+std::atomic<bool> g_stage{false};
+void NoteStage(bool on) {
+  g_stage.store(on, std::memory_order_relaxed);
+}
+bool InStage() {
+  return g_stage.load(std::memory_order_relaxed);
+}
+
+std::atomic<uint64_t> g_deleteClearsFrame{0};
+void DeleteClears() {
+  g_deleteClearsFrame.store(Frame() + 1, std::memory_order_relaxed);
+}
+bool DeleteClearsNow() {
+  uint64_t at = g_deleteClearsFrame.load(std::memory_order_relaxed);
+  return at && Frame() + 1 - at <= 2;
+}
+
 bool Pointer(float* x, float* y);
 
 // An arrow drawn lately.
@@ -223,7 +240,7 @@ uint32_t PadBits() {
     g_rightClicks.fetch_sub(1);
   }
   if (g_middleClicks.load() > 0) {
-    bits |= kY;  // (the load screen's Delete)
+    bits |= DeleteClearsNow() ? kX : kY;  // (the load screen's Delete; the Controls table's Clear)
     g_middleClicks.fetch_sub(1);
   }
   if (int wheel = g_wheel.load(); wheel) {

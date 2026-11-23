@@ -198,6 +198,7 @@ void LogBoxes() {
 }
 
 std::atomic<uint64_t> g_menuDrawnFrame{0};  // (+1: 0 is never)
+std::atomic<uint64_t> g_manualDrawnFrame{0};  // bucket 71: the in-game manual's pages (+1)
 int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -214,6 +215,9 @@ void DrawTagged(PPCContext& ctx, uint8_t* base, void (*draw)(PPCContext&, uint8_
   // (not bucket 20: play draws there too)
   if (g_drawBucket >= 0 && g_drawBucket != 20 && MenuBucket(g_drawBucket)) {
     g_menuDrawnFrame.store(ng2::menu_mouse::Frame() + 1, std::memory_order_relaxed);
+    if (g_drawBucket == 71) {
+      g_manualDrawnFrame.store(ng2::menu_mouse::Frame() + 1, std::memory_order_relaxed);
+    }
   }
   g_drawItem = ctx.r3.u32;
   draw(ctx, base);
@@ -355,6 +359,11 @@ bool g_constantWritable = false;
 
 bool HudShown() {
   return g_hudShown.load(std::memory_order_relaxed);
+}
+
+bool ManualShown() {
+  uint64_t at = g_manualDrawnFrame.load(std::memory_order_relaxed);
+  return at && ng2::menu_mouse::Frame() + 1 - at <= 2;
 }
 
 bool MenuShown() {

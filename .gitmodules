@@ -1,0 +1,15 @@
+[submodule "thirdparty/rexglue-sdk"]
+	path = thirdparty/rexglue-sdk
+	url = https://github.com/gamboozino/rexglue-sdk.git
+	branch = ng2
+	ignore = untracked
+[submodule "thirdparty/XenosRecomp"]
+	path = thirdparty/XenosRecomp
+	url = https://github.com/gamboozino/XenosRecomp.git
+	branch = ng2
+	ignore = untracked
+[submodule "thirdparty/plume"]
+	path = thirdparty/plume
+	url = https://github.com/gamboozino/plume.git
+	branch = ng2
+	ignore = untracked

@@ -10,7 +10,7 @@
 # glibc, zstd, the Vulkan loader and drivers, and the X11/Wayland libraries are the system's.
 #
 # The build runs in out/portable (NG2_PORTABLE_DIR): a copy of the sources in src/ (the code
-# generator writes into the tree), with the SDK patches already applied in thirdparty/, and
+# generator writes into the tree), with the submodules in thirdparty/ checked out, and
 # the SDK's and the game's build trees. The game's default.xex (and
 # default.xexp) are read from game_files/ (NG2_GAME_DIR) for the code and shaders. No game data
 # goes into the AppImage. packaging/appimage/build-local.sh is the quick, unportable build for

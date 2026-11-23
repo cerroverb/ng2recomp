@@ -45,8 +45,8 @@ Pull requests are welcome. A patch attached to an issue works too.
   the game).
 - **Fixes** that make the port match the Xbox 360 can be on by default. Check them against Xenia.
 - **Enhancements** that change the original look or behaviour go behind a setting, off by default.
-- Changes to the SDK, XenosRecomp or plume go in `patches/` as `git format-patch` files; the
-  checkouts in `thirdparty/` aren't committed. Don't edit `generated/`; it is regenerated from each
+- Changes to the SDK, XenosRecomp or plume are commits on the `ng2` branch of their forks
+  (the submodules in `thirdparty/`), and the submodule's new commit in this repository. Don't edit `generated/`; it is regenerated from each
   person's disc.
 - Commit messages start with the area when it helps (`Renderer:`, `Menus:`, `Audio:`, ...) and name
   the issue.

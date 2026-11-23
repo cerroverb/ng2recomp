@@ -9,7 +9,7 @@
 //   W A S D    left stick (move)          mouse       right stick (camera)
 //   left mouse, J   X (quick attack)      right mouse, K   Y (strong attack)
 //   Space      A (jump)                   E           B (projectile weapon)
-//   F          Y + B (ninpo)              C           A + X (water run)
+//   F          Y + B (ninpo)              C           A + X (wind run)
 //   Shift      LT (block)                 Q, middle mouse   RT
 //   R          LB                         V           RB
 //   Z / X      stick clicks               Tab         BACK
@@ -17,7 +17,10 @@
 //   Return, Backspace: A and B too (menus)
 //
 // Whichever of the keyboard and a pad was used last is the one in use (the
-// SDK's input system); the button prompts follow it (gpu/prompts.cpp), the
+// SDK's input system, input_last_used_only): only it plays, and a key or
+// click while a pad is in use only makes the keyboard the one in use (the
+// keys play from the next press: a key bumped presses nothing, #141); the
+// button prompts follow it (gpu/prompts.cpp), the
 // mouse moves the camera only then, and the pointer is hidden while a pad
 // is in use. (Shift can be bound: SDK patch 0017.)
 
@@ -106,6 +109,7 @@ Device ActiveDevice() {
 void ApplyDefaults() {
   static constexpr std::pair<const char*, const char*> kDefaults[] = {
       {"mnk_mode", "true"},
+      {"input_last_used_only", "true"},  // (the keys don't play while a pad is in use: #141)
       {"mnk_mouse", "true"},
       {"keybind_a", "Space,C,Return"},
       {"keybind_b", "E,F,Backspace"},
@@ -163,7 +167,11 @@ void Frame() {
   // A menu up: the pointer free and shown, its buttons and wheel the
   // menus' (menu_mouse.cpp).
   // (not in play: the title's screens, loading; or a menu over play)
-  bool menu = !(ng2::aspect::HudShown() || HudInPlay()) || ng2::aspect::MenuShown() ||
+  bool play = ng2::aspect::HudShown() || HudInPlay();
+  if (play) {
+    ng2::menu_mouse::NoteStage(true);
+  }
+  bool menu = !play || ng2::aspect::MenuShown() ||
               ng2::menu_mouse::MenuInputLately();
   // (not under the SDK's own overlay, F3/F4: its clicks are its own)
   ng2::menu_mouse::SetMenu(menu && !overlay);

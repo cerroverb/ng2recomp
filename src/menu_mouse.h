@@ -34,6 +34,14 @@ bool MenuInputLately();
 // The pad's bits the mouse (and Delete) press this frame (the game's: A
 // 0x10, B 0x20, Y 0x80, d-pad up 1, down 2), just before the pads are merged.
 uint32_t PadBits();
+// A stage is on (its HUD asked for), or the title menu is up: its menus are
+// the pause menu's then, whose X and Y prompts are play's (the command list).
+void NoteStage(bool on);
+bool InStage();
+// The Controls table takes input this frame: the Delete key is X there
+// (Clear), not Y.
+void DeleteClears();
+bool DeleteClearsNow();
 // Where the pointer is, in the game's 1280x720 UI (false: not known).
 bool Pointer(float* x, float* y);
 // The mouse was moved, clicked or wheeled in a menu since this was last

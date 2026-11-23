@@ -22,6 +22,9 @@ bool HudShown();
 // A menu's 2D was drawn lately (its buckets: the title's, the in-game
 // list): the mouse is the menus' (menu_mouse.cpp).
 bool MenuShown();
+// The in-game manual's pages are up (bucket 71; the pause list alone is 70
+// and 72, the inventory 49 and 50).
+bool ManualShown();
 
 // A draw now is the 2D pass's (HUD, menus; render thread).
 bool In2DPass();

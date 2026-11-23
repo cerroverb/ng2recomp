@@ -22,7 +22,7 @@ the cache, so a shader that only appears at runtime is noticed.
    and writes the decrypted, decompressed image (identical to the one the game
    runs with).
 2. XenosRecomp (built as an ExternalProject from `thirdparty/XenosRecomp`,
-   upstream 990d03b plus `patches/xenosrecomp/`) scans it and writes
+   a fork of upstream 990d03b with this port's changes on its `ng2` branch) scans it and writes
    `shaders/ng2_shader_cache.cpp` in the build directory. Any shader that fails
    to compile fails the build.
 
@@ -34,7 +34,7 @@ translates one.
 
 ## What NG2 needed beyond Unleashed
 
-The patch (`patches/xenosrecomp/0001-*.patch`):
+The first change on the fork's `ng2` branch:
 
 - Memory export. 64 vertex shaders are GPU passes drawn one vertex per output
   (skinning and the like): they read their inputs by index and write results

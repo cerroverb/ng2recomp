@@ -3,7 +3,7 @@
 This project's own code is under the GNU General Public License, version 3 or (at your option) any
 later version (GPL-3.0-or-later, [LICENSE](LICENSE)). It is built from, and its packages contain, the
 following parts, each under its own license. None of them is copied into this repository: they are
-checked out into `thirdparty/` at pinned versions, with this port's changes applied from `patches/`.
+submodules in `thirdparty/`: forks at pinned versions, with this port's changes on their `ng2` branches.
 
 ## Built into the game
 
@@ -56,7 +56,7 @@ notice:
     author's terms. Weapon Property Fixes is ported from Fiend Busa's Ninja Gaiden 2 Black mod. Ninja Gaiden II is a
     trademark of its owners; you need your own copy of the game.
 
-This port's changes to the ReXGlue SDK's recompiler (`patches/rexglue-sdk/0025`, `0026`) include parts
+This port's changes to the ReXGlue SDK's recompiler (commits 7087d634 and 6280e95c of its fork) include parts
 taken from [IzunaRecomp](https://github.com/YaibaKamikaze/IzunaRecomp) (MIT): the detection of the
 game's busy-wait loops (`IsSpinLoopHead`), and the plain guest memory accesses with a compiler barrier
 at each label. Its notice:

@@ -8,12 +8,9 @@ generated/default/
 out/
 *.log
 
-# local SDK/source checkouts (pinned as submodules later)
-thirdparty/rexglue-sdk/
+# local reference checkouts (the SDK, XenosRecomp and plume are submodules)
 thirdparty/rexglue-wiki/
 thirdparty/UnleashedRecomp/
-thirdparty/XenosRecomp/
-thirdparty/plume/
 thirdparty/xenia-edge/
 
 CMakeUserPresets.json
