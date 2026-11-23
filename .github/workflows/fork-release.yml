@@ -145,21 +145,10 @@ jobs:
           done
           clang --version | head -1
 
-      - name: SDK, XenosRecomp and plume at the pinned versions, with the port's patches
-        # (the pins as the README's build steps name them)
-        run: |
-          pin() { sed -n "s/.*$1 && git checkout \([^ ]*\) .*/\1/p" README.md | head -1; }
-          get() {  # <dir> <url> <pin> <patch dir> [submodules...]
-            local dir=$1 url=$2 rev=$3 patches=$4; shift 4
-            [ -n "$rev" ] || { echo "::error::no pin for $dir in the README"; exit 1; }
-            git clone -q "$url" "$dir" && git -C "$dir" checkout -q --detach "$rev"
-            git -C "$dir" submodule update -q --init --recursive "$@"
-            git -C "$dir" am -q "$GITHUB_WORKSPACE/$patches"/*.patch
-          }
-          get thirdparty/rexglue-sdk https://github.com/rexglue/rexglue-sdk "$(pin rexglue-sdk)" patches/rexglue-sdk
-          get thirdparty/XenosRecomp https://github.com/hedge-dev/XenosRecomp "$(pin XenosRecomp)" patches/xenosrecomp
-          get thirdparty/plume https://github.com/renderbag/plume "$(pin plume)" patches/plume \
-            contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
+      - name: SDK, XenosRecomp and plume
+        # (the submodules at the commits the release pins, upstream's forks with the port's changes on their ng2
+        # branch, as README build step 1 clones them)
+        run: git submodule update -q --init --recursive
 
       - name: Native SDK, code generation and shaders
         # (README build steps 1 and 4: the code generator's output and the shader cache the ARM build uses)
