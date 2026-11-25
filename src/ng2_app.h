@@ -21,6 +21,7 @@
 #include "aspect.h"
 #include "camera.h"
 #include "dlc.h"
+#include "game_icon.h"
 #include "gameplay.h"
 #include "mods.h"
 #include "gpu/native_gpu.h"
@@ -74,6 +75,9 @@ class Ng2App : public rex::ReXApp {
   // it would bring up a firewall prompt).
   void OnPostInitLogging() override {
     ng2::stderr_log::Start();  // the libraries' and the driver's errors into ng2.log
+    // The window's icon from the game's own title art, made once and kept
+    // in the data folder (next to the saves' folder, as mods-cache).
+    ng2::game_icon::Start(&app_context(), game_data_root(), user_data_root().parent_path() / "icon");
     ng2::recomp_settings::ReportConfigRepair();
     for (auto [name, value] : {std::pair{"protect_zero", "false"}, {"net_bind_loopback", "true"}}) {
       const auto* info = rex::cvar::GetFlagInfo(name);
@@ -157,6 +161,7 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    ng2::game_icon::Stop();
     if (ng2::video::IsNativeRenderer()) {
       ng2::video::DestroyHostDevice();
     }

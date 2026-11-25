@@ -101,6 +101,8 @@ set(NG2_SOURCES
     src/frame_wait.cpp
     src/dlc.cpp
     src/mods.cpp
+    src/game_icon.cpp
+    src/game_icon_window.cpp
     src/stderr_log.cpp
     src/gameplay.cpp
     src/game_fixes.cpp
