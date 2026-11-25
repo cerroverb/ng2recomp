@@ -25,6 +25,10 @@ import urllib.request
 if sys.version_info < (3, 11):
     sys.exit("fetch-sysroot.py needs Python 3.11 or newer (hashlib.file_digest)")
 socket.setdefaulttimeout(60)  # (a stalled download fails instead of hanging)
+# ports.ubuntu.com answers 403 to Python's default User-Agent for files in pool/ (since 2026-11-24).
+_opener = urllib.request.build_opener()
+_opener.addheaders = [("User-Agent", "ng2recomp-fetch-sysroot")]
+urllib.request.install_opener(_opener)
 
 ARCHIVE = "https://ports.ubuntu.com/ubuntu-ports"
 # Later suites replace the packages of earlier ones (noble-updates carries the security fixes too).
