@@ -142,6 +142,10 @@ devices, and none of the player's settings or saves.
   `NG2_TRACE_FRAMES` (60) frames and a small picture every 10, in `~/ng2-trace-<n>` (`HOME` decides
   where).
 - `NG2_DUMP_TEXTURES=<dir>`: write decoded textures (PGM/PAM/DDS).
+- `NG2_DUMP_PROMPT_ATLAS=<dir>`: write the game's button atlas and palette as loaded (`atlas.bin`,
+  `palette.bin`, in a stage), the input of `tools/make_prompts.py`, which makes `src/gpu/prompt_sets.inc`
+  (the PlayStation, Nintendo and keyboard prompts as patches on them, from `tools/prompt_art.py`).
+  `NG2_PROMPTS=ps|nintendo|keys|xbox` shows a set whatever the setting.
 - `NG2_TRACE_PICTURES=<n>`: a trace picture every n frames (10; 0: none). `NG2_TRACE_PICTURES_ONLY=1`:
   F7 takes the pictures alone, no draws or memory (a trace's own stall can hide what it's after).
   `NG2_TRACE_STACKS=1`: each traced draw with its guest call chain. Traced draws carry their shader

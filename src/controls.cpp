@@ -70,27 +70,6 @@ void SetAppContext(rex::ui::WindowedAppContext* context) {
   g_appContext = context;
 }
 
-// A Steam Deck: Steam's SteamDeck=1, or the board's name (LCD Jupiter, OLED
-// Galileo) when started without Steam.
-static bool OnSteamDeck() {
-  static const bool deck = [] {
-    if (const char* v = std::getenv("SteamDeck"); v && *v) {
-      return std::strcmp(v, "1") == 0;
-    }
-#if defined(__linux__)
-    if (FILE* f = std::fopen("/sys/devices/virtual/dmi/id/board_name", "r")) {
-      char name[32] = {};
-      bool match = std::fgets(name, sizeof(name), f) &&
-                   (std::strncmp(name, "Jupiter", 7) == 0 || std::strncmp(name, "Galileo", 7) == 0);
-      std::fclose(f);
-      return match;
-    }
-#endif
-    return false;
-  }();
-  return deck;
-}
-
 Device ActiveDevice() {
   auto* runtime = rex::Runtime::instance();
   auto* input = runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
@@ -98,7 +77,7 @@ Device ActiveDevice() {
     return Device::kUnknown;
   }
   switch (input->ActiveKind(0)) {
-    case rex::input::DeviceKind::kXbox: return OnSteamDeck() ? Device::kSteamDeck : Device::kXbox;
+    case rex::input::DeviceKind::kXbox: return Device::kXbox;
     case rex::input::DeviceKind::kPlayStation: return Device::kPlayStation;
     case rex::input::DeviceKind::kNintendo: return Device::kNintendo;
     case rex::input::DeviceKind::kKeyboard: return Device::kKeyboard;

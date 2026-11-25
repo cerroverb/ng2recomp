@@ -10,7 +10,7 @@ recompiling the game's own PowerPC code to run directly on a PC, not an emulator
 takes over the game's Direct3D calls instead of emulating the Xbox 360 GPU. It plays at a steady
 60 fps on modest hardware (the Steam Deck is the baseline) and adds PC options in the game's own
 menus: higher render resolutions, widescreen and ultrawide, anti-aliasing, keyboard and mouse,
-PlayStation, Nintendo and Steam Deck button prompts, and more.
+PlayStation, Nintendo and keyboard button prompts in the game's own style, and more.
 
 **You need your own copy of the game.** This project contains none of the game's data (graphics,
 sound, movies, text): on first start it asks for your disc image, Games on Demand package or
@@ -26,7 +26,8 @@ is supported and optional: it can be added on the first start or later.
 - 16:9, 16:10, 21:9, 32:9 and 4:3: the 3D fills the screen, the HUD goes to the screen's corners,
   the menus and movies keep their own frame
 - Keyboard and mouse, with the keys' own pictures in the game's button prompts; Xbox,
-  PlayStation, Nintendo and Steam Deck prompts, following the controller in use
+  PlayStation and Nintendo prompts, following the controller in use. The PlayStation, Nintendo
+  and keyboard buttons are made from the game's own (its discs, plates and ovals, relettered)
 - Options from alicenotmech's Master Edition, in the port's own versions: skip the death screen,
   chapter cards that go on by themselves, a HUD that fades out when not fighting (or hidden),
   no post-effects, smoother HUD and menus, a sharper font, hi-res shadows in fights; and its Modern
@@ -181,8 +182,8 @@ each defaults to the game's own behaviour.
   on; the save keeps your own)
 - **Interface**: HUD (shown, fading out when not fighting, hidden); Hi-Res Font (text drawn from
   glyphs twice the size, sharper above 720p; from the next start); Smooth HUD and Menus (the 2D
-  always filtered); Show FPS; Button Prompts (Auto follows the device in use, with the Steam Deck's
-  own buttons on a Deck; Xbox, PlayStation, Nintendo, Keyboard, Steam Deck); Mouse Sensitivity (0.25 to 8)
+  always filtered); Show FPS; Button Prompts (Auto follows the device in use; Xbox, PlayStation,
+  Nintendo, Keyboard); Mouse Sensitivity (0.25 to 8)
 - **Extras**: Skip Intro; Skip Cutscenes (any, watched or not); Skip Death Screen (straight to the
   game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves);
   More Blood (twice the blood sprays and stains)
@@ -369,8 +370,6 @@ If you'd like to support the project: [GitHub Sponsors](https://github.com/spons
   renderer follows its Vulkan renderer (GPL-3.0)
 - [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev: the shader translator (MIT)
 - [plume](https://github.com/renderbag/plume) by renderbag: the Vulkan layer (MIT)
-- [Xelu's controller and keyboard prompts](https://thoseawesomeguys.com/prompts/) by Nicolae "Xelu"
-  Berbece: the PlayStation, Nintendo, Steam Deck and keyboard button prompts (CC0)
 - [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
   alicenotmech: its Modern Camera and OT/UT Free Camera, ported (MIT), and a reference for this
   port's own versions of some of its other options
