@@ -48,6 +48,7 @@ bool Base720p();  // base_resolution.cpp
 #include <optional>
 #include <unordered_set>
 #include <algorithm>
+#include <bitset>
 #include <cstddef>
 #include <unordered_map>
 #include <vector>
@@ -1717,9 +1718,12 @@ std::vector<CarriedTexture> TakeCarried() {
     }
   }
   g_carriedTouch.clear();
-  static size_t logged = ~size_t(0);
-  if (carried.size() != logged) {
-    logged = carried.size();
+  // Each count once (it can flip between two every frame: #153's log had
+  // 30 lines a second).
+  static std::bitset<64> logged;
+  size_t count = std::min<size_t>(carried.size(), 63);
+  if (!logged[count]) {
+    logged[count] = true;
     std::string list;
     for (auto& c : carried) {
       list += fmt::format(" {}x{}", c.texture->width, c.texture->height);
