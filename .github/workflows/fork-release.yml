@@ -163,13 +163,48 @@ jobs:
           rm -rf thirdparty/rexglue-sdk/out/build/linux-amd64
 
       - name: Build for aarch64
+        id: build
+        continue-on-error: true
+        shell: bash
         run: |
+          cat > "$RUNNER_TEMP/build.sh" <<'EOF'
           JOBS=$(nproc) packaging/aarch64/build.sh || { tail -n 60 out/logs/*arm64*.log out/logs/ffmpeg*.log; exit 1; }
           file out/aarch64-dist/ng2.bin | grep -q 'ARM aarch64' || { echo "::error::ng2.bin is not an aarch64 program"; exit 1; }
           mkdir -p "$RUNNER_TEMP/dist"
           cp -a out/aarch64-dist "$RUNNER_TEMP/dist/NinjaGaiden2-arm64"
           tar -C "$RUNNER_TEMP/dist" -czf "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz" NinjaGaiden2-arm64
           ls -l "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz"
+          EOF
+          set -o pipefail
+          bash -e "$RUNNER_TEMP/build.sh" 2>&1 | tee .build-error.log
+
+      # A failed build goes to Claude Code once.
+      - name: Repair the build (Claude Code)
+        if: steps.build.outcome == 'failure' && env.HAS_CLAUDE == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            This repository is a fork of gamboozino/ng2recomp that builds for 64-bit ARM Linux (aarch64) with packaging/aarch64/build.sh. After the merge of upstream tag ${{ env.UP }} the build failed. The build output is in .build-error.log: read its end first, then the logs in out/logs.
+            Find the cause and fix it with the smallest change. Port, do not invent: when upstream added or changed something that the aarch64 build lacks (for example a new source file or library the x86-64 build lists and packaging/aarch64 or the cmake toolchain does not), carry upstream's change over and name the upstream file in a short comment. Read both sides with git log, git show and git grep to learn why each change exists. Change only source and build files, never thirdparty/, game_files/ or .github/. Add no new behaviour and change nothing unrelated to the error. Do not stage or commit. If the cause is outside the repository (a server down, a package missing from a mirror) or not clear, change nothing and say why.
+          claude_args: >-
+            --allowedTools "Read,Edit,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git grep:*),Bash(git status:*),Bash(git blame:*)"
+            --disallowedTools "Bash(git push:*),Bash(git commit:*),Bash(git add:*),Bash(curl:*),Bash(gh:*)"
+
+      - name: Check, commit and build the repair
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          rm -f .build-error.log
+          git submodule foreach --quiet --recursive 'git diff --quiet' || { echo "::error::The repair changed a submodule"; exit 1; }
+          changed=$(git diff --name-only --ignore-submodules=dirty)
+          [ -n "$changed" ] || { echo "::error::The build failed and was not repaired (see the Build for aarch64 step)"; exit 1; }
+          echo "repaired: $changed"
+          if echo "$changed" | grep -qE '^(thirdparty|game_files|\.github)/'; then echo "::error::The repair changed protected files"; exit 1; fi
+          git diff
+          git add -u && git commit -q -m "Repair the build for $UP (Claude Code)"
+          bash -e "$RUNNER_TEMP/build.sh"
 
       - name: Logs
         if: always()
