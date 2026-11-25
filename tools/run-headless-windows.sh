@@ -7,6 +7,7 @@
 #   NG2_WIN_DIR=<dir>   the packaged game (default out/windows/NinjaGaiden2)
 #   NG2_SHOTS="10 30"   gamescope screenshots at those seconds
 #   PROTONPATH=<dir>    Proton for umu (default Steam's Proton - Experimental)
+#   NG2_TEST_REFRESH=120  the headless display's refresh rate (Hz)
 #   NG2_PAD_SCRIPT, NG2_SAVE_FROM: as in run-headless.sh
 set -euo pipefail
 
@@ -45,7 +46,7 @@ exec env -u WAYLAND_DISPLAY -u DISPLAY \
   NG2_AUDIO=0 NG2_CONFIG="$(winpath "$out/ng2.toml")" \
   SDL_GAMECONTROLLER_IGNORE_DEVICES=0x2dc8/0x310a SDL_JOYSTICK_IGNORE_DEVICES=0x2dc8/0x310a \
   timeout --kill-after=10 "$((secs + 30))" \
-  gamescope --backend headless -W 1280 -H 720 -w 1280 -h 720 -- \
+  gamescope --backend headless -W 1280 -H 720 -w 1280 -h 720 ${NG2_TEST_REFRESH:+-r $NG2_TEST_REFRESH} -- \
   bash -c "$inner" inner "${NG2_SHOTS:-}" "$out" "$((secs + 20))" \
   umu-run "$win/ng2.exe" --game_data_root="$(winpath "$root/game_files")" \
   --user_data_root="$(winpath "$out/user")" --input_backend=none \

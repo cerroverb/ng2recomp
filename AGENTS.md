@@ -80,6 +80,8 @@ devices, and none of the player's settings or saves.
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_BARYCENTRIC=1` or `0`: cut-off parts' id interpolated in the shader, or by the hardware
   (default: in the shader on NVIDIA, where the GPU supports it).
+  Shaders drawn with their barycentric variant don't get `cutout_msaa`'s per-sample pipelines:
+  NVIDIA's Windows driver crashed building one (#149).
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
 - `NG2_PROFILE=1`: time per renderer stage, once a second, and every 5 s the busiest threads' CPU
   time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render

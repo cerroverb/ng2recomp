@@ -1780,7 +1780,10 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
   // (a click off the table confirms nothing)
   bool clickOff = ng2::menu_mouse::ClickedThisFrame() &&
                   PointedRow(kTableNameX - 16.0f, kTableCellX[2] + 140.0f, kTableTop, kTablePitch, kControlRows) < 0;
-  bool confirm = !clickOff && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, 0, 0, 0}) != 0;
+  // (X, and Delete, clear: the game's confirm takes X too in some of its
+  // modes, sub_823E4158's +56 word: 0 A/X/Start, 2 A/X, 4 A)
+  bool clear = (pressed & kPadX) != 0;
+  bool confirm = !clickOff && !clear && CallGuest(ctx, base, __imp__sub_823E4158, {kPadState, 0, 0, 0}) != 0;
   if (c.row == rebind::kActions) {
     if (confirm) {
       rebind::Defaults();
@@ -1795,7 +1798,7 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
       c.capture = 2, c.ignore = held, c.first = -1, c.since = Clock::now();
       play(3);
     }
-  } else if (pressed & kPadX) {
+  } else if (clear) {
     if (c.column < 2) {
       rebind::SetKey(c.row, c.column, "");
     } else {

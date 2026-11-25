@@ -29,10 +29,12 @@
 #elif defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 #include <ctime>
 #endif
 #include <rex/hook.h>
+#include <rex/ppc/intrinsics.h>
 #include <rex/runtime.h>
 #include <rex/system/xmemory.h>
 #include <rex/logging.h>
@@ -350,37 +352,49 @@ REX_HOOK_RAW(sub_8376AA48) {
 // The D3D library's waits for the GPU: each fills a wait block (with the
 // time base at +20 when it starts) and calls sub_8375E588 until the GPU's
 // read pointer passes a fence (1: still waiting). The console spins here; on
-// a PC that's a whole core busy until the next vblank, so once a wait has
-// spun a while each step sleeps a little. The count starts again with each
-// wait, told apart by that time stamp (they end on the read pointer, not on
-// a step's 0).
+// a PC that's a whole core busy until the next vblank. Each step is 32 delay
+// hints (rex::ppc::SpinBackoff), which would yield after 50 us of a wait
+// (~170k yields a second on the render thread): here they only pause, and
+// once a wait has gone on for 100 us each step sleeps 200 us (Linux: with a
+// timer slack of 1 us, so a sleep ends close to when asked). In play these are
+// one wait a frame of many milliseconds (the next frame's), so a wait ends at
+// most a sleep late, once a frame. A wait is told apart from the next by
+// that time stamp (they end on the read pointer, not on a step's 0).
 REX_EXTERN(__imp__sub_8375E588);
 REX_HOOK_RAW(sub_8375E588) {
-  thread_local uint32_t spins = 0, lastStamp = 0;
-  thread_local int64_t lastNs = 0;
+  thread_local uint32_t lastStamp = 0;
+  thread_local int64_t lastNs = 0, startNs = 0;
+  thread_local bool first = true;
+#if defined(__linux__)
+  thread_local bool slack = (prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL), true);
+  (void)slack;
+#endif
   uint32_t stamp = ng2::guest::Load32(ctx.r3.u32 + 20);
   const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
-  if (stamp != lastStamp) {
+  if (stamp != lastStamp || first) {
     lastStamp = stamp;
-    spins = 0;
-  } else if (spins > 0) {
+    startNs = nowNs;
+    first = false;
+  } else {
     ng2::video::NoteWait(ng2::video::WaitKind::kFence, nowNs - lastNs);  // (NG2_PROFILE)
   }
   lastNs = nowNs;
+  rex::ppc::SetSpinBackoffQuiet(true);
   __imp__sub_8375E588(ctx, base);
-  if (ctx.r3.u32 != 0 && ++spins > 64) {
+  rex::ppc::SetSpinBackoffQuiet(false);
+  if (ctx.r3.u32 != 0 && nowNs - startNs > 100'000) {
 #if defined(_WIN32)
     // (Sleep is a millisecond or more: the high-resolution timer, or a yield
-    // where there is none, which keeps the core busy)
+    // where there is none)
     if (ng2::video::PreciseSleepAvailable()) {
-      ng2::video::PreciseSleepNs(100'000);
+      ng2::video::PreciseSleepNs(200'000);
     } else {
       std::this_thread::yield();
     }
 #else
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
 #endif
   }
 }
@@ -482,6 +496,22 @@ static void BarrierWake(uint8_t* byte) {
 
 REX_EXTERN(__imp__sub_83774800);
 REX_HOOK_RAW(sub_83774800) {
+#if defined(_WIN32)
+  // NG2_TEST_AUDIO_PRIORITY=1 (#17): XAudio2's workers (the threads that meet
+  // here every pass) at a higher priority than the game's other threads, so
+  // a CPU too busy for all of them slows the frames instead of the sound.
+  static const bool raise = [] {
+    const char* v = std::getenv("NG2_TEST_AUDIO_PRIORITY");
+    return v && v[0] == '1';
+  }();
+  thread_local bool raised = false;
+  if (raise && !raised) {
+    raised = true;
+    bool ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+    REXLOG_INFO("audio: worker thread {} at a higher priority{}", GetCurrentThreadId(),
+                ok ? "" : " (failed)");
+  }
+#endif
   // NG2_GAME_AUDIO_BARRIER=1: the game's own barrier (for comparisons).
   static const bool original = [] {
     const char* v = std::getenv("NG2_GAME_AUDIO_BARRIER");

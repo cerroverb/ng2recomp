@@ -14,6 +14,11 @@ xer_as_local = true
 cr_as_local = true
 reserved_as_local = true
 non_volatile_as_local = true
+# r0, r2, r11, r12, f0 and v32-v63 too (not in SEH funclets, SDK change): no
+# function reads one before writing it, except the funclets (r12, their
+# owner's frame) and the stack probe sub_83992304 (r12, the frame size;
+# a no-op hook in src/game_fixes.cpp).
+non_argument_as_local = true
 shared_vector_registers = [29, 30, 64, 65, 69, 72]
 
 # MSVC CRT; libjpeg's error_exit longjmps out of the decoder.

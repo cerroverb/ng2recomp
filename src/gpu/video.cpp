@@ -3609,6 +3609,21 @@ void DropRoundTowardZero(std::vector<uint8_t>& spirv) {
   std::memcpy(spirv.data(), kept.data(), spirv.size());
 }
 
+// On NVIDIA the shaders that hide cut-off parts interpolate the part id
+// themselves where the GPU has fragment shader barycentrics: its hardware
+// interpolation is a hair off there (speckled cut limbs). Elsewhere the
+// hardware's is exact enough. NG2_BARYCENTRIC=1 or 0 forces it on or off.
+bool UsesBarycentricVariant(const ShaderCacheEntry* entry) {
+  static const bool barycentric = [] {
+    const char* v = std::getenv("NG2_BARYCENTRIC");
+    bool wanted = v ? v[0] == '1' : g_device->getDescription().vendor == RenderDeviceVendor::NVIDIA;
+    bool on = g_device->getCapabilities().fragmentShaderBarycentric && wanted;
+    REXLOG_INFO("video: part ids interpolated {}", on ? "from barycentrics" : "by the hardware");
+    return on;
+  }();
+  return barycentric && entry && entry->barycentricSpirvSize;
+}
+
 RenderShader* HostShader(const ShaderCacheEntry* entry) {
   auto& host = g_hostShaders[entry];
   if (!host) {
@@ -3617,18 +3632,7 @@ RenderShader* HostShader(const ShaderCacheEntry* entry) {
       ZSTD_decompress(g_spirvCache.get(), g_spirvCacheDecompressedSize, g_compressedSpirvCache,
                       g_spirvCacheCompressedSize);
     }
-    // On NVIDIA the shaders that hide cut-off parts interpolate the part id
-    // themselves where the GPU has fragment shader barycentrics: its hardware
-    // interpolation is a hair off there (speckled cut limbs). Elsewhere the
-    // hardware's is exact enough. NG2_BARYCENTRIC=1 or 0 forces it on or off.
-    static const bool barycentric = [] {
-      const char* v = std::getenv("NG2_BARYCENTRIC");
-      bool wanted = v ? v[0] == '1' : g_device->getDescription().vendor == RenderDeviceVendor::NVIDIA;
-      bool on = g_device->getCapabilities().fragmentShaderBarycentric && wanted;
-      REXLOG_INFO("video: part ids interpolated {}", on ? "from barycentrics" : "by the hardware");
-      return on;
-    }();
-    bool variant = barycentric && entry->barycentricSpirvSize;
+    bool variant = UsesBarycentricVariant(entry);
     const uint8_t* encoded =
         g_spirvCache.get() + (variant ? entry->barycentricSpirvOffset : entry->spirvOffset);
     uint32_t encodedSize = variant ? entry->barycentricSpirvSize : entry->spirvSize;
@@ -5013,6 +5017,14 @@ void ListPipeline(uint64_t hash, const PipelineKey& key) {
 
 RenderShader* HostShader(const ShaderCacheEntry* entry);
 
+// cutout_msaa for a pixel shader, where the GPU can shade per sample. Not
+// the shaders drawn with their barycentric variant (NVIDIA): its Windows
+// driver crashed building one per sample (#149).
+bool CutoutMsaa(const ShaderCacheEntry* ps) {
+  static const bool on = REXCVAR_GET(cutout_msaa) && g_device->getCapabilities().sampleRateShading;
+  return on && !UsesBarycentricVariant(ps);
+}
+
 // The pipelines in a list file, asked of the workers. The player's list is
 // repaired (a record cut short when the game stopped while writing it) or,
 // from another version, dropped. The seed (packaging: pipelines recorded
@@ -5073,12 +5085,18 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
       }
       key.slopeDepthBias *= ScaleOf(g_resolutionScale);
     }
+    const ShaderCacheEntry* vs = FindShaderCacheEntry(key.vertexShader);
+    const ShaderCacheEntry* ps =
+        key.pixelShader == 1 ? nullptr : FindShaderCacheEntry(key.pixelShader);
+    // A per-sample one recorded while it was on, built plain when it's off.
+    if (key.alphaTest == 2 && !CutoutMsaa(ps)) {
+      key.alphaTest = 1;
+    }
     // Multisampled alpha tests recorded before cutout_msaa (the seed, older lists) or with it
     // off: their per-sample twin too, the reference (only known at the draw) deciding which
     // is used.
     bool twin = key.alphaTest == 1 && !key.alphaToCoverage && key.samples > 1 &&
-                key.pixelShader != 1 && REXCVAR_GET(cutout_msaa) &&
-                g_device->getCapabilities().sampleRateShading;
+                key.pixelShader != 1 && CutoutMsaa(ps);
     for (int pass = 0; pass < (twin ? 2 : 1); pass++) {
       if (pass == 1) {
         key.alphaTest = 2;
@@ -5087,9 +5105,6 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
       if (!g_listedPipelines.insert(hash).second) {
         continue;
       }
-      const ShaderCacheEntry* vs = FindShaderCacheEntry(key.vertexShader);
-      const ShaderCacheEntry* ps =
-          key.pixelShader == 1 ? nullptr : FindShaderCacheEntry(key.pixelShader);
       RenderShader* vertexShader = vs ? HostShader(vs) : nullptr;
       RenderShader* pixelShader = ps ? HostShader(ps) : nullptr;
       if (!vertexShader || (key.pixelShader != 1 && !pixelShader)) {
@@ -5979,11 +5994,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // blended effects) keeps the plain test: its edges don't show. (Measured:
   // foliage tests at 0.25; a Mission 1 fight with ninpo had 17 multisampled
   // alpha tests, all effects, none at 1/16 or above.)
-  static const bool sampleShading = g_device->getCapabilities().sampleRateShading;
-  if (key.alphaTest && !key.alphaToCoverage && ps && key.samples > 1 && sampleShading &&
+  if (key.alphaTest && !key.alphaToCoverage && ps && key.samples > 1 &&
       (uint32_t(colorControl.alpha_func) == 4 || uint32_t(colorControl.alpha_func) == 6) &&
-      shared.alphaThreshold >= 0.1f &&
-      REXCVAR_GET(cutout_msaa)) {
+      shared.alphaThreshold >= 0.1f && CutoutMsaa(ps->entry)) {
     key.alphaTest = 2;
   }
   // =all colors the skinned draws only (bones in fetch slot 94): other
@@ -7599,9 +7612,31 @@ void DisplayClockThread() {
         }
         windowUnits = 0, windowUneven = 0;
       }
+      // Not the display's refreshes when the rate measured isn't the display
+      // mode's: with variable refresh (G-SYNC, FreeSync) the screen shows each
+      // frame as it comes, so these are the game's own frame times, steady
+      // near 60 Hz on a 144 Hz panel. Frame Pacing Auto locked the guest's
+      // vblanks to them and the game ran away from itself, up to 68 fps
+      // (#153). Not under gamescope, whose reported rate isn't always the
+      // panel's.
+      bool ownFrames = false;
+      if (double hz = g_displayModeHz.load(); steady && hz > 0 && runUnits >= 60u * every && !UnderGamescope()) {
+        // (against the nearest whole number of the measured rate: a 360 Hz
+        // panel, counted one frame at a time, measures a real 60 Hz)
+        double measured = 1e9 / period;
+        double n = std::max(1.0, std::floor(hz / measured + 0.5));
+        ownFrames = std::abs(measured * n - hz) > hz * 0.03;
+        static bool logged = false;
+        if (ownFrames && !logged) {
+          logged = true;
+          REXLOG_INFO("video: display clock follows the game's frames ({:.2f} Hz on a {:.2f} Hz display: variable "
+                      "refresh?): not taken as the display's refreshes",
+                      measured, hz);
+        }
+      }
       g_displayPeriodNs.store(int64_t(period));  // (a refresh: the lock takes every few)
       g_displayRefreshNs.store(t);
-      g_displaySteady.store(steady);
+      g_displaySteady.store(steady && !ownFrames);
     }
     last = t;
     if (t - secondStart > 1'000'000'000) {

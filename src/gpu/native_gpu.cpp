@@ -423,6 +423,14 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           while (target < after + step - periodNs / 2) {
             target += periodNs;
           }
+          // Never two vblanks closer than 97% of the guest's own period: on a
+          // real display the targets are whole refreshes apart, within 2% of
+          // it; reported "refreshes" that follow the game's own frames
+          // (variable refresh) pulled them closer each frame, and the game
+          // ran fast (#153).
+          if (lastTargetNs) {
+            target = std::max(target, lastTargetNs + guestPeriodNs * 97 / 100);
+          }
           lastTargetNs = target;
           int64_t wait = target - ng2::video::DisplayClockNow();
           if (wait > 0) {

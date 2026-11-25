@@ -198,3 +198,9 @@ REX_HOOK_RAW(sub_8232C370) {
   }
   __imp__sub_8232C370(ctx, base);
 }
+
+// The stack probe big frames call first (r12: the frame's size): touches each
+// 4 KB page below the stack pointer, for the console's guard pages. The guest
+// stacks here are committed whole, and with r12 a local (non_argument_as_local)
+// the size never reaches it.
+REX_HOOK_RAW(sub_83992304) {}
