@@ -67,6 +67,11 @@ jobs:
       PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
       DRAFT: ${{ inputs.draft || false }}
       HAS_CLAUDE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      # (commits after a Claude Code step are cerroverb's: the action leaves its own git identity behind)
+      GIT_AUTHOR_NAME: cerroverb
+      GIT_AUTHOR_EMAIL: 84094990+cerroverb@users.noreply.github.com
+      GIT_COMMITTER_NAME: cerroverb
+      GIT_COMMITTER_EMAIL: 84094990+cerroverb@users.noreply.github.com
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,6 +176,7 @@ jobs:
           JOBS=$(nproc) packaging/aarch64/build.sh || { tail -n 60 out/logs/*arm64*.log out/logs/ffmpeg*.log; exit 1; }
           file out/aarch64-dist/ng2.bin | grep -q 'ARM aarch64' || { echo "::error::ng2.bin is not an aarch64 program"; exit 1; }
           mkdir -p "$RUNNER_TEMP/dist"
+          rm -rf "$RUNNER_TEMP/dist/NinjaGaiden2-arm64"  # (build.sh runs again after a repair)
           cp -a out/aarch64-dist "$RUNNER_TEMP/dist/NinjaGaiden2-arm64"
           tar -C "$RUNNER_TEMP/dist" -czf "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz" NinjaGaiden2-arm64
           ls -l "$RUNNER_TEMP/NinjaGaiden2-linux-arm64.tar.gz"
@@ -203,7 +209,7 @@ jobs:
           echo "repaired: $changed"
           if echo "$changed" | grep -qE '^(thirdparty|game_files|\.github)/'; then echo "::error::The repair changed protected files"; exit 1; fi
           git diff
-          git add -u && git commit -q -m "Repair the build for $UP (Claude Code)"
+          git add -u && git commit -q -m "Repair the build for $UP"
           bash -e "$RUNNER_TEMP/build.sh"
 
       - name: Logs
