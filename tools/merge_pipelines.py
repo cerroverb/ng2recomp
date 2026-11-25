@@ -11,6 +11,7 @@ import struct
 import sys
 
 MAGIC, VERSION = 0x4E473250, 1
+RECORD_SIZE = 96  # sizeof(PipelineKey), src/gpu/video.cpp
 
 
 def records(path):
@@ -18,8 +19,10 @@ def records(path):
     if len(data) < 12:
         return None, []
     magic, version, size = struct.unpack_from("<III", data)
-    if magic != MAGIC or version != VERSION or size == 0:
+    if magic != MAGIC or version != VERSION:
         raise SystemExit(f"{path}: not a pipeline list of version {VERSION}")
+    if size != RECORD_SIZE:
+        raise SystemExit(f"{path}: records of {size} bytes, not {RECORD_SIZE}")
     body = data[12:]
     return size, [body[i:i + size] for i in range(0, len(body) - size + 1, size)]
 
