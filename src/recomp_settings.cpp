@@ -1717,8 +1717,7 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
       done = true, binding = c.first;  // let go, or held a while, alone
     }
     if (done) {
-      rebind::SetPad(c.row, binding);
-      play(3);
+      play(rebind::SetPad(c.row, binding) ? 3 : 2);
       c.capture = 0;
       c.letGo = true;
     } else if (c.first < 0 && Clock::now() - c.since > std::chrono::seconds(5)) {
@@ -1806,12 +1805,14 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
     if (c.column < 2) {
       rebind::SetKey(c.row, c.column, "");
     } else {
-      rebind::SetPad(c.row, rebind::kNone);
+      if (!rebind::SetPad(c.row, rebind::kNone)) {
+        play(2);
+        return false;
+      }
     }
     play(3);
   } else if (CallGuest(ctx, base, __imp__sub_823E43B0, {kPadState})) {
-    rebind::Default(c.row);
-    play(3);
+    play(rebind::Default(c.row) ? 3 : 2);
   }
   return false;
 }

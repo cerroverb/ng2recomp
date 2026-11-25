@@ -41,11 +41,11 @@ void SetKey(int action, int slot, const std::string& key);
 bool PadFixed(int action);
 bool PadPairs(int action);
 int Pad(int action);
-void SetPad(int action, int binding);
+bool SetPad(int action, int binding);  // false: refused (Interact keeps a button)
 // A fixed one's text (the game's button tags).
 const char16_t* PadFixedText(int action);
 // One action, or all, as they come.
-void Default(int action);
+bool Default(int action);  // false: its button refused (as SetPad)
 void Defaults();
 // How the settings are stored (RECOMP SETTINGS': written to the config).
 void SetStore(void (*store)(const char* name, const std::string& value));
