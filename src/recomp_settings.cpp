@@ -210,7 +210,7 @@ constexpr Setting kSettings[] = {
     {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
     {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9", u"4:3"}, 5, "aspect_ratio", Kind::kAspect},
     // The prompts follow the device in use (gpu/prompts.cpp).
-    {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard", u"Steam Deck"}, 6,
+    {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard"}, 5,
      "button_prompts", Kind::kLevel},
     {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2", u"3", u"4", u"6", u"8"}, 10, "mnk_sensitivity",
      Kind::kSensitivity},
@@ -663,6 +663,10 @@ uint32_t ValueOf(const Setting& setting) {
       return filtering >= 5 ? 3 : filtering == 4 ? 2 : filtering == 3 ? 1 : 0;
     }
     case Kind::kLevel:
+      // Button Prompts' Steam Deck (5, removed) is Auto now, as prompts.cpp takes it.
+      if (std::string_view(setting.name) == "button_prompts" && GetInt(setting.name) >= int32_t(setting.count)) {
+        return 0;
+      }
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
     case Kind::kSensitivity: {
       double value = std::atof(GetSetting(setting.name).c_str());
@@ -1713,8 +1717,7 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
       done = true, binding = c.first;  // let go, or held a while, alone
     }
     if (done) {
-      rebind::SetPad(c.row, binding);
-      play(3);
+      play(rebind::SetPad(c.row, binding) ? 3 : 2);
       c.capture = 0;
       c.letGo = true;
     } else if (c.first < 0 && Clock::now() - c.since > std::chrono::seconds(5)) {
@@ -1802,12 +1805,14 @@ bool RunControls(PPCContext& ctx, uint8_t* base) {
     if (c.column < 2) {
       rebind::SetKey(c.row, c.column, "");
     } else {
-      rebind::SetPad(c.row, rebind::kNone);
+      if (!rebind::SetPad(c.row, rebind::kNone)) {
+        play(2);
+        return false;
+      }
     }
     play(3);
   } else if (CallGuest(ctx, base, __imp__sub_823E43B0, {kPadState})) {
-    rebind::Default(c.row);
-    play(3);
+    play(rebind::Default(c.row) ? 3 : 2);
   }
   return false;
 }

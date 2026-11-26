@@ -11,9 +11,7 @@ class WindowedAppContext;
 
 namespace ng2::controls {
 
-// kSteamDeck: an Xbox-layout pad on a Steam Deck (its own controls, or Steam
-// Input's virtual pad, which stands in for them).
-enum class Device { kUnknown, kXbox, kPlayStation, kNintendo, kKeyboard, kSteamDeck };
+enum class Device { kUnknown, kXbox, kPlayStation, kNintendo, kKeyboard };
 
 // The kind of device player one used last (any thread).
 Device ActiveDevice();

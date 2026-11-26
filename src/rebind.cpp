@@ -34,6 +34,7 @@
 
 #include "rebind.h"
 
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -390,32 +391,62 @@ int Pad(int action) {
 const char16_t* PadFixedText(int action) {
   return kTable[action].fixed ? kTable[action].fixed : u"";
 }
-void SetPad(int action, int binding) {
+bool SetPad(int action, int binding) {
   if (PadFixed(action) || (IsPair(binding) && !PadPairs(action))) {
-    return;
+    return false;
   }
-  // A button, or a pair, leaves whatever had it (a button taken alone
-  // doesn't break a pair it is part of: the two can be both, as the game's
-  // Ninpo on Strong Attack's and Projectile's).
-  if (binding != kNone) {
+  // Interact always keeps a button: without one nothing can be examined or
+  // picked up, and the game shows no button for it.
+  auto needsOne = [](int a) { return kTable[a].id == kInteract; };
+  if (binding == kNone && needsOne(action)) {
+    return false;
+  }
+  // A button, or a pair, swaps with whatever had it: that one gets this
+  // one's (none if it can't take a pair, then refused for Interact). A
+  // button taken alone doesn't break a pair it is part of: the two can be
+  // both, as the game's Ninpo on Strong Attack's and Projectile's.
+  int old = PadOf(action);
+  if (binding != kNone && binding != old) {
+    for (int other = 0; other < kActions; other++) {
+      if (other == action || PadFixed(other) || PadOf(other) != binding) {
+        continue;
+      }
+      int given = IsPair(old) && !PadPairs(other) ? kNone : old;
+      if (given == kNone && needsOne(other)) {
+        return false;
+      }
+    }
     for (int other = 0; other < kActions; other++) {
       if (other != action && !PadFixed(other) && PadOf(other) == binding) {
-        Store(kTable[other].pad, std::to_string(kNone));
+        Store(kTable[other].pad, std::to_string(IsPair(old) && !PadPairs(other) ? kNone : old));
       }
     }
   }
   Store(kTable[action].pad, std::to_string(binding));
+  return true;
 }
-void Default(int action) {
-  for (const char* name : {kTable[action].key, kTable[action].pad}) {
-    if (const auto* info = name ? rex::cvar::GetFlagInfo(name) : nullptr) {
-      Store(name, info->default_value);
+bool Default(int action) {
+  // The button first, through SetPad (swapped with the action that had it);
+  // refused, nothing changes.
+  if (const auto* info = kTable[action].pad ? rex::cvar::GetFlagInfo(kTable[action].pad) : nullptr) {
+    if (!SetPad(action, int(std::strtol(info->default_value.c_str(), nullptr, 0)))) {
+      return false;
     }
   }
+  if (const auto* info = kTable[action].key ? rex::cvar::GetFlagInfo(kTable[action].key) : nullptr) {
+    Store(kTable[action].key, info->default_value);
+  }
+  return true;
 }
 void Defaults() {
+  // All at once: the defaults together hold no button twice (one by one, a
+  // swap refused for Interact could leave one out).
   for (int a = 0; a < kActions; a++) {
-    Default(a);
+    for (const char* name : {kTable[a].key, kTable[a].pad}) {
+      if (const auto* info = name ? rex::cvar::GetFlagInfo(name) : nullptr) {
+        Store(name, info->default_value);
+      }
+    }
   }
   // The game's own Controller Settings to its defaults too (Type A), so it
   // shows these.

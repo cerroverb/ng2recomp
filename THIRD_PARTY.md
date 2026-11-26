@@ -17,7 +17,6 @@ submodules in `thirdparty/`: forks at pinned versions, with this port's changes 
 | [smol-v](https://github.com/aras-p/smol-v) | compressed SPIR-V | MIT |
 | SDL 3 (built into the ReXGlue runtime) | window, input, audio output | zlib |
 | [xxHash](https://github.com/Cyan4973/xxHash) | hashing | BSD-2-Clause |
-| [Xelu's controller and keyboard prompts](https://thoseawesomeguys.com/prompts/) (`assets/prompts`) | the PlayStation, Nintendo and keyboard button prompts, reduced into the game's button atlas (`tools/make_prompts.py`) | CC0 |
 
 The native renderer (`src/gpu/video.cpp`) follows the Vulkan renderer of
 [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp) (GPL-3.0).

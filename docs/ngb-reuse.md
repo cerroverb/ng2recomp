@@ -24,7 +24,7 @@ Worth taking, best first:
    plain C) to wire into ReXGlue's input layer, save loaders. NG2 has no
    input injection yet; this is the piece needed to test past the title.
 6. Rebindable controls (`src/bindings.c`, `keyboard.c`, `controls.ini`) and
-   Xelu button prompt art (CC0, `assets/prompts/`).
+   NGB's Xelu button prompt art (CC0); NG2 makes its prompts from the game's own buttons.
 7. Settings list and ini format (Graphics/Display/Sound/Gameplay/Cheats/
    Controls pages). NGB's menus patch the game's own menu engine; NG2 would
    build them in ImGui like Unleashed, so only the list and the ini carry over.
