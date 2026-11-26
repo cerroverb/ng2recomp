@@ -1005,7 +1005,56 @@ struct GuestMemoryRange {
   // it stays unchanged for a while.
   bool dynamic = false;
   uint8_t finishTurn = 0;  // (FinishGuestMemory's 1 in 8)
+  // Unchanged for over a second: a hash of the shadow's copy (what the GPU
+  // has), so a check reads guest memory alone instead of it and the shadow
+  // (#153: on CPUs with small caches the comparisons were a large part of the
+  // render thread). Taken from the shadow, which only the render thread
+  // writes: a game write racing the check shows as a different hash next
+  // time. 0: none.
+  uint64_t hash = 0;
+  uint64_t hashStamp = 0;  // g_shadowStamp when it was taken
+  // A neighbour on its pages was written while it had a hash: none again
+  // until this frame (rehashing at each check cost more than comparing).
+  uint64_t hashAgainFrame = 0;
 };
+// The shadow's writes by 4 KB page (a count, g_shadowStamp): a range's hash
+// holds only while none of its pages was written since, as another range over
+// the same bytes may have put other values there (and on the GPU).
+std::vector<uint64_t> g_shadowPageStamps;
+uint64_t g_shadowStamp = 0;
+void NoteShadowWrite(uint32_t address, uint32_t size) {
+  if (g_shadowPageStamps.empty()) {
+    g_shadowPageStamps.resize(GUEST_MEMORY_SIZE >> 12);
+  }
+  ++g_shadowStamp;
+  for (uint32_t page = address >> 12; page <= (address + size - 1) >> 12; page++) {
+    g_shadowPageStamps[page] = g_shadowStamp;
+  }
+}
+// Whether guest memory over the range matches its hash (false: no hash, or
+// its shadow written since).
+bool MatchesRangeHash(GuestMemoryRange& range, uint32_t address, uint32_t size, uint64_t frame) {
+  if (!range.hash) {
+    return false;
+  }
+  if (!g_shadowPageStamps.empty()) {
+    for (uint32_t page = address >> 12; page <= (address + size - 1) >> 12; page++) {
+      if (g_shadowPageStamps[page] > range.hashStamp) {
+        range.hash = 0;
+        range.hashAgainFrame = frame + 120;
+        return false;
+      }
+    }
+  }
+  return (XXH3_64bits(guest::Physical(address), size) | 1) == range.hash;
+}
+// The range's hash taken, if it has been unchanged for over a second.
+void NoteRangeHash(GuestMemoryRange& range, uint32_t address, uint32_t size, uint64_t frame) {
+  if (!range.dynamic && !range.late && frame - range.changedFrame > 60 && frame >= range.hashAgainFrame) {
+    range.hash = XXH3_64bits(g_guestMemoryShadow + address, size) | 1;
+    range.hashStamp = g_shadowStamp;
+  }
+}
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
 constexpr uint64_t kRangeStableFrames = 600;
 constexpr uint64_t kRangeRecheckFrames = 4;
@@ -2739,18 +2788,24 @@ void SetInterpPictureCap() {
 // Exclusive full screen (the swapchain takes the display, its presents
 // flipped by it instead of composed by DWM, which spoils the pictures'
 // pacing): only for frame interpolation, in Window Mode Fullscreen
-// (fullscreen and exclusive_fullscreen). NG2_EXCLUSIVE (0, 1, 2: left to the
-// driver) over it. Decided again between frames: the menu changes both.
+// (fullscreen and exclusive_fullscreen). In Borderless never: AMD's driver
+// otherwise takes the display for a window covering the screen, and screen
+// capture (OBS, Game Bar, Discord) then sees black while the game has focus
+// (#74). NG2_EXCLUSIVE (0: not asked, 1, 2: left to the driver, 3: never)
+// over it. Decided again between frames: the menu changes both.
 int ExclusiveMode() {
 #if defined(_WIN32)
   static const char* forced = std::getenv("NG2_EXCLUSIVE");
   if (forced && forced[0]) {
-    return std::clamp(std::atoi(forced), 0, 2);
+    return std::clamp(std::atoi(forced), 0, 3);
   }
-  return InterpEnabled() && rex::cvar::Query<bool>("fullscreen") &&
-                 rex::cvar::Query<bool>("exclusive_fullscreen")
-             ? 1
-             : 0;
+  if (!rex::cvar::Query<bool>("fullscreen")) {
+    return 0;
+  }
+  if (!rex::cvar::Query<bool>("exclusive_fullscreen")) {
+    return 3;
+  }
+  return InterpEnabled() ? 1 : 0;
 #else
   return 0;
 #endif
@@ -2763,7 +2818,8 @@ bool UpdateExclusiveMode() {
   if (!g_swapChain || mode == g_exclusiveMode) {
     return false;
   }
-  REXLOG_INFO("video: exclusive full screen {}", mode ? "asked for" : "off");
+  REXLOG_INFO("video: exclusive full screen {}",
+              mode == 3 ? "never" : mode ? "asked for" : "off");
   g_exclusiveMode = mode;
   g_swapChain->setFullScreenExclusive(mode);
   return true;
@@ -3450,10 +3506,15 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   bool first = range.checkedFrame == ~0ull;
   // Unchanged for kRangeStableFrames: compared every kRangeRecheckFrames
   // frames (static geometry; comparing it all twice a frame was most of this
-  // stage). A rewrite after that shows up to that many frames late.
+  // stage). A rewrite after that shows up to that many frames late. Each on
+  // its own turn, from a hash of its address: ranges loaded together came due
+  // on the same frames, 4 MB compared on two frames of four and 0.5 MB on the
+  // others, which on a slow CPU made a frame late every few (#153). One not
+  // drawn on its turn waits at most twice as long.
   if (!always && !first && !range.dynamic &&
       g_frameCount - range.changedFrame > kRangeStableFrames &&
-      g_frameCount - range.checkedFrame < kRangeRecheckFrames) {
+      (g_frameCount + (address * 0x9E3779B1u >> 28)) % kRangeRecheckFrames != 0 &&
+      g_frameCount - range.checkedFrame < 2 * kRangeRecheckFrames) {
     return;
   }
   if (!always && range.checkedFrame != g_frameCount) {
@@ -3474,10 +3535,15 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   if (!first && g_frameCount - range.changedFrame > 60) {
     g_profile.quietBytes += size;
   }
+
   // Upload only the span between the first and last block that differ.
   uint32_t begin = 0, end = size;
   if (!first) {
+    if (MatchesRangeHash(range, address, size, g_frameCount)) {
+      return;
+    }
     if (std::memcmp(source, shadow, size) == 0) {
+      NoteRangeHash(range, address, size, g_frameCount);
       return;
     }
     constexpr uint32_t kBlock = 256;
@@ -3500,8 +3566,10 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   }
   uint32_t length = end - begin;
   range.changedFrame = g_frameCount;
+  range.hash = 0;
   g_profile.uploadedBytes += length;
   std::memcpy(shadow + begin, source + begin, length);
+  NoteShadowWrite(address + begin, length);
   Upload upload = AllocateCopySource(length, 16);
   std::memcpy(upload.data, source + begin, length);
   RecordGuestMemoryCopy(address + begin, upload, length, inOrder);
@@ -3530,11 +3598,12 @@ void FinishGuestMemory() {
     if (!frameRange.lateCopy) {
       g_profile.finishBytes += frameRange.size;
     }
-    if (frameRange.lateCopy ||
+    if (frameRange.lateCopy || MatchesRangeHash(range, frameRange.address, frameRange.size, g_frameCount) ||
         std::memcmp(guest::Physical(frameRange.address),
                     g_guestMemoryShadow + frameRange.address, frameRange.size) == 0) {
       continue;
     }
+    range.hash = 0;
     if (range.changedFrame + 1 >= g_frameCount) {
       // Checked at every draw this frame and still written after the last.
       range.late = true;
@@ -3552,6 +3621,7 @@ void FinishGuestMemory() {
       const uint8_t* source = guest::Physical(frameRange.address);
       std::memcpy(frameRange.lateCopy, source, frameRange.size);
       std::memcpy(g_guestMemoryShadow + frameRange.address, source, frameRange.size);
+      NoteShadowWrite(frameRange.address, frameRange.size);
       g_profile.uploadedBytes += frameRange.size;
     }
   }
@@ -4421,7 +4491,12 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   header |= promptTexture;
   bool stable = cached.host && !header && cached.checkedFrame != ~0ull &&
                 g_frameCount - cached.changedFrame > kTextureStableFrames;
-  bool due = stable ? g_frameCount - cached.checkedFrame >= kTextureRecheckFrames
+  // (stable ones on their own turn, from the key, as the memory ranges: the
+  // textures of a stage came due together, 6 MB hashed one frame in 8; at
+  // most twice as long for one not drawn on its turn)
+  bool due = stable ? ((g_frameCount + (key >> 59)) % kTextureRecheckFrames == 0 &&
+                       cached.checkedFrame != g_frameCount) ||
+                          g_frameCount - cached.checkedFrame >= 2 * kTextureRecheckFrames
                     : cached.checkedFrame != g_frameCount;
   g_profile.textureLookups++;
   if (due) {
@@ -5796,6 +5871,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   if (ps) {
     copyConstants(psConstants.data, psSource, ps->entry->floatConstantMask, 224);
   }
+
   int32_t interpIndex = -1;
   if (InterpEnabled()) {
     const HostTexture* shape = target ? target : depth;
@@ -5813,6 +5889,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   Upload sharedUpload = Allocate(sizeof(shared));
   std::memcpy(sharedUpload.data, &shared, sizeof(shared));
+
 
   // NG2_TEST_TOGGLE_LOG=1 (#21): draws whose shader constants switch between
   // two sets of values from frame to frame, logged with what differs.

@@ -19,7 +19,8 @@
 //
 // Buttons: up down left right start back lthumb rthumb lb rb a b x y, lt rt
 // (triggers fully pressed), lleft lright lup ldown / rleft rright rup rdown
-// (a stick at full throw; "rright@20" at 20%); "trace" presses F7 (the renderer's trace) as the
+// (a stick at full throw; "rright@20" at 20%); "ptr640x360" puts the menu pointer at that point of
+// a 1280x720 window and "click" clicks its left button (menu_mouse.h); "trace" presses F7 (the renderer's trace) as the
 // step fires, so a trace starts at the same point of a scripted run. Times are decimal. Every step is logged as it
 // fires; a step whose window passed while the game wasn't reading the pad
 // (a load) is pressed late for one read rather than dropped.
@@ -48,6 +49,10 @@
 
 namespace ng2::video {
 void RequestTrace();  // src/gpu/video.cpp: as F7 (the "trace" step)
+}
+namespace ng2::menu_mouse {
+void TestPointer(int32_t x, int32_t y);  // src/menu_mouse.cpp: the "ptr" and "click" steps
+void TestClick();
 }
 
 namespace ng2 {
@@ -153,6 +158,12 @@ class ScriptInputDriver : public rex::input::InputDriver {
         if (step.trace) {
           video::RequestTrace();
         }
+        if (step.pointerX >= 0) {
+          menu_mouse::TestPointer(step.pointerX, step.pointerY);
+        }
+        if (step.click) {
+          menu_mouse::TestClick();
+        }
       }
       pad.buttons |= step.buttons;
       pad.lt = std::max(pad.lt, step.lt);
@@ -238,6 +249,8 @@ class ScriptInputDriver : public rex::input::InputDriver {
     std::string text;
     bool announced = false;
     bool trace = false;  // "trace": F7 as the step fires
+    int32_t pointerX = -1, pointerY = -1;  // "ptr<x>x<y>": the menu pointer there (1280x720)
+    bool click = false;                    // "click": a left click in a menu
   };
 
   static bool AddButton(std::string_view name, Step& step) {
@@ -299,6 +312,18 @@ class ScriptInputDriver : public rex::input::InputDriver {
     if (same("trace")) {
       step.trace = true;
       return true;
+    }
+    if (same("click")) {
+      step.click = true;
+      return true;
+    }
+    if (name.size() > 3 && name.substr(0, 3) == "ptr") {
+      int x = 0, y = 0;
+      if (std::sscanf(std::string(name.substr(3)).c_str(), "%dx%d", &x, &y) == 2 && x >= 0 && y >= 0) {
+        step.pointerX = x, step.pointerY = y;
+        return true;
+      }
+      return false;
     }
     if (same("lt")) {
       step.lt = 0xFF;

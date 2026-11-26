@@ -94,6 +94,8 @@ cp "$repo/tools/xdvdfs_extract.py" "$repo/tools/stfs_extract.py" "$repo/tools/fi
 cp "$here/AppRun" "$app/AppRun"
 chmod +x "$app/AppRun"
 cp "$here/ng2.desktop" "$app/"
+# RecompLauncher reads it at the AppImage's root.
+cp "$repo/packaging/recomplauncher.json" "$app/"
 cp "$here/ng2.png" "$app/ng2.png"
 cp "$here/ng2.png" "$app/.DirIcon"
 cp "$repo/LICENSE" "$repo/THIRD_PARTY.md" "$app/usr/share/licenses/ng2/"

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "gamboozino/ng2recomp",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your copy of the World release (544307D5): a disc image (.iso), the Games on Demand package (the file in 544307D5/00007000, with its .data folder beside it) or an extracted game folder.",
+      "formats": [{ "type": "file" }, { "type": "folder" }],
+      "check": { "ids": ["544307D5"] }
+    },
+    {
+      "id": "update",
+      "label": "Title Update 3: TU_1A461UL_000000G000000.00000000000O4 (on a console in Content/0000000000000000/544307D5/000B0000), or its default.xexp. Not needed when your extracted copy already has it.",
+      "role": "update",
+      "optional": true,
+      "formats": [{ "type": "file" }]
+    },
+    {
+      "id": "dlc",
+      "label": "Downloadable content: Mission Mode and the costume packs, the 544307D5/00000002 folder or one package from it.",
+      "role": "dlc",
+      "optional": true,
+      "formats": [{ "type": "folder" }, { "type": "file" }]
+    }
+  ],
+  "start": {
+    "program": ["NinjaGaiden2-x86_64.AppImage", "ng2.exe"]
+  },
+  "prepare": {
+    "program": ["NinjaGaiden2-x86_64.AppImage", "ng2.exe"],
+    "args": [
+      "--prepare",
+      "--prepare_game={input:game}",
+      "--prepare_update={input:update}",
+      "--prepare_dlc={input:dlc}"
+    ],
+    "label": "The game and Title Update 3 from your copy",
+    "done": ["{data}/prepared.txt"],
+    "keeps_copy": true
+  },
+  "folders": {
+    "game": [{ "path": "{data}/game" }],
+    "logs": [{ "path": "{data}" }]
+  },
+  "saves": ["{data}/user"],
+  "system": {
+    "windows": { "version": "10", "graphics": { "vulkan": "1.3" } },
+    "linux": { "glibc": "2.35", "graphics": { "vulkan": "1.3" } }
+  }
+}

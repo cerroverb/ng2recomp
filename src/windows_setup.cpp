@@ -27,6 +27,18 @@
 
 #include "dlc.h"
 
+// RecompLauncher's setup step (recomplauncher.json): the game set up in
+// RECOMPLAUNCHER_DATA from the files given, with no windows and progress
+// lines on stdout, then exit.
+REXCVAR_DEFINE_BOOL(prepare, false, "Launcher",
+                    "Set the game up without windows, then exit (RecompLauncher)");
+REXCVAR_DEFINE_STRING(prepare_game, "", "Launcher",
+                      "--prepare: disc image, Games on Demand package or extracted game folder");
+REXCVAR_DEFINE_STRING(prepare_update, "", "Launcher",
+                      "--prepare: Title Update 3's package or default.xexp");
+REXCVAR_DEFINE_STRING(prepare_dlc, "", "Launcher",
+                      "--prepare: a downloadable content package, or a folder searched for them");
+
 namespace ng2::windows_setup {
 namespace fs = std::filesystem;
 
@@ -49,13 +61,32 @@ std::string Utf8(const fs::path& path, bool generic = false) {
   return std::string(text.begin(), text.end());
 }
 
+bool g_quiet = false;  // --prepare: no windows, lines on stdout
+
+// A line for RecompLauncher, on the stdout it gave the program.
+void Print(const std::string& line) {
+  std::string text = line + "\n";
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  DWORD written = 0;
+  if (out && out != INVALID_HANDLE_VALUE) {
+    WriteFile(out, text.data(), DWORD(text.size()), &written, nullptr);
+  }
+}
+
 void Message(const std::string& text, bool error) {
+  if (g_quiet) {
+    Print(text);
+    return;
+  }
   SDL_ShowSimpleMessageBox(error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_INFORMATION, kTitle,
                            text.c_str(), nullptr);
 }
 
 // A question with two buttons: true for the first.
 bool Ask(const std::string& text, const char* yes, const char* no) {
+  if (g_quiet) {
+    return false;
+  }
   const SDL_MessageBoxButtonData buttons[] = {
       {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, yes},
       {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, no},
@@ -83,6 +114,9 @@ fs::path KnownFolder(REFKNOWNFOLDERID id) {
 // The shell's file dialog: a folder, or a file; empty if cancelled.
 fs::path Pick(bool folder, const wchar_t* title) {
   fs::path result;
+  if (g_quiet) {
+    return result;
+  }
   IFileOpenDialog* dialog = nullptr;
   if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                               IID_PPV_ARGS(&dialog)))) {
@@ -445,6 +479,9 @@ class Disc {
 class Progress {
  public:
   Progress(const wchar_t* title, const wchar_t* line) {
+    if (g_quiet) {
+      return;
+    }
     if (SUCCEEDED(CoCreateInstance(CLSID_ProgressDialog, nullptr, CLSCTX_INPROC_SERVER,
                                    IID_PPV_ARGS(&dialog_)))) {
       dialog_->SetTitle(title);
@@ -460,6 +497,17 @@ class Progress {
   }
   // False once the player pressed Cancel.
   bool Update(uint64_t done, uint64_t total) {
+    if (g_quiet && total) {
+      // RecompLauncher's progress line: the copy is 5-90% of the setup.
+      int percent = int(done * 100 / total);
+      if (percent != shown_) {
+        shown_ = percent;
+        char line[64];
+        std::snprintf(line, sizeof(line), "progress %.2f Copying the game from the disc",
+                      0.05 + 0.85 * percent / 100);
+        Print(line);
+      }
+    }
     if (!dialog_) {
       return true;
     }
@@ -469,7 +517,92 @@ class Progress {
 
  private:
   IProgressDialog* dialog_ = nullptr;
+  int shown_ = -1;
 };
+
+// A whole new copy (part) in place of dest: the old one is set aside first and
+// only deleted once its downloadable content and title update are moved
+// over. An empty string, or what went wrong.
+std::string Fail(const fs::path& part, std::string why) {
+  std::error_code ec;
+  fs::remove_all(part, ec);
+  return why;
+}
+
+std::string ReplaceCopy(const fs::path& part, const fs::path& dest) {
+  std::error_code ec;
+  fs::path old = dest;
+  old += ".old";
+  // One left by a swap that failed halfway: its content first.
+  for (const char* keep : {"dlc", "default.xexp"}) {
+    if (!fs::exists(dest / keep, ec) && fs::exists(old / keep, ec)) {
+      fs::rename(old / keep, part / keep, ec);
+    }
+  }
+  fs::remove_all(old, ec);
+  if (fs::exists(dest, ec)) {
+    fs::rename(dest, old, ec);
+    if (ec) {
+      return Fail(part, "Can't replace " + Utf8(dest) + ": close what has it open and try again.");
+    }
+  }
+  fs::rename(part, dest, ec);
+  if (ec) {
+    std::error_code back;
+    fs::rename(old, dest, back);
+    return Fail(part, "Can't write to " + Utf8(dest) + ".");
+  }
+  // (where the new copy has its own: its title update, and both one's
+  // downloadable content)
+  bool kept = true;
+  if (fs::is_directory(old / "dlc", ec) && fs::is_directory(dest / "dlc", ec)) {
+    std::vector<fs::path> packages;  // (listed first, then moved)
+    for (auto it = fs::directory_iterator(old / "dlc", ec); !ec && it != fs::directory_iterator();
+         it.increment(ec)) {
+      packages.push_back(it->path());
+    }
+    kept &= !ec;
+    for (const auto& package : packages) {
+      fs::path to = dest / "dlc" / package.filename();
+      std::error_code me;
+      if (!fs::exists(to, me)) {
+        fs::rename(package, to, me);
+        kept &= !me;
+      }
+    }
+  } else if (fs::exists(old / "dlc", ec)) {
+    fs::rename(old / "dlc", dest / "dlc", ec);
+    kept &= !ec;
+  }
+  if (fs::exists(old / "default.xexp", ec) && !fs::exists(dest / "default.xexp", ec)) {
+    fs::rename(old / "default.xexp", dest / "default.xexp", ec);
+    kept &= !ec;
+  }
+  if (kept) {
+    fs::remove_all(old, ec);
+  }
+  return {};
+}
+
+// An extracted copy's folder copied into dest (RecompLauncher's setup keeps
+// the game in its own folder): an empty string, or what went wrong.
+std::string CopyFolder(const fs::path& from, const fs::path& dest) {
+  std::error_code ec;
+  fs::path part = dest;
+  part += ".part";
+  fs::remove_all(part, ec);
+  fs::copy(from, part, fs::copy_options::recursive, ec);
+  if (ec) {
+    return Fail(part, "Can't copy " + Utf8(from) + " to " + Utf8(dest) + ": " + ec.message());
+  }
+  // (from a read-only folder, a mounted disc: the copy is written to later)
+  for (auto it = fs::recursive_directory_iterator(part, ec); !ec && it != fs::recursive_directory_iterator();
+       it.increment(ec)) {
+    std::error_code pe;
+    fs::permissions(it->path(), fs::perms::owner_write, fs::perm_options::add, pe);
+  }
+  return ReplaceCopy(part, dest);
+}
 
 // The disc's files into dest (a new folder, renamed into place when
 // complete): an empty string, or what went wrong.
@@ -544,62 +677,18 @@ std::string ExtractDisc(const fs::path& image, const fs::path& dest) {
       return fail("Can't write to " + Utf8(part) + ".");
     }
   }
-  // The new copy replaces the old one, which is set aside first and only
-  // deleted once its downloadable content and title update are moved over.
-  fs::path old = dest;
-  old += ".old";
-  // One left by a swap that failed halfway: its content first.
-  for (const char* keep : {"dlc", "default.xexp"}) {
-    if (!fs::exists(dest / keep, ec) && fs::exists(old / keep, ec)) {
-      fs::rename(old / keep, part / keep, ec);
-    }
-  }
-  fs::remove_all(old, ec);
-  if (fs::exists(dest, ec)) {
-    fs::rename(dest, old, ec);
-    if (ec) {
-      return fail("Can't replace " + Utf8(dest) + ": close what has it open and try again.");
-    }
-  }
-  fs::rename(part, dest, ec);
-  if (ec) {
-    std::error_code back;
-    fs::rename(old, dest, back);
-    return fail("Can't write to " + Utf8(dest) + ".");
-  }
-  bool kept = true;
-  for (const char* keep : {"dlc", "default.xexp"}) {
-    if (fs::exists(old / keep, ec)) {
-      fs::rename(old / keep, dest / keep, ec);
-      kept &= !ec;
-    }
-  }
-  if (kept) {
-    fs::remove_all(old, ec);
-  }
-  return {};
+  return ReplaceCopy(part, dest);
 }
 
-// Downloadable content, offered once: the packages in a chosen folder (at any
-// depth, as the console keeps them) copied into the game folder's dlc\,
-// which the game installs from at start.
-void OfferDlc(const fs::path& data, const fs::path& game) {
-  fs::path asked = data / "dlc_asked";
+// This game's downloadable content packages in a folder (at any depth, as
+// the console keeps them), or the one package given.
+std::vector<fs::path> FindDlc(const fs::path& from, const fs::path& game) {
   std::error_code ec;
-  if (fs::exists(asked, ec)) {
-    return;
-  }
-  bool add = Ask("Add downloadable content? Choose the folder with the packages (for example "
-                 "544307D5\\00000002). You can also put them in the dlc folder inside the game "
-                 "folder later.",
-                 "Add DLC", "Skip");
-  std::ofstream(asked) << "1\n";  // answered: not asked again
-  if (!add) {
-    return;
-  }
-  fs::path from = Pick(true, L"The folder with the downloadable content");
-  if (from.empty()) {
-    return;
+  if (fs::is_regular_file(from, ec)) {
+    if (dlc::IsGameDlc(from)) {
+      return {from};
+    }
+    return {};
   }
   // One of each name, none from the game's own dlc folder. Only files that
   // can be packages are opened (no extension, 40 KB or more), and Windows'
@@ -647,10 +736,18 @@ void OfferDlc(const fs::path& data, const fs::path& game) {
       }
     }
   }
+  return packages;
+}
+
+// The packages in from copied into the game folder's dlc\, which the game
+// installs from at start: false (with a message) if none was copied.
+bool CopyDlc(const fs::path& from, const fs::path& game) {
+  std::vector<fs::path> packages = FindDlc(from, game);
   if (packages.empty()) {
     Message("There's no downloadable content for this game in " + Utf8(from) + ".", true);
-    return;
+    return false;
   }
+  std::error_code ec;
   fs::create_directories(game / "dlc", ec);
   int copied = 0;
   for (const auto& package : packages) {
@@ -661,6 +758,29 @@ void OfferDlc(const fs::path& data, const fs::path& game) {
   }
   if (copied < int(packages.size())) {
     Message("Can't copy the downloadable content to " + Utf8(game / "dlc") + ".", true);
+    return false;
+  }
+  return true;
+}
+
+// Downloadable content, offered once: the packages in a chosen folder.
+void OfferDlc(const fs::path& data, const fs::path& game) {
+  fs::path asked = data / "dlc_asked";
+  std::error_code ec;
+  if (fs::exists(asked, ec)) {
+    return;
+  }
+  bool add = Ask("Add downloadable content? Choose the folder with the packages (for example "
+                 "544307D5\\00000002). You can also put them in the dlc folder inside the game "
+                 "folder later.",
+                 "Add DLC", "Skip");
+  std::ofstream(asked) << "1\n";  // answered: not asked again
+  if (!add) {
+    return;
+  }
+  fs::path from = Pick(true, L"The folder with the downloadable content");
+  if (!from.empty()) {
+    CopyDlc(from, game);
   }
 }
 
@@ -686,20 +806,29 @@ bool IsTitleUpdate3(const std::vector<uint8_t>& xexp) {
 }
 
 // Title Update 3 next to default.xex: asked for once (its package, or an
-// extracted default.xexp) and written there, over an older update.
-bool EnsureTitleUpdate(const fs::path& game) {
+// extracted default.xexp; or the one given) and written there, over an
+// older update.
+bool EnsureTitleUpdate(const fs::path& game, fs::path update = {}) {
   std::error_code ec;
   if (fs::file_size(game / "default.xexp", ec) == kTitleUpdate3Size &&
       IsTitleUpdate3(ReadFile(game / "default.xexp"))) {
     return true;
   }
-  Message(std::string("This port runs the game with Title Update 3 (for the World release, media "
-                      "ID 69F555CB). Choose the update: its package (") +
-              kTitleUpdatePackage + ") or an extracted default.xexp.",
-          false);
-  fs::path update = Pick(false, L"Title Update 3 (package or default.xexp)");
-  if (update.empty()) {
+  if (update.empty() && g_quiet) {
+    Message(std::string("Title Update 3 is missing: choose its package (") + kTitleUpdatePackage +
+                ") on the setup screen.",
+            true);
     return false;
+  }
+  if (update.empty()) {
+    Message(std::string("This port runs the game with Title Update 3 (for the World release, "
+                        "media ID 69F555CB). Choose the update: its package (") +
+                kTitleUpdatePackage + ") or an extracted default.xexp.",
+            false);
+    update = Pick(false, L"Title Update 3 (package or default.xexp)");
+    if (update.empty()) {
+      return false;
+    }
   }
   constexpr uintmax_t kMaxPackage = 64ull << 20;  // the update is a few MB
   constexpr const char* kWrong =
@@ -735,6 +864,118 @@ bool EnsureTitleUpdate(const fs::path& game) {
   return true;
 }
 
+fs::path FromUtf8(const std::string& text) {
+  return fs::path(std::u8string(text.begin(), text.end()));
+}
+
+// Saves and settings from the usual place (the game played before
+// RecompLauncher set it up), copied into the launcher's folder once.
+void BringOldData(const fs::path& old, const fs::path& data) {
+  std::error_code ec;
+  if (old.empty() || !fs::is_directory(old, ec) || fs::equivalent(old, data, ec)) {
+    return;
+  }
+  if (fs::is_directory(old / "user", ec) &&
+      (!fs::exists(data / "user", ec) || fs::is_empty(data / "user", ec))) {
+    fs::copy(old / "user", data / "user",
+             fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+  }
+  for (const char* name : {"ng2.toml", "ng2-pipelines.bin"}) {
+    fs::copy_file(old / name, data / name, fs::copy_options::skip_existing, ec);
+  }
+}
+
+// RecompLauncher's setup step (--prepare): the game copied into data (or an
+// extracted copy remembered), Title Update 3 and the downloadable content
+// put in it, with no windows. 0 when the game can be played.
+int Prepare(const fs::path& data, const fs::path& old) {
+  g_quiet = true;
+  std::error_code ec;
+  Print("progress 0.01 Checking your copy of the game");
+  fs::create_directories(data, ec);
+  BringOldData(old, data);
+  fs::create_directories(data / "user", ec);
+  // prepared.txt: the setup finished (RecompLauncher's "done"); gone while a
+  // run works, so one cut short never looks finished. copied.txt: the copy
+  // the game folder was made from, written once it's whole.
+  fs::path marker = data / "prepared.txt", copied = data / "copied.txt";
+  fs::remove(marker, ec);
+  std::string last;
+  std::getline(std::ifstream(copied), last);
+  std::string input = REXCVAR_GET(prepare_game);
+  fs::path source = FromUtf8(input);
+  if (!input.empty() && _wcsicmp(source.filename().c_str(), L"default.xex") == 0) {
+    source = source.parent_path();
+  }
+  std::string sourceText = Utf8(source);
+  // (a file as its path, size and time, so one replaced or mended since is
+  // copied again; a folder is always copied again)
+  bool file = fs::is_regular_file(source, ec);
+  std::string stamp = sourceText;
+  if (file) {
+    stamp += " " + std::to_string(fs::file_size(source, ec)) + " " +
+             std::to_string(fs::last_write_time(source, ec).time_since_epoch().count());
+  }
+  fs::path game = data / "game";
+  if (input.empty()) {
+    // Run again without the copy (a new release): the game set up before.
+    if (!IsGameFolder(game)) {
+      Message("Choose your copy of the game on the setup screen.", true);
+      return 1;
+    }
+  } else if (file && stamp == last && IsGameFolder(game)) {
+    Print("progress 0.90 Already copied");
+  } else {
+    if (!fs::exists(source, ec)) {
+      Message("There's no " + sourceText + ".", true);
+      return 1;
+    }
+    fs::remove(copied, ec);
+    bool folder = fs::is_directory(source, ec);
+    if (folder) {
+      Print("progress 0.10 Copying the game folder");
+    }
+    std::string error = folder ? CopyFolder(source, game) : ExtractDisc(source, game);
+    if (!error.empty()) {
+      Message(error, true);
+      return 1;
+    }
+    std::ofstream(copied) << stamp << '\n';
+  }
+  if (!IsGameFolder(game)) {
+    Message("There's no default.xex in " + Utf8(game) + ": choose the game's folder, disc image "
+            "or Games on Demand package.",
+            true);
+    return 1;
+  }
+  std::ofstream(data / "game_dir.txt", std::ios::trunc) << Utf8(game) << '\n';
+  Print("progress 0.92 Title Update 3");
+  if (!EnsureTitleUpdate(game, FromUtf8(REXCVAR_GET(prepare_update)))) {
+    return 1;
+  }
+  std::string dlc = REXCVAR_GET(prepare_dlc);
+  if (!dlc.empty()) {
+    Print("progress 0.95 Downloadable content");
+    fs::path from = FromUtf8(dlc);
+    if (fs::exists(from, ec)) {
+      if (!CopyDlc(from, game)) {
+        return 1;
+      }
+    } else if (fs::is_directory(game / "dlc", ec) && !fs::is_empty(game / "dlc", ec)) {
+      // (gone since, a drive unplugged: the packages copied before stay)
+      Print(dlc + " isn't there; the downloadable content installed before is kept.");
+    } else {
+      Message("There's no " + dlc + ".", true);
+      return 1;
+    }
+  }
+  std::ofstream(data / "dlc_asked") << "1\n";
+  std::ofstream(data / "launcher.txt") << "1\n";  // (set up there once: never removed)
+  std::ofstream(marker) << Utf8(game) << '\n';
+  Print("progress 1 Ready to play");
+  return 0;
+}
+
 }  // namespace
 
 bool ConfigurePaths(rex::PathConfig& paths) {
@@ -749,10 +990,23 @@ bool ConfigurePaths(rex::PathConfig& paths) {
   wchar_t exe[MAX_PATH] = {};
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
   fs::path beside = fs::path(exe).parent_path();
+  // RecompLauncher: everything in its data folder for the game once its setup
+  // step has run there (a player who skips its setup keeps the usual place).
+  fs::path launcher;
+  if (const wchar_t* v = _wgetenv(L"RECOMPLAUNCHER_DATA"); v && *v) {
+    launcher = v;
+  }
+  bool fromLauncher =
+      !launcher.empty() && (REXCVAR_GET(prepare) || fs::exists(launcher / "launcher.txt", ec) ||
+                            fs::exists(launcher / "prepared.txt", ec));
+  fs::path usual = fs::exists(beside / "portable.txt", ec) ? beside / "userdata" : data;
+  if (REXCVAR_GET(prepare)) {
+    ExitProcess(UINT(Prepare(fromLauncher ? launcher : usual, fromLauncher ? usual : fs::path())));
+  }
   // (a Normal answer is kept as portable_asked in the usual folder)
   bool firstStart = !fs::exists(data / "game_dir.txt", ec) && !fs::exists(data / "portable_asked", ec) &&
                     !fs::exists(beside / "portable.txt", ec);
-  if (firstStart && !std::getenv("NG2_CONFIG")) {
+  if (firstStart && !fromLauncher && !std::getenv("NG2_CONFIG")) {
     fs::path probe = beside / "portable.probe";
     bool writable = std::ofstream(probe).good();
     fs::remove(probe, ec);
@@ -766,7 +1020,9 @@ bool ConfigurePaths(rex::PathConfig& paths) {
       std::ofstream(data / "portable_asked");
     }
   }
-  if (fs::exists(beside / "portable.txt", ec)) {
+  if (fromLauncher) {
+    data = launcher;
+  } else if (fs::exists(beside / "portable.txt", ec)) {
     data = beside / "userdata";
   }
   fs::create_directories(data / "user", ec);

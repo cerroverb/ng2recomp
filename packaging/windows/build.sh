@@ -119,6 +119,8 @@ for dll in "${vcruntime_dlls[@]}"; do cp "$deps/vcruntime/$dll.dll" "$pkg/"; don
 # The pipelines recorded playing the game (tools/collect_pipelines.sh), made in the background at
 # the first start.
 cp "$repo/packaging/ng2-pipelines-seed.bin" "$pkg/"
+# RecompLauncher reads it next to ng2.exe.
+cp "$repo/packaging/recomplauncher.json" "$pkg/"
 cp "$repo/LICENSE" "$repo/THIRD_PARTY.md" "$pkg/licenses/"
 cp "$deps/ffmpeg/LICENSE.txt" "$pkg/licenses/LICENSE-FFmpeg.txt"
 cat > "$pkg/README.txt" <<'TXT'

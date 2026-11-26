@@ -133,6 +133,14 @@ Needs Windows 10 or 11 (64-bit). The Microsoft Visual C++ runtime DLLs are inclu
 Both packages carry the game twice, for any PC with SSE4.2 and for one with AVX2 (most PCs since
 2013, the Steam Deck): the faster one is used where the CPU has it. `NG2_NO_AVX2=1` keeps the other.
 
+### RecompLauncher
+
+The packages carry a `recomplauncher.json`, so [RecompLauncher](https://recomplauncher.com) sets
+the game up from its own setup screen: your copy, Title Update 3 and, if you have it, the DLC
+folder. Everything is then kept in the game's `recompdata` folder there. Saves and settings from an
+earlier install in the usual places (below) are copied over once. With the launcher's setup skipped,
+the game asks on its first start as above.
+
 ### Where things are kept
 
 | | Linux | Windows |
