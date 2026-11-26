@@ -11,8 +11,9 @@
     },
     {
       "id": "update",
-      "label": "Title Update 3: TU_1A461UL_000000G000000.00000000000O4 (on a console in Content/0000000000000000/544307D5/000B0000), or its default.xexp.",
+      "label": "Title Update 3: TU_1A461UL_000000G000000.00000000000O4 (on a console in Content/0000000000000000/544307D5/000B0000), or its default.xexp. Not needed when your extracted copy already has it.",
       "role": "update",
+      "optional": true,
       "formats": [{ "type": "file" }]
     },
     {

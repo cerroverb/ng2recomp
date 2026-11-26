@@ -3410,8 +3410,12 @@ REX_HOOK_RAW(sub_823E8720) {
       (px < kInGameLeft || px > kPauseValueRight || py < 110.0f || py > 185.0f + 41.0f * float(kGameRows))) {
     g_suppress |= 0x10;  // (a click off the rows confirms nothing)
   }
-  if (ng2::menu_mouse::PointerActive() && ng2::menu_mouse::Pointer(&px, &py) && px >= kInGameLeft &&
-      px <= kPauseValueRight) {
+  // (while a four-choice row's steps run, the pointer leaves the cursor on
+  // it, so they all land; a new click still counts)
+  bool stepping = g_pauseSteps && !ng2::menu_mouse::ClickedThisFrame() &&
+                  ng2::menu_mouse::Frame() - g_pauseStepsFrame <= 3;
+  if (!stepping && ng2::menu_mouse::PointerActive() && ng2::menu_mouse::Pointer(&px, &py) &&
+      px >= kInGameLeft && px <= kPauseValueRight) {
     int shown = py >= 110.0f && py < 164.0f ? 0 : PointedRow(kInGameLeft, kPauseValueRight, 185.0f - 41.0f, 41.0f, int(kGameRows) + 1);
     if (shown >= 1 || (shown == 0 && py < 164.0f)) {
       uint32_t to = ToGameIndex(uint32_t(shown));
