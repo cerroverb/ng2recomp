@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <functional>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1211,6 +1212,44 @@ int PointedRow(float left, float right, float top, float pitch, int count) {
 constexpr float kTitleMenuLeft = 500.0f, kTitleMenuRight = 780.0f;
 constexpr float kTitleMenuTop = 432.0f, kTitleMenuPitch = 35.2f;
 
+// Mission Mode's list (sub_823E4758, its state at +0, the mission picked at
+// +4; state 3 takes input): 24 missions in rows of four, three rows shown,
+// scrolled by the view (0x8536CEF0) to keep the picked one in sight, its
+// offset at +0x3A00 (-75 a row). The pointer on a mission picks it as the
+// d-pad does (sound 51, the view told); a click on none confirms nothing
+// (#163).
+REX_EXTERN(__imp__sub_836C7738);  // the mission view: (view, mission)
+constexpr uint32_t kMissionView = 0x8536CEF0;
+constexpr float kMissionLeft = 612.0f, kMissionTop = 197.0f, kMissionWidth = 130.0f, kMissionHeight = 75.0f;
+REX_EXTERN(__imp__sub_823E4758);
+REX_HOOK_RAW(sub_823E4758) {
+  using ng2::guest::Load32;
+  uint32_t object = ctx.r3.u32;
+  float x, y;
+  if (Load32(object) == 3 && ng2::menu_mouse::Pointer(&x, &y)) {
+    int column = int(std::floor((x - kMissionLeft) / kMissionWidth));
+    int row = int(std::floor((y - kMissionTop) / kMissionHeight));
+    int first = int(std::lround(-LoadFloat(kMissionView + 0x3A00) / kMissionHeight));
+    int mission = -1;
+    if (column >= 0 && column < 4 && row >= 0 && row < 3 && first >= 0 && first <= 3) {
+      mission = (first + row) * 4 + column;
+    }
+    if (ng2::menu_mouse::ClickedThisFrame() && mission < 0) {
+      constexpr uint32_t kA = 0x10;
+      for (uint32_t pad = 0; pad < 5; pad++) {  // (the four, then the merged one)
+        uint32_t at = kPadPressed + pad * 0x44;
+        Store32(at, Load32(at) & ~kA);
+      }
+    }
+    if (ng2::menu_mouse::PointerActive() && mission >= 0 && uint32_t(mission) != Load32(object + 4)) {
+      Store32(object + 4, uint32_t(mission));
+      CallGuest(ctx, base, __imp__sub_8242AFC0, {51}, LoadFloat(kCursorSound));
+      CallGuest(ctx, base, __imp__sub_836C7738, {kMissionView, uint32_t(mission)}, 0.0);
+    }
+  }
+  __imp__sub_823E4758(ctx, base);
+}
+
 // The title menu's input: Confirm on the exit entry quits. (Each frame the
 // menu is up: perf_overlay.cpp shows the version then.)
 void TitleMenuFrame();
@@ -1234,6 +1273,8 @@ REX_HOOK_RAW(sub_8366FBC0) {
     uint32_t count = std::min<uint32_t>(ng2::guest::Load32(kTitleEntryCount), 8);
     int row = PointedRow(kTitleMenuLeft, kTitleMenuRight, kTitleMenuTop, kTitleMenuPitch, int(count));
     if (row >= 0 && uint32_t(row) != ng2::guest::Load32(kTitleCursor)) {
+      // (the sound the menu makes when its cursor moves: 17, #163)
+      CallGuest(ctx, base, __imp__sub_8242AFC0, {17}, LoadFloat(kCursorSound));
       Store32(kTitleCursor, uint32_t(row));
     }
   }
@@ -1957,12 +1998,15 @@ REX_HOOK_RAW(sub_823E59A0) {
   }
 }
 
+void GamePagePointer(PPCContext& ctx, uint8_t* base, uint32_t page);
+
 // The category list, replaced while ours is open: our categories only;
 // Confirm opens one's page, Back leaves Options.
 REX_EXTERN(__imp__sub_823E5D88);
 REX_HOOK_RAW(sub_823E5D88) {
   ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
   if (!g_open) {
+    GamePagePointer(ctx, base, 0);
     __imp__sub_823E5D88(ctx, base);
     return;
   }
@@ -2085,6 +2129,147 @@ REX_HOOK_RAW(sub_836D03E8) {
   }
 }
 
+// The game's own Options (ours not open): the pointer on a row puts the
+// page's cursor there, with the menu's cursor sound, before its handler
+// runs (which lights the row); a click on no row confirms nothing, and a
+// click on the row's value picks what's under it (#163). A row's value is
+// in the menu model, as (current, last) words from kOptionsValues + 0x40 *
+// page + 8 * row.
+constexpr uint32_t kOptionsValues = 0x8532EE30;
+enum class Pick : uint8_t {
+  kNone,    // no value (Restore Defaults, a row that opens a page)
+  kHalves,  // a list or a slider: the value's left half left, its right half right
+  kTwo,     // two choices, the left one 0
+  kOnOff,   // two choices, the left one 1 (the game's On/Off rows, and a few)
+  kFour,    // four choices in two lines of two, 0-3 left to right, top to bottom
+};
+struct OptionsRow {
+  float top, bottom;  // in the 1280x720 UI
+  Pick pick;
+  float split = 0;  // kFour: between its two lines
+};
+struct OptionsRows {
+  uint32_t page;
+  float left, right;
+  std::initializer_list<OptionsRow> rows;  // in cursor order ("???" rows: a zero span)
+};
+constexpr float R(int i) { return 123.0f + 44.0f * float(i); }  // the pages' usual rows
+const OptionsRows kOptionsRows[] = {
+    {0, 90.0f, 390.0f,  // the category list
+     {{115, 175, Pick::kNone}, {175, 235, Pick::kNone}, {235, 295, Pick::kNone}, {295, 355, Pick::kNone},
+      {355, 415, Pick::kNone}, {415, 475, Pick::kNone}, {475, 535, Pick::kNone}, {535, 595, Pick::kNone}}},
+    {1, 440.0f, 1110.0f,  // Game Settings
+     {{R(0), R(1), Pick::kHalves}, {R(1), R(2), Pick::kTwo}, {R(2), R(3), Pick::kOnOff},
+      {R(3), R(4), Pick::kOnOff}, {R(4), R(5), Pick::kOnOff}, {R(5), R(6), Pick::kOnOff},
+      {R(6), R(7), Pick::kOnOff}, {R(7), R(8), Pick::kNone}}},
+    {2, 440.0f, 1110.0f,  // Controller Settings
+     {{R(0), R(1), Pick::kTwo}, {R(1), R(3), Pick::kFour, 210}, {R(3), R(4), Pick::kOnOff},
+      {R(4), R(5), Pick::kTwo}, {R(5), R(6), Pick::kNone}}},
+    {3, 440.0f, 1110.0f,  // Camera Settings
+     {{120, 213, Pick::kFour, 158}, {213, 315, Pick::kFour, 268}, {340, 385, Pick::kHalves},
+      {385, 430, Pick::kHalves}, {430, 475, Pick::kNone}}},
+    {4, 440.0f, 1110.0f,  // Screen Settings
+     {{R(0), R(1), Pick::kOnOff}, {R(1), R(2), Pick::kNone}, {0, 0, Pick::kNone}, {R(3), R(4), Pick::kNone}}},
+    {5, 440.0f, 1110.0f,  // Audio Settings
+     {{R(0), R(1), Pick::kHalves}, {R(1), R(2), Pick::kHalves}, {R(2), R(3), Pick::kHalves},
+      {R(3), R(4), Pick::kTwo}, {0, 0, Pick::kNone}, {R(5), R(6), Pick::kNone}}},
+};
+
+// Presses still to make for the last click (a four-choice row's steps, one a
+// frame), on which page, and the menu frame of the last (dropped when the page
+// isn't run for a few frames: Options closed, ours opened).
+uint32_t g_optionsSteps = 0, g_optionsStepsPage = 0;
+uint64_t g_optionsStepsFrame = 0;
+
+void GamePagePointer(PPCContext& ctx, uint8_t* base, uint32_t page) {
+  using ng2::guest::Load32;
+  const OptionsRows* rows = nullptr;
+  for (const OptionsRows& r : kOptionsRows) {
+    if (r.page == page) {
+      rows = &r;
+    }
+  }
+  constexpr uint32_t kA = 0x10, kLeft = 0x4, kRight = 0x8;
+  auto press = [](uint32_t remove, uint32_t add) {
+    for (uint32_t pad = 0; pad < 5; pad++) {  // (the four, then the merged one)
+      uint32_t at = kPadPressed + pad * 0x44;
+      Store32(at, (Load32(at) & ~remove) | add);
+    }
+  };
+  // Restore Defaults' question (page 7): Yes (783-815) or No (882-908) at
+  // y 648-662, its cursor (by the depth, sub_823E82E0) 1 Yes, 0 No; picked
+  // with the question's sound (3).
+  if (page == 7) {
+    const uint32_t cursorAt = kCursors + 4 * std::min(Load32(kDepth), 11u);
+    float x, y;
+    if (ng2::menu_mouse::Pointer(&x, &y)) {
+      int word = y >= 632.0f && y < 678.0f ? (x >= 760.0f && x < 850.0f ? 1 : x >= 850.0f && x < 940.0f ? 0 : -1) : -1;
+      if (ng2::menu_mouse::ClickedThisFrame() && word < 0) {
+        press(kA, 0);
+      }
+      if (ng2::menu_mouse::PointerActive() && word >= 0 && uint32_t(word) != Load32(cursorAt)) {
+        CallGuest(ctx, base, __imp__sub_8242AFC0, {3}, LoadFloat(kCursorSound));
+        Store32(cursorAt, uint32_t(word));
+      }
+    }
+    return;
+  }
+  if (g_optionsSteps && g_optionsStepsPage == page &&
+      ng2::menu_mouse::Frame() - g_optionsStepsFrame <= 3) {
+    g_optionsSteps--;
+    g_optionsStepsFrame = ng2::menu_mouse::Frame();
+    press(kA, kRight);  // (a click meanwhile confirms nothing)
+    return;
+  }
+  g_optionsSteps = 0;
+  float x = 0, y = 0;
+  if (!rows || !ng2::menu_mouse::Pointer(&x, &y)) {
+    return;
+  }
+  int row = -1;
+  const OptionsRow* at = rows->rows.begin();
+  if (x >= rows->left && x <= rows->right) {
+    for (int i = 0; i < int(rows->rows.size()); i++) {
+      if (y >= at[i].top && y < at[i].bottom) {
+        row = i;
+      }
+    }
+  }
+  uint32_t cursorAddress = kCursors + 4 * page;
+  if (ng2::menu_mouse::ClickedThisFrame()) {
+    if (row < 0) {
+      press(kA, 0);
+    } else if (page != 0 && x >= kValueLeft && at[row].pick != Pick::kNone) {
+      // (the click is the value's, not Confirm; on another row than the
+      // cursor's, the cursor goes there below, before the page's handler)
+      const OptionsRow& r = at[row];
+      uint32_t value = Load32(kOptionsValues + 0x40 * page + 8 * uint32_t(row));
+      bool right = x >= kValueCenter;
+      uint32_t add = 0;
+      if (r.pick == Pick::kHalves) {
+        add = right ? kRight : kLeft;
+      } else if (r.pick == Pick::kTwo || r.pick == Pick::kOnOff) {
+        bool leftShown = value == (r.pick == Pick::kOnOff ? 1u : 0u);
+        add = leftShown == right ? kRight : 0;  // (either way toggles)
+      } else if (r.pick == Pick::kFour) {
+        uint32_t target = (y >= r.split ? 2 : 0) + (right ? 1 : 0);
+        uint32_t steps = (target + 4 - (value & 3)) % 4;
+        if (steps) {
+          add = kRight;
+          g_optionsSteps = steps - 1, g_optionsStepsPage = page;
+          g_optionsStepsFrame = ng2::menu_mouse::Frame();
+        }
+      }
+      press(kA, add);
+    }
+  }
+  if (ng2::menu_mouse::PointerActive() && row >= 0 && at[row].bottom > at[row].top &&
+      uint32_t(row) != Load32(cursorAddress)) {
+    CallGuest(ctx, base, __imp__sub_8242AFC0, {2}, LoadFloat(kCursorSound));
+    Store32(cursorAddress, uint32_t(row));
+  }
+}
+
 // The pages' handlers, replaced while ours is open.
 void Handle(PPCContext& ctx, uint8_t* base, void (*handler)(PPCContext&, uint8_t*)) {
   ng2::menu_mouse::NoteMenuInput();  // (a menu up: the mouse's, menu_mouse.cpp)
@@ -2092,6 +2277,9 @@ void Handle(PPCContext& ctx, uint8_t* base, void (*handler)(PPCContext&, uint8_t
   if (g_open && page) {
     RunPage(ctx, base, *page);
   } else {
+    if (!g_open) {
+      GamePagePointer(ctx, base, ng2::guest::Load32(kPage));
+    }
     handler(ctx, base);
   }
 }
@@ -2977,6 +3165,58 @@ REX_HOOK_RAW(sub_823E4158) {
   __imp__sub_823E4158(ctx, base);
 }
 
+// The mouse on the game's own rows of the in-game list and on Quit Game's
+// question (#163). Values: the list's model, (current, last) words from
+// kInGameModel + 8 * (row + 1), the game's row index. Places measured in the
+// 1280x720 UI: the choices of a row in one line, about 182 apart from 545;
+// the sliders from 480 to 820. Quit Game's question (state 1): its cursor at
+// kInGameCursors + 4, 0 No, 1 Yes, the two words at (800, 683) and (895, 683).
+enum class PausePick : uint8_t { kNone, kHalves, kTwo, kOnOff, kFour };
+constexpr PausePick kPausePicks[12] = {
+    PausePick::kNone,   // the manual
+    PausePick::kFour,   // 1st-Person Camera Control: Default, Vertical, Horizontal, All Inverted
+    PausePick::kFour,   // 3rd-Person
+    PausePick::kHalves, // 1st-Person Cam. Speed
+    PausePick::kHalves, // 3rd-Person
+    PausePick::kTwo,    // Swimming Control: Default, Vertical Inverted
+    PausePick::kOnOff,  // Karma Display
+    PausePick::kOnOff,  // Controller Vibration
+    PausePick::kOnOff,  // NINJA CINEMA
+    PausePick::kOnOff,  // Save Method: Auto, Manual
+    PausePick::kNone,   // Quit Game
+    PausePick::kNone,   // Return to Game
+};
+constexpr float kPauseValueLeft = 480.0f, kPauseValueRight = 1200.0f;
+constexpr float kPauseChoiceLeft = 545.0f, kPauseChoicePitch = 182.0f, kPauseSliderMiddle = 650.0f;
+uint32_t g_pauseSteps = 0, g_pauseStepsRow = 0;  // a four-choice row's presses still to make, one a frame
+uint64_t g_pauseStepsFrame = 0;
+void PausePress(uint32_t remove, uint32_t add) {
+  for (uint32_t pad = 0; pad < 5; pad++) {  // (the four, then the merged one)
+    uint32_t at = kPadPressed + pad * 0x44;
+    Store32(at, (ng2::guest::Load32(at) & ~remove) | add);
+  }
+}
+
+// Quit Game's question (sub_823E8D40, state 1): the pointer on Yes or No
+// picks it, with the question's own sound (3); a click on it confirms it, on
+// neither nothing. The handler shows the cursor it reads each frame.
+REX_EXTERN(__imp__sub_823E8D40);
+REX_HOOK_RAW(sub_823E8D40) {
+  ng2::menu_mouse::NoteMenuInput();
+  float x, y;
+  if (ng2::menu_mouse::Pointer(&x, &y)) {
+    int word = y >= 662.0f && y < 706.0f ? (x >= 760.0f && x < 850.0f ? 1 : x >= 850.0f && x < 950.0f ? 0 : -1) : -1;
+    if (ng2::menu_mouse::ClickedThisFrame() && word < 0) {
+      PausePress(0x10, 0);
+    }
+    if (ng2::menu_mouse::PointerActive() && word >= 0 && uint32_t(word) != ng2::guest::Load32(kInGameCursors + 4)) {
+      CallGuest(ctx, base, __imp__sub_8242AFC0, {3}, LoadFloat(kCursorSound));
+      Store32(kInGameCursors + 4, uint32_t(word));
+    }
+  }
+  __imp__sub_823E8D40(ctx, base);
+}
+
 // The list's handler: moves onto and off our row, and our settings while
 // they're shown.
 REX_EXTERN(__imp__sub_823E8720);
@@ -3167,12 +3407,12 @@ REX_HOOK_RAW(sub_823E8720) {
   // the manual's, taller, then the others 41 apart).
   float px, py;
   if (ng2::menu_mouse::ClickedThisFrame() && ng2::menu_mouse::Pointer(&px, &py) &&
-      (px < kInGameLeft || px > kGameListRight || py < 110.0f || py > 185.0f + 41.0f * float(kGameRows))) {
+      (px < kInGameLeft || px > kPauseValueRight || py < 110.0f || py > 185.0f + 41.0f * float(kGameRows))) {
     g_suppress |= 0x10;  // (a click off the rows confirms nothing)
   }
   if (ng2::menu_mouse::PointerActive() && ng2::menu_mouse::Pointer(&px, &py) && px >= kInGameLeft &&
-      px <= kGameListRight) {
-    int shown = py >= 110.0f && py < 164.0f ? 0 : PointedRow(kInGameLeft, kGameListRight, 185.0f - 41.0f, 41.0f, int(kGameRows) + 1);
+      px <= kPauseValueRight) {
+    int shown = py >= 110.0f && py < 164.0f ? 0 : PointedRow(kInGameLeft, kPauseValueRight, 185.0f - 41.0f, 41.0f, int(kGameRows) + 1);
     if (shown >= 1 || (shown == 0 && py < 164.0f)) {
       uint32_t to = ToGameIndex(uint32_t(shown));
       if (to != cursor) {
@@ -3182,7 +3422,49 @@ REX_HOOK_RAW(sub_823E8720) {
         g_suppress |= 0x3;  // the game's handler doesn't move it again
         up = down = false;
       }
+      // A click on a game row's value: the choice under it (left half of a
+      // slider less, right half more); not Confirm.
+      if (ng2::menu_mouse::ClickedThisFrame() && to < 12 && px >= kPauseValueLeft &&
+          kPausePicks[to] != PausePick::kNone) {
+        g_pauseSteps = 0;  // (a new click: the last one's steps no longer)
+        uint32_t value = Load32(kInGameModel + 8 * (to + 1));
+        int choice = std::clamp(int(std::floor((px - kPauseChoiceLeft) / kPauseChoicePitch + 0.5f)), 0, 3);
+        uint32_t add = 0;
+        switch (kPausePicks[to]) {
+          case PausePick::kHalves:
+            add = px < kPauseSliderMiddle ? 0x4 : 0x8;
+            break;
+          case PausePick::kTwo:
+          case PausePick::kOnOff: {
+            bool leftShown = value == (kPausePicks[to] == PausePick::kOnOff ? 1u : 0u);
+            add = (choice == 0) != leftShown ? 0x8 : 0;  // (either way toggles)
+            break;
+          }
+          case PausePick::kFour:
+            if (uint32_t steps = (uint32_t(choice) + 4 - (value & 3)) % 4) {
+              add = 0x8;
+              g_pauseSteps = steps - 1, g_pauseStepsRow = to;
+              g_pauseStepsFrame = ng2::menu_mouse::Frame();
+            }
+            break;
+          default:
+            break;
+        }
+        PausePress(0x10 | 0x4 | 0x8, add);
+        g_suppress |= 0x10;
+      }
     }
+  }
+  // A four-choice row's further steps (one a frame), while it's still the
+  // cursor's row (after the pointer above may have moved it).
+  if (g_pauseSteps && g_pauseStepsRow == cursor && !ng2::menu_mouse::ClickedThisFrame() &&
+      ng2::menu_mouse::Frame() - g_pauseStepsFrame <= 3 && g_pauseStepsFrame != ng2::menu_mouse::Frame()) {
+    g_pauseSteps--;
+    g_pauseStepsFrame = ng2::menu_mouse::Frame();
+    PausePress(0x10, 0x8);
+    g_suppress |= 0x10;
+  } else if (g_pauseStepsRow != cursor || ng2::menu_mouse::Frame() - g_pauseStepsFrame > 3) {
+    g_pauseSteps = 0;
   }
   uint32_t shown = ToShown(cursor), toShown = shown;
   if (shown == kEntryShownAt) {

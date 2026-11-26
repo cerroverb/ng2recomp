@@ -273,6 +273,22 @@ bool ClickedThisFrame() {
   return g_clickedNow.load();
 }
 
+void TestPointer(int32_t x, int32_t y) {
+  g_width.store(1280), g_height.store(720);
+  g_x.store(x), g_y.store(y);
+  g_used.store(true);
+  g_moved.store(true);
+}
+void TestClick() {
+  if (!g_menu.load()) {
+    return;
+  }
+  g_used.store(true);
+  if (g_leftClicks.load() < kMostQueued) {
+    g_leftClicks.fetch_add(1);
+  }
+}
+
 bool Pointer(float* x, float* y) {
   int32_t px = g_x.load(), py = g_y.load(), w = g_width.load(), h = g_height.load();
   if (px < 0 || w <= 0 || h <= 0) {

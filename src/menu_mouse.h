@@ -21,11 +21,6 @@ void SetMenu(bool menu);
 // doesn't end a menu).
 void FrameStart();
 uint64_t Frame();
-// The game's frames, counted at each frame's start (controls.cpp): the
-// menus' signs are kept for a couple of them, not a time (a slow frame
-// doesn't end a menu).
-void FrameStart();
-uint64_t Frame();
 bool InMenu();
 // A menu read the pad (its helpers: a direction, Confirm, Back), from their
 // hooks; MenuInputLately: in the last frames (play reads actions instead).
@@ -42,6 +37,10 @@ bool InStage();
 // (Clear), not Y.
 void DeleteClears();
 bool DeleteClearsNow();
+// Scripted runs (script_input.h's "ptr<x>x<y>" and "click" steps): the
+// pointer moved to that point of a 1280x720 window, and a left click.
+void TestPointer(int32_t x, int32_t y);
+void TestClick();
 // Where the pointer is, in the game's 1280x720 UI (false: not known).
 bool Pointer(float* x, float* y);
 // The mouse was moved, clicked or wheeled in a menu since this was last
