@@ -32,6 +32,8 @@ cp "$repo/tools/xdvdfs_extract.py" "$repo/tools/stfs_extract.py" "$repo/tools/fi
 cp "$here/AppRun" "$app/AppRun"
 chmod +x "$app/AppRun"
 cp "$here/ng2.desktop" "$app/"
+# RecompLauncher reads it at the AppImage's root.
+cp "$repo/packaging/recomplauncher.json" "$app/"
 cp "$here/ng2.png" "$app/ng2.png"
 
 ARCH=x86_64 "$tool" --no-appstream "$app" "$out/NinjaGaiden2-x86_64.AppImage" >/dev/null

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Print this game's downloadable content packages under a folder, at any
 depth (STFS LIVE/PIRS/CON packages of content type 2 for title 544307D5),
-one path per line. Only files that can be packages are opened (no extension,
-40 KB or more), and system folders are passed over, so a whole drive is quick
-to search.
+one path per line; given a package, that one if it is. Only files that can
+be packages are opened (no extension, 40 KB or more), and system folders are
+passed over, so a whole drive is quick to search.
 
-usage: find_dlc.py <folder>
+usage: find_dlc.py <folder | package>
 """
 import os
 import struct
@@ -35,6 +35,10 @@ def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     top = os.path.realpath(sys.argv[1])
+    if os.path.isfile(top):  # one package (RecompLauncher's setup)
+        if is_dlc(top):
+            print(top)
+        return
     for root, dirs, files in os.walk(top):
         drive = os.path.dirname(root) == root or os.path.ismount(root)
         dirs[:] = [d for d in dirs if d.lower() not in SKIP and not (drive and d.lower() in SKIP_TOP)]

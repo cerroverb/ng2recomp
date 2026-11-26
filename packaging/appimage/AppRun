@@ -11,6 +11,29 @@ data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/ng2-recomp
 # first start offers it when that folder can be written.
 beside=${APPIMAGE:+$(dirname "$APPIMAGE")}
 
+# RecompLauncher (recomplauncher.json): its setup step, --prepare with the
+# player's files (--prepare_game=, --prepare_update=, --prepare_dlc=), sets
+# the game up in RECOMPLAUNCHER_DATA without dialogs, printing progress lines,
+# then exits. Once it has, everything is kept there; a player who skips the
+# launcher's setup keeps the usual places.
+prepare= prepare_game= prepare_update= prepare_dlc= args=()
+for arg in "$@"; do
+  case $arg in
+    --prepare|--prepare=true) prepare=1 ;;
+    --prepare_game=*) prepare_game=${arg#*=} ;;
+    --prepare_update=*) prepare_update=${arg#*=} ;;
+    --prepare_dlc=*) prepare_dlc=${arg#*=} ;;
+    *) args+=("$arg") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+old_config= old_data=
+launcher=${RECOMPLAUNCHER_DATA:-}
+if [ -n "$launcher" ] && { [ -n "$prepare" ] || [ -f "$launcher/prepared.txt" ]; }; then
+  old_config=$config_dir old_data=$data_dir
+  config_dir=$launcher data_dir=$launcher beside=
+fi
+
 # Dialogs: kdialog (KDE), else qarma or zenity (other desktops, such as GNOME,
 # Cinnamon or Xfce), else questions in the terminal the AppImage was started
 # from. ui_* return non-zero when the player cancels.
@@ -20,6 +43,7 @@ elif command -v qarma >/dev/null; then ui=qarma
 elif command -v zenity >/dev/null; then ui=zenity markup=(--no-markup)
 elif [ -t 0 ] && [ -t 1 ]; then ui=terminal
 fi
+[ -z "$prepare" ] || ui=
 ui_message() {  # <title> <text>
   case $ui in
     kdialog) kdialog --title "$1" --msgbox "$2" ;;
@@ -139,6 +163,146 @@ extract() {
   return $status
 }
 
+# A disc image or package copied into $data_dir/game, in place of the copy
+# there (its downloadable content and title update kept); exits on an error,
+# 130 if the player cancelled. With "lines": RecompLauncher's progress lines.
+install_disc() {
+  local game=$data_dir/game status=0 kept keep
+  rm -rf "$game.part"
+  if [ "${2:-}" = lines ]; then
+    python3 -I "$here/usr/bin/xdvdfs_extract.py" "$1" "$game.part" --progress 2>"$data_dir/extract.log" |
+      while read -r percent; do
+        printf 'progress 0.%02d Copying the game from the disc\n' $((5 + percent * 85 / 100))
+      done || status=$?
+  else
+    extract "$1" "$game.part" || status=$?
+  fi
+  if [ $status -ne 0 ]; then
+    rm -rf "$game.part"
+    [ $status -eq 130 ] && return 130  # cancelled
+    error "Could not read the game from that file: $(tail -1 "$data_dir/extract.log")"
+  fi
+  [ -f "$game.part/default.xex" ] || { rm -rf "$game.part"; error "There's no default.xex on that disc."; }
+  # The new copy replaces the old one, which is set aside first and only
+  # deleted once its downloadable content and title update are moved over.
+  # One left by a swap that failed halfway: its content first.
+  for keep in dlc default.xexp; do
+    if [ ! -e "$game/$keep" ] && [ -e "$game.old/$keep" ]; then
+      mv "$game.old/$keep" "$game.part/$keep" || { rm -rf "$game.part"; error "Can't move $game.old/$keep."; }
+    fi
+  done
+  rm -rf "$game.old"
+  if [ -e "$game" ]; then
+    mv "$game" "$game.old" || { rm -rf "$game.part"; error "Can't replace $game."; }
+  fi
+  mv "$game.part" "$game" || { mv "$game.old" "$game" 2>/dev/null; error "Can't write to $game."; }
+  kept=1
+  for keep in dlc default.xexp; do
+    if [ -e "$game.old/$keep" ]; then mv "$game.old/$keep" "$game/$keep" || kept=; fi
+  done
+  [ -n "$kept" ] && rm -rf "$game.old"
+  return 0
+}
+
+# Title Update 3's default.xexp from its package or an extracted copy, into
+# the game folder $2; exits if it isn't that update.
+install_update() {
+  local update=$1 game=$2
+  [ -f "$update" ] || error "There's no $update."
+  [ -w "$game" ] || error "Can't write to $game: copy default.xexp there yourself."
+  case "$(basename "$update")" in
+    *.xexp|*.XEXP) cp "$update" "$game/default.xexp.part" || error "Can't copy to $game." ;;
+    *) python3 -I "$here/usr/bin/stfs_extract.py" "$update" default.xexp "$game/default.xexp.part" ||
+         error "That file isn't the title update." ;;
+  esac
+  # Title Update 3's default.xexp for this disc, nothing else (the Japanese
+  # release's TU3, another update or game's wouldn't fit this build).
+  if [ "$(sha1sum "$game/default.xexp.part" | cut -d' ' -f1)" != "$tu3_sha1" ]; then
+    rm -f "$game/default.xexp.part"
+    error "That isn't Title Update 3 for this disc (the World release's: TU_1A461UL_000000G000000.00000000000O4)."
+  fi
+  mv "$game/default.xexp.part" "$game/default.xexp"
+}
+
+# This game's downloadable content packages in folder or file $1 copied into
+# the game folder $2's dlc/ (one of each name, none from that dlc folder).
+install_dlc() {
+  local from=$1 game=$2 target package name
+  target=$(realpath -m "$game/dlc")
+  local -a packages=()
+  local -A seen=()
+  while IFS= read -r package; do
+    name=$(basename "$package")
+    case "$(realpath -m "$package")" in "$target"/*) continue ;; esac
+    [ -n "${seen[$name]:-}" ] && continue
+    seen[$name]=1
+    packages+=("$package")
+  done < <(python3 -I "$here/usr/bin/find_dlc.py" "$from")
+  if [ ${#packages[@]} -eq 0 ]; then
+    ui_error "There's no downloadable content for this game in $from."
+    return 1
+  elif ! { mkdir -p "$game/dlc" && cp -f "${packages[@]}" "$game/dlc/"; }; then
+    ui_error "Can't copy the downloadable content to $game/dlc."
+    return 1
+  fi
+}
+
+tu3_sha1=e9df578781355d9a25e1c0adba8fbb859333456a  # the World disc's (media ID 69F555CB)
+tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062  # what earlier builds ran: replaced
+
+if [ -n "$prepare" ]; then
+  echo "progress 0.01 Checking your copy of the game"
+  # Saves and settings from the usual places (the game played before the
+  # launcher set it up), copied once.
+  if [ -n "$old_data" ] && [ "$old_data" != "$data_dir" ]; then
+    if [ -d "$old_data/user" ] && [ -z "$(ls -A "$data_dir/user")" ]; then
+      cp -a "$old_data/user/." "$data_dir/user/" || true
+    fi
+    for name in ng2.toml ng2-pipelines.bin; do
+      if [ ! -e "$config_dir/$name" ] && [ -f "$old_config/$name" ]; then cp "$old_config/$name" "$config_dir/" || true; fi
+    done
+  fi
+  # prepared.txt: the copy it was set up from; gone while a run works, so one
+  # cut short never looks finished.
+  last=$(cat "$data_dir/prepared.txt" 2>/dev/null || true)
+  rm -f "$data_dir/prepared.txt"
+  if [ -z "$prepare_game" ]; then
+    # Run again without the copy (a new release): the game set up before.
+    game=$(cat "$config_dir/game_dir" 2>/dev/null || true)
+    [ -n "$game" ] && [ -f "$game/default.xex" ] || error "Choose your copy of the game on the setup screen."
+  elif [ -d "$prepare_game" ]; then
+    game=$prepare_game
+  elif [ "$(basename "${prepare_game,,}")" = default.xex ]; then
+    game=$(dirname "$prepare_game")
+  elif [ "$prepare_game" = "$last" ] && [ -f "$data_dir/game/default.xex" ]; then
+    game=$data_dir/game  # copied from it before
+    echo "progress 0.90 Already copied"
+  else
+    [ -f "$prepare_game" ] || error "There's no $prepare_game."
+    install_disc "$prepare_game" lines
+    game=$data_dir/game
+  fi
+  [ -f "$game/default.xex" ] ||
+    error "There's no default.xex in $game: choose the game's folder, disc image or Games on Demand package."
+  printf '%s\n' "$game" > "$config_dir/game_dir"
+  echo "progress 0.92 Title Update 3"
+  if [ -f "$game/default.xexp" ] && [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu3_sha1" ]; then
+    :
+  elif [ -n "$prepare_update" ]; then
+    install_update "$prepare_update" "$game"
+  else
+    error "Title Update 3 is missing: choose its package (TU_1A461UL_000000G000000.00000000000O4) on the setup screen."
+  fi
+  if [ -n "$prepare_dlc" ]; then
+    echo "progress 0.95 Downloadable content"
+    install_dlc "$prepare_dlc" "$game" || exit 1
+  fi
+  touch "$config_dir/dlc_asked"
+  printf '%s\n' "${prepare_game:-$last}" > "$data_dir/prepared.txt"
+  echo "progress 1 Ready to play"
+  exit 0
+fi
+
 # The game files: NG2_GAME_DIR, the remembered folder, or ask: default.xex in
 # an extracted copy, or a disc image or Games on Demand package (its header
 # file, next to the .data folder), which is extracted into the data folder.
@@ -171,39 +335,14 @@ if [ -z "$game" ] || [ ! -f "$game/default.xex" ]; then
   case "${name,,}" in
     default.xex) game=$(dirname "$choice") ;;
     *)
+      install_disc "$choice" || exit 0  # (130: cancelled)
       game=$data_dir/game
-      rm -rf "$game.part"
-      extract "$choice" "$game.part" || {
-        status=$?
-        rm -rf "$game.part"
-        [ $status -eq 130 ] && exit 0  # cancelled
-        error "Could not read the game from that file: $(tail -1 "$data_dir/extract.log")"
-      }
-      [ -f "$game.part/default.xex" ] || { rm -rf "$game.part"; error "There's no default.xex on that disc."; }
-      # The new copy replaces the old one, which is set aside first and only
-      # deleted once its downloadable content and title update are moved over.
-      # One left by a swap that failed halfway: its content first.
-      for keep in dlc default.xexp; do
-        if [ ! -e "$game/$keep" ] && [ -e "$game.old/$keep" ]; then mv "$game.old/$keep" "$game.part/$keep"; fi
-      done
-      rm -rf "$game.old"
-      if [ -e "$game" ]; then
-        mv "$game" "$game.old" || { rm -rf "$game.part"; error "Can't replace $game."; }
-      fi
-      mv "$game.part" "$game" || { mv "$game.old" "$game" 2>/dev/null; error "Can't write to $game."; }
-      kept=1
-      for keep in dlc default.xexp; do
-        if [ -e "$game.old/$keep" ]; then mv "$game.old/$keep" "$game/$keep" || kept=; fi
-      done
-      [ -n "$kept" ] && rm -rf "$game.old"
       ;;
   esac
   [ -f "$game/default.xex" ] || error "No default.xex in $game."
   printf '%s\n' "$game" > "$config_dir/game_dir"
 fi
 
-tu3_sha1=e9df578781355d9a25e1c0adba8fbb859333456a  # the World disc's (media ID 69F555CB)
-tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062  # what earlier builds ran: replaced
 # Title Update 3 (default.xexp next to default.xex): ask for the update
 # package (or an extracted default.xexp) once and put it in the game folder.
 if [ -f "$game/default.xexp" ] && [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ]; then
@@ -215,20 +354,7 @@ if [ ! -f "$game/default.xexp" ]; then
   ui_message "Ninja Gaiden II: Title Update 3" \
     "This port runs the game with Title Update 3 (for the World release, media ID 69F555CB). Choose the update: its package (TU_1A461UL_000000G000000.00000000000O4) or an extracted default.xexp." || exit 0
   update=$(ui_file "Ninja Gaiden II: Title Update 3" "TU_* default.xexp|Title update or default.xexp") || exit 0
-  [ -f "$update" ] || error "There's no $update."
-  [ -w "$game" ] || error "Can't write to $game: copy default.xexp there yourself."
-  case "$(basename "$update")" in
-    *.xexp|*.XEXP) cp "$update" "$game/default.xexp.part" || error "Can't copy to $game." ;;
-    *) python3 -I "$here/usr/bin/stfs_extract.py" "$update" default.xexp "$game/default.xexp.part" ||
-         error "That file isn't the title update." ;;
-  esac
-  # Title Update 3's default.xexp for this disc, nothing else (the Japanese
-  # release's TU3, another update or game's wouldn't fit this build).
-  if [ "$(sha1sum "$game/default.xexp.part" | cut -d' ' -f1)" != "$tu3_sha1" ]; then
-    rm -f "$game/default.xexp.part"
-    error "That isn't Title Update 3 for this disc (the World release's: TU_1A461UL_000000G000000.00000000000O4)."
-  fi
-  mv "$game/default.xexp.part" "$game/default.xexp"
+  install_update "$update" "$game"
 fi
 [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu3_sha1" ] ||
   error "$game/default.xexp isn't Title Update 3 for this disc. Remove it to choose the update again."
@@ -242,22 +368,7 @@ if [ ! -f "$config_dir/dlc_asked" ] && [ -n "$ui" ]; then
       "Add downloadable content? Choose the folder with the packages (for example 544307D5/00000002). You can also put them in the dlc folder inside the game folder later."; then
     from=$(ui_folder "Ninja Gaiden II: downloadable content") || from=
     if [ -n "$from" ]; then
-      # One of each name, none from the game's own dlc folder.
-      target=$(realpath -m "$game/dlc")
-      packages=()
-      declare -A seen=()
-      while IFS= read -r package; do
-        name=$(basename "$package")
-        case "$(realpath -m "$package")" in "$target"/*) continue ;; esac
-        [ -n "${seen[$name]:-}" ] && continue
-        seen[$name]=1
-        packages+=("$package")
-      done < <(python3 -I "$here/usr/bin/find_dlc.py" "$from")
-      if [ ${#packages[@]} -eq 0 ]; then
-        ui_error "There's no downloadable content for this game in $from."
-      elif ! { mkdir -p "$game/dlc" && cp -f "${packages[@]}" "$game/dlc/"; }; then
-        ui_error "Can't copy the downloadable content to $game/dlc."
-      fi
+      install_dlc "$from" "$game" || true
     fi
   fi
 fi
