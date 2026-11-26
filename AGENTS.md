@@ -108,8 +108,9 @@ devices, and none of the player's settings or saves.
 - Exclusive full screen (Windows): with Frame Interpolation on and Window Mode Fullscreen (`fullscreen`
   and `exclusive_fullscreen`), the swapchain takes the display (VK_EXT_full_screen_exclusive, plume
   patches 0017, 0020 and 0021), so its presents are flipped by the display instead of composed by DWM, which
-  drops pictures at high refresh rates; decided again when either changes. `NG2_EXCLUSIVE=1` takes it
-  always, `2` leaves it to the driver, `0` never.
+  drops pictures at high refresh rates; decided again when either changes. In Borderless the swapchain
+  never takes it (AMD otherwise does, and screen capture sees black, #74). `NG2_EXCLUSIVE=1` takes it
+  always, `2` leaves it to the driver, `0` doesn't ask, `3` never.
 - Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
   2 each second, each one at 120 Hz and below, 3 2x: one picture between the game's frames; experimental,
   off by default; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws
