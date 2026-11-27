@@ -17,6 +17,7 @@
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
+#include "achievements.h"
 #include "controls.h"
 #include "aspect.h"
 #include "camera.h"
@@ -149,6 +150,7 @@ class Ng2App : public rex::ReXApp {
       std::_Exit(1);
     }
     ng2::movie::SetGameDataRoot(game_data_root());
+    ng2::achievements::SetGameRoot(game_data_root());
     if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
       // (half made, nothing could draw: stopped here rather than at the first draw)
       REXLOG_ERROR("native renderer: cannot create the Vulkan device");

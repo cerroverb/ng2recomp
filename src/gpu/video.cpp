@@ -12,6 +12,8 @@
 // guest address, which is also how Swap finds the front buffer.
 
 #include "video.h"
+
+#include "../achievements.h"
 #include "../aspect.h"
 namespace ng2 {
 bool Base720p();  // base_resolution.cpp
@@ -102,6 +104,8 @@ extern const uint8_t g_copy_7e3_ps[];
 extern const size_t g_copy_7e3_ps_size;
 extern const uint8_t g_copy_7e3_ms_ps[];
 extern const size_t g_copy_7e3_ms_ps_size;
+extern const uint8_t g_image_ps[];
+extern const size_t g_image_ps_size;
 extern const uint8_t g_scale_ps[];
 extern const size_t g_scale_ps_size;
 extern const uint8_t g_depth_copy_ps[];
@@ -349,6 +353,7 @@ std::unique_ptr<RenderShader> g_copyShader;
 std::unique_ptr<RenderShader> g_copy7e3Shader;
 std::unique_ptr<RenderShader> g_copy7e3MsShader;
 std::unique_ptr<RenderShader> g_scaleShader;
+std::unique_ptr<RenderShader> g_imageShader;
 std::unique_ptr<RenderShader> g_debugShader;
 std::unique_ptr<RenderShader> g_depthCopyShader;
 std::unique_ptr<RenderShader> g_depthCopyMsShader;
@@ -1324,6 +1329,14 @@ bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
   }
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
     g_traceRequest = true;
+  }
+  // NG2_TEST_TOAST=1: F6 shows an achievement's toast (achievements.h)
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F6 && !event->key.repeat) {
+    ng2::achievements::PreviewToast();
+  }
+  // NG2_TEST_UNLOCK_KEY=1: F5 unlocks the next locked achievement, for real
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F5 && !event->key.repeat) {
+    ng2::achievements::TestUnlockNext();
   }
   return true;
 }
@@ -6572,6 +6585,206 @@ void WriteInterpShots() {
   g_interpShots.clear();
 }
 
+// UI images (video.h): pictures of ours in the game's 1280x720 UI, drawn
+// over its frame as the frame is presented (on a copy of the front buffer,
+// so every way of presenting it shows them), or under its 2D (under: into
+// its 2D target, in order with its draws). Each image's pixels are given once and
+// uploaded at its first draw; the images to draw are set each frame by a
+// guest thread and dropped when not set again for a couple of frames.
+struct UiImageTexture {
+  uint32_t width = 0, height = 0;
+  std::vector<uint8_t> rgba;  // until uploaded
+  std::unique_ptr<HostTexture> texture;
+};
+std::mutex g_uiImagesMutex;
+std::unordered_map<uint32_t, UiImageTexture> g_uiImageTextures;  // (g_uiImagesMutex)
+std::vector<ng2::video::UiImage> g_uiImages;                     // (g_uiImagesMutex)
+uint64_t g_uiImagesFrame = 0;                                    // (g_uiImagesMutex)
+std::atomic<uint64_t> g_uiPresents{0};  // presents counted for them (SetUiImages runs on a guest thread)
+std::unordered_map<uint32_t, std::unique_ptr<RenderPipeline>> g_imagePipelines;  // by target format
+// The front buffer with the images over it: they're drawn on a copy, never
+// into the game's own resolve (shown again on a repeated frame, or read by
+// the game, it would carry them).
+std::unique_ptr<HostTexture> g_uiComposite;
+
+// This frame's images, those drawn under the game's 2D (under) or over it.
+std::vector<ng2::video::UiImage> UiImagesNow(bool under) {
+  std::vector<ng2::video::UiImage> images;
+  std::lock_guard lock(g_uiImagesMutex);
+  if (g_uiImagesFrame + 2 < g_uiPresents.load(std::memory_order_relaxed)) {
+    return images;
+  }
+  for (const auto& image : g_uiImages) {
+    if (image.under == under) {
+      images.push_back(image);
+    }
+  }
+  return images;
+}
+
+void DrawImagesInto(HostTexture* target, const std::vector<ng2::video::UiImage>& images);
+
+// The front buffer to present: front itself, or a copy with this frame's
+// images.
+HostTexture* DrawUiImages(HostTexture* front) {
+  std::vector<ng2::video::UiImage> images = UiImagesNow(false);
+  if (images.empty()) {
+    return front;
+  }
+  if (!front || !front->texture || front->samples != RenderSampleCount::COUNT_1 || !g_imageShader) {
+    return front;
+  }
+  if (!g_uiComposite || g_uiComposite->width != front->width || g_uiComposite->height != front->height ||
+      g_uiComposite->format != front->format) {
+    if (g_uiComposite) {
+      g_garbage[g_frame].push_back(std::move(g_uiComposite));
+    }
+    g_uiComposite = std::make_unique<HostTexture>();
+    g_uiComposite->width = front->width;
+    g_uiComposite->height = front->height;
+    g_uiComposite->format = front->format;
+    g_uiComposite->halfScale = front->halfScale;
+    g_uiComposite->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+        front->width, front->height, 1, front->format, RenderTextureFlag::RENDER_TARGET));
+    if (!g_uiComposite->texture) {
+      g_uiComposite.reset();
+      return front;
+    }
+    SetDescriptor(*g_uiComposite);
+  }
+  HostTexture* target = g_uiComposite.get();
+  Transition(*front, RenderTextureLayout::COPY_SOURCE);
+  Transition(*target, RenderTextureLayout::COPY_DEST);
+  CommandList()->copyTextureRegion(RenderTextureCopyLocation::Subresource(target->texture.get()),
+                                   RenderTextureCopyLocation::Subresource(front->texture.get()));
+  DrawImagesInto(target, images);
+  return target;
+}
+
+// Images drawn into a single-sampled target (the 1280x720 UI mapped onto it).
+void DrawImagesInto(HostTexture* target, const std::vector<ng2::video::UiImage>& images) {
+  auto& pipeline = g_imagePipelines[uint32_t(target->format)];
+  if (!pipeline) {
+    RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = g_pipelineLayout.get();
+    desc.vertexShader = g_fullscreenShader.get();
+    desc.pixelShader = g_imageShader.get();
+    desc.renderTargetFormat[0] = target->format;
+    desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+    desc.renderTargetCount = 1;
+    pipeline = g_device->createGraphicsPipeline(desc);
+    if (!pipeline) {
+      return;
+    }
+  }
+  float scaleX = float(target->width) / 1280.0f, scaleY = float(target->height) / 720.0f;
+  // (squeezed about the 2D's centre as the game's 2D is, for the presenter
+  // to stretch back: aspect.cpp)
+  float squeezeX = aspect::SqueezeX(), squeezeY = aspect::SqueezeY();
+  bool bound = false;
+  for (const auto& image : images) {
+    HostTexture* texture = nullptr;
+    {
+      std::lock_guard lock(g_uiImagesMutex);
+      auto it = g_uiImageTextures.find(image.key);
+      if (it == g_uiImageTextures.end() || !it->second.width) {
+        continue;
+      }
+      UiImageTexture& made = it->second;
+      if (!made.texture) {
+        made.texture = std::make_unique<HostTexture>();
+        made.texture->width = made.width;
+        made.texture->height = made.height;
+        made.texture->format = RenderFormat::R8G8B8A8_UNORM;
+        made.texture->texture = g_device->createTexture(
+            RenderTextureDesc::Texture2D(made.width, made.height, 1, RenderFormat::R8G8B8A8_UNORM));
+        if (!made.texture->texture) {
+          made.width = 0;  // (not again)
+          continue;
+        }
+        SetDescriptor(*made.texture);
+        uint32_t rowBytes = made.width * 4, pitch = (rowBytes + 255) & ~255u;
+        Upload upload = AllocateCopySource(uint64_t(pitch) * made.height, 512);
+        for (uint32_t y = 0; y < made.height; y++) {
+          std::memcpy(upload.data + uint64_t(y) * pitch, made.rgba.data() + uint64_t(y) * rowBytes, rowBytes);
+        }
+        Transition(*made.texture, RenderTextureLayout::COPY_DEST);
+        CommandList()->copyTextureRegion(
+            RenderTextureCopyLocation::Subresource(made.texture->texture.get()),
+            RenderTextureCopyLocation::PlacedFootprint(upload.buffer, RenderFormat::R8G8B8A8_UNORM, made.width,
+                                                       made.height, 1, pitch / 4, upload.offset));
+        made.rgba.clear();
+        made.rgba.shrink_to_fit();
+        bound = false;
+      }
+      texture = made.texture.get();
+    }
+    if (!texture->descriptor) {
+      continue;
+    }
+    Transition(*texture, RenderTextureLayout::SHADER_READ);
+    if (!bound) {
+      BindFramebuffer(target, nullptr);
+      bound = true;
+    }
+    float x = (640.0f + (image.x - 640.0f) * squeezeX) * scaleX;
+    float y = (360.0f + (image.y - 360.0f) * squeezeY) * scaleY;
+    float w = image.width * squeezeX * scaleX, h = image.height * squeezeY * scaleY;
+    int32_t left = std::max(int32_t(std::floor(x)), 0), top = std::max(int32_t(std::floor(y)), 0);
+    int32_t right = std::min(int32_t(std::ceil(x + w)), int32_t(target->width));
+    int32_t bottom = std::min(int32_t(std::ceil(y + h)), int32_t(target->height));
+    if (right <= left || bottom <= top) {
+      continue;
+    }
+    auto* commandList = CommandList();
+    RenderViewport viewport(x, y, w, h);
+    RenderRect scissor(left, top, right, bottom);
+    struct {
+      uint32_t texture, sampler;
+      float alpha;
+      uint32_t grey;
+    } constants{texture->descriptor, SAMPLER_LINEAR_CLAMP, image.alpha, image.grey ? 1u : 0u};
+    commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    commandList->setPipeline(pipeline.get());
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    commandList->setGraphicsPushConstants(0, &constants, 0, sizeof(constants));
+    commandList->setViewports(&viewport, 1);
+    commandList->setScissors(&scissor, 1);
+    commandList->drawInstanced(3, 1, 0, 0);
+  }
+  if (!bound) {
+    BindFramebuffer(target, nullptr);  // (none drawn: still a target's layout)
+  }
+}
+
+// The images under the game's 2D, into the target it draws its 2D in now.
+void RunUiImagesUnder(uint32_t device) {
+  std::vector<ng2::video::UiImage> images = UiImagesNow(true);
+  if (images.empty()) {
+    return;
+  }
+  std::lock_guard lock(g_mutex);
+  if (!g_device || !g_imageShader) {
+    return;
+  }
+  FlushPendingDraw();
+  BeginFrame();
+  HostTexture* target = GetSurface(guest::Load32(device + guest::device::kRenderTargets), false);
+  if (!target || !target->texture || target->samples != RenderSampleCount::COUNT_1) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_WARN("video: the UI images under the 2D not drawn: its target is {}",
+                  target ? "multisampled" : "unknown");
+    }
+    return;
+  }
+  DrawImagesInto(target, images);
+}
+
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   {
@@ -6588,6 +6801,8 @@ void Present(HostTexture* frontBuffer) {
     lastTicks = ticks;
   }
   auto* commandList = CommandList();
+  frontBuffer = DrawUiImages(frontBuffer);
+  g_uiPresents.fetch_add(1, std::memory_order_relaxed);
   FinishGuestMemory();
   // NG2_TRACE_FILE=<file>: as F7 when the file appears (for test runs).
   static const char* traceFile = std::getenv("NG2_TRACE_FILE");
@@ -7492,6 +7707,7 @@ void CreatePipelines() {
   g_copy7e3Shader = CreateShader(g_copy_7e3_ps, g_copy_7e3_ps_size);
   g_copy7e3MsShader = CreateShader(g_copy_7e3_ms_ps, g_copy_7e3_ms_ps_size);
   g_scaleShader = CreateShader(g_scale_ps, g_scale_ps_size);
+  g_imageShader = CreateShader(g_image_ps, g_image_ps_size);
   g_debugShader = CreateShader(g_debug_ps, g_debug_ps_size);
   g_depthCopyShader = CreateShader(g_depth_copy_ps, g_depth_copy_ps_size);
   g_depthCopyMsShader = CreateShader(g_depth_copy_ms_ps, g_depth_copy_ms_ps_size);
@@ -8505,6 +8721,16 @@ void DestroyHostDevice() {
   g_presentPipeline.reset();
   g_presentShader.reset();
   g_fullscreenShader.reset();
+  // (the UI images: before the device they were made on)
+  g_imagePipelines.clear();
+  g_uiComposite.reset();
+  g_imageShader.reset();
+  {
+    std::lock_guard lock(g_uiImagesMutex);
+    for (auto& [key, made] : g_uiImageTextures) {
+      made.texture.reset();
+    }
+  }
   for (auto& view : g_nullTextureViews) {
     view.reset();
   }
@@ -9058,7 +9284,7 @@ constexpr uint32_t kMirrorSize = 0x4800;
 // physical memory (the drawing takes its physical address).
 constexpr uint32_t kStagingHalf = 2u << 20;
 
-enum class Rec : uint32_t { kDraw, kInline, kClear, kResolve, kSwap };
+enum class Rec : uint32_t { kDraw, kInline, kClear, kResolve, kSwap, kUiImagesUnder };
 struct RecHeader {
   Rec type;
   uint32_t bytes;  // the whole record, this header and the delta included
@@ -9460,6 +9686,9 @@ void Replay(const uint8_t* p) {
                  a.hasColor ? w.mirror + kMirrorColor : 0, a.clearZ, a.clearStencil);
       break;
     }
+    case Rec::kUiImagesUnder:
+      RunUiImagesUnder(device);
+      break;
     case Rec::kSwap: {
       SwapArgs a;
       std::memcpy(&a, at, sizeof(a));
@@ -9540,6 +9769,27 @@ void WaitForRecordedCalls(uint64_t records) {
   if (DrawWorkerEnabled() && records) {
     WaitForWorker(records);
   }
+}
+
+// The game's D3D device, as its last draw gave it (its D3D thread).
+uint32_t g_lastDevice = 0;
+
+// The images under the game's 2D (video.h): in order with its draws.
+void UiImagesUnderNow() {
+  uint32_t device = g_lastDevice;
+  if (!device) {
+    return;  // (none yet: the first draws are 3D, long before any 2D)
+  }
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunUiImagesUnder(device);
+    return;
+  }
+  FlushInline();
+  BeginRecord(Rec::kUiImagesUnder, device);
+  PutSurfaces(device);
+  SendRecord();
 }
 
 void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uint32_t flags,
@@ -9631,6 +9881,7 @@ void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
 
 void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
             bool indexed, uint32_t startIndex) {
+  g_lastDevice = device;
   std::unique_lock lock(g_worker.producer);
   if (!Recording()) {
     lock.unlock();
@@ -9647,6 +9898,7 @@ void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t 
 
 void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
                      uint32_t vertexData) {
+  g_lastDevice = device;
   std::unique_lock lock(g_worker.producer);
   if (!Recording()) {
     lock.unlock();
@@ -9683,3 +9935,27 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVe
 }
 
 }  // namespace ng2::video
+
+void ng2::video::SetUiImagePixels(uint32_t key, uint32_t width, uint32_t height, std::vector<uint8_t> rgba) {
+  std::lock_guard lock(g_uiImagesMutex);
+  if (!width || !height || rgba.size() < size_t(width) * height * 4) {
+    g_uiImageTextures.try_emplace(key);  // (none: known, drawn as nothing)
+    return;
+  }
+  UiImageTexture& made = g_uiImageTextures[key];
+  if (made.width) {
+    return;  // (given once)
+  }
+  made.width = width, made.height = height, made.rgba = std::move(rgba);
+}
+
+bool ng2::video::HasUiImage(uint32_t key) {
+  std::lock_guard lock(g_uiImagesMutex);
+  return g_uiImageTextures.count(key) != 0;
+}
+
+void ng2::video::SetUiImages(std::vector<UiImage> images) {
+  std::lock_guard lock(g_uiImagesMutex);
+  g_uiImages = std::move(images);
+  g_uiImagesFrame = g_uiPresents.load(std::memory_order_relaxed);
+}

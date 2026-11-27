@@ -38,6 +38,8 @@
 #include <rex/hook.h>
 
 #include "gpu/guest.h"
+#include "gpu/video.h"
+#include "overlay.h"
 
 REXCVAR_DEFINE_INT32(aspect_ratio, 0, "Display", "0: 16:9, 1: 16:10, 2: 21:9, 3: 32:9, 4: 4:3");
 
@@ -206,6 +208,8 @@ int64_t NowMs() {
 }
 bool MenuBucket(int bucket);
 
+bool g_toastBoxDrawn = false;  // this 2D pass (its thread)
+
 // Draws an item with its bucket known.
 void DrawTagged(PPCContext& ctx, uint8_t* base, void (*draw)(PPCContext&, uint8_t*)) {
   auto it = g_itemBucket.find(ctx.r3.u32);
@@ -233,7 +237,7 @@ bool LeftHud(int bucket) {
   return (bucket >= 39 && bucket <= 41) || (bucket >= 57 && bucket <= 61);
 }
 // The frame-rate counter's layer (src/perf_overlay.cpp): the top left corner.
-constexpr uint32_t kCounterLayer = 0x15;
+constexpr uint32_t kCounterLayer = 0x30;
 bool MenuBucket(int bucket) {
   return bucket == 20 || bucket == 49 || bucket == 50 || (bucket >= 70 && bucket <= 72) ||
          (bucket >= 80 && bucket <= 86);
@@ -252,6 +256,11 @@ Anchor ItemAnchor(float x, float y) {
   // +8; the game files them in another bucket) are at the top.
   if (g_drawItem && Load32(g_drawItem + 8) == kCounterLayer && y < 48.0f) {
     return {-1, -1};
+  }
+  // The achievements' toast (the same layer, lower): about the centre, as
+  // its box and icon (UI images, video.cpp) are, so they stay together.
+  if (g_drawItem && Load32(g_drawItem + 8) == kCounterLayer) {
+    return {};
   }
   if (!g_hud || g_drawBucket < 0 || MenuBucket(g_drawBucket)) {
     return {};
@@ -593,6 +602,13 @@ REX_HOOK_RAW(sub_8368EFF8) {
 // A string's transform.
 REX_EXTERN(__imp__sub_8370DD70);
 REX_HOOK_RAW(sub_8370DD70) {
+  // The achievements' toast: its box (a UI image under the 2D) before its
+  // first string is drawn, so its texts are over it (the 2D lists draw
+  // copies of the items, a word each: the toast's are known by their place).
+  if (g_in2DPass && !g_toastBoxDrawn && ng2::overlay::IsToastText(High(ctx.r10.u64), Low(ctx.r10.u64))) {
+    g_toastBoxDrawn = true;
+    ng2::video::UiImagesUnderNow();
+  }
   Squeeze s = CurrentSqueeze();
   NotePoint(High(ctx.r10.u64), Low(ctx.r10.u64));
   if (s.active()) {
@@ -630,6 +646,7 @@ REX_EXTERN(__imp__sub_8368E2E8);
 REX_HOOK_RAW(sub_8368E2E8) {
   ScanBuckets();
   g_in2DPass = true;
+  g_toastBoxDrawn = false;
   __imp__sub_8368E2E8(ctx, base);
   g_in2DPass = false;
   g_drawBucket = -1;

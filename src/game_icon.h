@@ -31,6 +31,11 @@ struct Picture {
 // sprite pack in other.ng2). False, with why, if the files can't be read.
 bool Make(const std::filesystem::path& game_root, std::vector<Picture>* out, std::string* why);
 
+// A texture of a sprite pack in the game's archives (file: its id), as R G B
+// A (its palette applied), if it's there at that size.
+bool PackPicture(const std::filesystem::path& game_root, uint32_t file, const std::string& name, int width,
+                 int height, std::vector<uint8_t>* rgba);
+
 // Sets the window's icon on a thread of its own: from <cache_dir>/ng2_<size>.png,
 // or made with Make and written there for the next start. Nothing changes if
 // neither works.

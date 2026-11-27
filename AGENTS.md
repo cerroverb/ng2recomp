@@ -94,6 +94,11 @@ devices, and none of the player's settings or saves.
 - `NG2_PIPELINE_STATS=1`: what the driver compiled each shader pair to, logged once a pair (registers,
   scratch, instructions; VK_KHR_pipeline_executable_properties, plume patches 0011 and 0012: the driver feature is only enabled with it). On AMD the vertex
   stage is `ShaderProperties.gs`; `scratchMemUsageInBytes` above 0 there means spilled registers.
+- Achievements (src/achievements.cpp): `NG2_TEST_UNLOCK=<id>,...` unlocks those, one a second, about 10 s
+  after start (`NG2_TEST_UNLOCK_DELAY=<seconds>` later); `NG2_TEST_UNLOCK_KEY=1`: F5 unlocks the next locked
+  one (the hidden ones first). Both are real unlocks, written to the player's achievements file: use a copy
+  of the user data (`--user_data_root`). `NG2_TEST_TOAST=1`: F6 shows the next one's toast, nothing unlocked.
+  Secret achievements (hidden until unlocked): ids 69-74 and 77-102.
 - `NG2_PRESENT_GAPS=1`: the time between real presents (on the thread that makes them) each second.
   Test switches for choppy play at a steady 60 (#36, #46): presents are held until 90% of a refresh
   after the last (V-Sync FIFO or Mailbox only; on by default since 0.5.58, `NG2_TEST_EVEN_PRESENT=0` turns it off); `NG2_TEST_GAMESCOPE_AUTO=1` lets

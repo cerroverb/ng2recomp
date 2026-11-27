@@ -9,7 +9,7 @@
 //                        dark metal plate
 //   t_0x20006 (413x499)  the red brush-stroke "II"
 // The N is cut from the logo with its part of the plate, the plate's left
-// bevel mirrored onto the cut, and laid left on a black rounded tile; the II
+// bevel mirrored onto the cut, and laid left on a black square tile; the II
 // stands over the plate's right edge with a red glow behind and a soft shadow
 // under it. Drawn at 512 and reduced, with the small sizes' own tweaks: from
 // 48 down the chrome rim is brightened, from 32 down the II is widened and
@@ -646,12 +646,18 @@ Rgba Fit(const Rgba& im, int size, double frac, double dx, double dy, bool by_he
   return c;
 }
 
-// The black rounded square, drawn at 4x and reduced for a clean edge. Its
+// The black tile: square, or (a radius) rounded, drawn at 4x and reduced for
+// a clean edge. Its
 // corners are quarter ellipses traced as Pillow's ImageDraw traces them
 // (Draw.c's quarter_next, in half pixels: from (d, 0) to (0, d), each step the
 // one of up, left and up-left that stays nearest the curve), giving each
 // corner row's first pixel.
-Rgba Tile(int size, double radius = 0.19) {
+Rgba Tile(int size, double radius = 0.0) {
+  if (radius <= 0.0) {  // (square: the user's choice, 11-27; the mock-ups' was 0.19)
+    Rgba t(size, size);
+    for (int i = 0; i < size * size; ++i) t.p[size_t(i) * 4 + 3] = 255;
+    return t;
+  }
   const int big = size * 4, d = Round(big * radius) * 2, r = d / 2, last = big - 1;
   std::vector<int> first(r + 1, 0);  // corner row (0 the top) -> first pixel
   {
@@ -762,6 +768,31 @@ Rgba Reduce(const Rgba& im, int size) {
 }
 
 }  // namespace
+
+bool PackPicture(const fs::path& game_root, uint32_t file, const std::string& name, int width, int height,
+                 std::vector<uint8_t>* rgba) {
+  std::map<uint32_t, Entry> ix;
+  if (!Index(game_root, &ix)) {
+    return false;
+  }
+  auto it = ix.find(file);
+  if (it == ix.end()) {
+    return false;
+  }
+  const Entry& e = it->second;
+  std::vector<uint8_t> data;
+  if (!ReadPart(game_root / e.archive, e.offset, e.size ? e.size : e.padded, &data) || data.size() < 7 ||
+      std::memcmp(data.data(), "sprpack", 7) != 0) {
+    return false;
+  }
+  Spr spr;
+  Rgba picture;
+  if (!spr.Parse(data) || !spr.Picture(name, &picture) || picture.w != width || picture.h != height) {
+    return false;
+  }
+  *rgba = std::move(picture.p);
+  return true;
+}
 
 bool Make(const fs::path& game_root, std::vector<Picture>* out, std::string* why) {
   std::vector<uint8_t> data;

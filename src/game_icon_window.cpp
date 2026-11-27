@@ -35,7 +35,7 @@ namespace {
 
 // Written next to the cached pictures: changed when the drawing changes, so
 // older pictures are made again.
-constexpr std::string_view kStamp = "n_plate_over_ii2 1\n";
+constexpr std::string_view kStamp = "n_plate_over_ii2 2\n";  // (2: the tile square)
 
 // The thread, waited for at shutdown (Stop) or else at exit: one left
 // joinable would end the program.
