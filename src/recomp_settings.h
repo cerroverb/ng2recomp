@@ -28,4 +28,8 @@ void ApplyWindowAtStart();
 // saved.
 void WindowFrame();
 
+// Cheats unlocked (RECOMP SETTINGS asked "Do you want to use cheats?" and
+// Yes was chosen, or a cheat is on): achievements are off while they are.
+bool CheatsUnlocked();
+
 }  // namespace ng2::recomp_settings

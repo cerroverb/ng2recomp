@@ -10,6 +10,7 @@
 #include <filesystem>
 
 #include <cstdint>
+#include <vector>
 
 namespace rex::ui {
 class WindowedAppContext;
@@ -101,5 +102,23 @@ void NoteDrawStack(const std::string& stack);
 // pictures between the game's frames (then the counter shows their rate).
 uint64_t PicturesPresented();
 bool InterpolationOn();
+
+// UI images: pictures of ours over the game's frame, in its 1280x720 UI
+// (the achievements' icons). An image's RGBA pixels are given once, by key;
+// the images to show are set each frame (dropped when not set again).
+struct UiImage {
+  uint32_t key = 0;
+  float x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
+  float alpha = 1.0f;
+  bool grey = false;
+  bool under = false;  // under the game's 2D: drawn where UiImagesUnderNow is called
+};
+void SetUiImagePixels(uint32_t key, uint32_t width, uint32_t height, std::vector<uint8_t> rgba);
+bool HasUiImage(uint32_t key);
+void SetUiImages(std::vector<UiImage> images);
+// The images marked under, drawn now into the target the game draws its 2D
+// in, in order with its draws (its D3D thread, e.g. as an item of the 2D
+// pass is drawn).
+void UiImagesUnderNow();
 
 }  // namespace ng2::video

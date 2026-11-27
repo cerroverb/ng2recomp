@@ -28,6 +28,7 @@
 #include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
+#include "achievements.h"
 #include "overlay.h"
 #include "recomp_settings.h"
 
@@ -47,7 +48,12 @@ constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_836CEDE
 // left corner (left edge, line center).
 constexpr float kAnchorX = 953.0f, kAnchorY = 650.0f;
 constexpr float kX = 32.0f - kAnchorX, kY = 16.0f - kAnchorY;
-constexpr uint32_t kLayer = 0x15;  // aspect.cpp keeps this layer's text in the top left corner
+constexpr uint32_t kLayer = 0x15;  // the menu panel's
+// The frame-rate counter's and the toast's: a layer drawn after the rest
+// and in every state of the game (0x15 isn't drawn in the pause menu;
+// 0x20-0x30 are, 0x38 and up nowhere). aspect.cpp keeps its text in the
+// top left corner.
+constexpr uint32_t kTopLayer = 0x30;
 constexpr uint32_t kAllocAttributes = 0xB2800000;
 // A text frame like the one the Options pages' arrow lists show their value
 // in (UI package 0x78's resource 0x2A), from package 0, which is always
@@ -107,7 +113,9 @@ REX_EXTERN(__imp__sub_8242C048);  // a text part's constructor
 REX_EXTERN(__imp__sub_836CEDE8);  // the menu font's scale for a size -> f1
 REX_EXTERN(__imp__sub_83691AD8);  // a text item into this frame's 2D lists: (item, layer)
 REX_EXTERN(__imp__sub_837047E0);  // a sprite's resource: (sprite, resource)
+REX_EXTERN(__imp__sub_8242AFC0);  // a menu sound: (number), f1
 REX_EXTERN(__imp__sub_83704978);  // a sprite's update
+REX_EXTERN(__imp__sub_83704E08);  // an image part into this frame's 2D lists: (part, &{layer, 0x100, 0, 0, -1})
 
 namespace {
 
@@ -181,7 +189,7 @@ void QueueText(PPCContext& ctx, uint8_t* base, uint32_t item, uint32_t* resource
   StoreFloat(item + kTextScale + 4, float(scale));
   std::memcpy(ng2::guest::Virtual(item + 0x40), ng2::guest::Virtual(kTextColor), 16);
   CallGuest(ctx, base, __imp__sub_83704978, {item});
-  CallGuest(ctx, base, __imp__sub_83691AD8, {item, kLayer});
+  CallGuest(ctx, base, __imp__sub_83691AD8, {item, kTopLayer});
 }
 
 // A panel of texts of ours (overlay.h): each a text item of its own, made
@@ -190,29 +198,73 @@ constexpr uint32_t kPanelChars = 96;
 struct PanelItem {
   uint32_t item = 0, resource = 0;
 };
-std::mutex g_panelMutex;
-std::vector<ng2::overlay::Text> g_panel;  // (guarded)
-uint64_t g_panelFrame = ~0ull;            // the frame it was last set in (guarded)
-uint32_t g_panelLayer = 0;                // (guarded)
-bool g_panelQueued = false;               // by QueuePanel (guarded)
-std::mutex g_panelItemsMutex;
-std::vector<PanelItem> g_panelItems;      // (g_panelItemsMutex)
+// Two of them: the menus' panel, and the achievements' toast (over play).
+struct Channel {
+  std::mutex mutex;
+  std::vector<ng2::overlay::Text> texts;      // (mutex)
+  std::vector<ng2::overlay::Sprite> sprites;  // (mutex)
+  uint64_t frame = ~0ull;                     // the frame it was last set in (mutex)
+  uint32_t layer = 0;                         // (mutex)
+  bool queued = false;                        // by QueuePanel (mutex)
+  std::mutex itemsMutex;
+  std::vector<PanelItem> items;               // (itemsMutex)
+  std::vector<uint32_t> spriteCopies;         // (itemsMutex)
+};
+Channel g_menuPanel, g_toastPanel;
 
-void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued) {
+void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued, Channel& channel = g_menuPanel) {
   std::vector<ng2::overlay::Text> texts;
+  std::vector<ng2::overlay::Sprite> sprites;
   uint32_t layer = kLayer;
-  std::lock_guard items(g_panelItemsMutex);
+  std::lock_guard items(channel.itemsMutex);
   {
-    std::lock_guard lock(g_panelMutex);
+    std::lock_guard lock(channel.mutex);
     uint64_t now = g_frameNumber.load(std::memory_order_relaxed);
-    if (g_panelQueued != queued) {
+    if (channel.queued != queued) {
       return;
     }
-    if (!queued && (g_panelFrame == ~0ull || g_panelFrame + 2 < now)) {
+    if (!queued && (channel.frame == ~0ull || channel.frame + 2 < now)) {
       return;  // not set lately: its menu is gone
     }
-    texts = g_panel;
-    layer = g_panelLayer ? g_panelLayer : kLayer;
+    texts = channel.texts;
+    sprites = channel.sprites;
+    layer = channel.layer ? channel.layer : kLayer;
+  }
+  auto& g_spriteCopies = channel.spriteCopies;
+  auto& g_panelItems = channel.items;
+  for (size_t i = 0; i < sprites.size(); i++) {
+    if (i >= g_spriteCopies.size()) {
+      uint32_t copy = CallGuest(ctx, base, __imp__sub_83835960, {0x100, kAllocAttributes});
+      if (!copy) {
+        return;
+      }
+      g_spriteCopies.push_back(copy);
+    }
+    const ng2::overlay::Sprite& sprite = sprites[i];
+    uint32_t copy = g_spriteCopies[i];
+    if (sprite.update) {
+      CallGuest(ctx, base, __imp__sub_83704978, {sprite.source});
+    }
+    std::memcpy(ng2::guest::Virtual(copy), ng2::guest::Virtual(sprite.source), 0x90);
+    StoreFloat(copy + 0x30, sprite.x);
+    StoreFloat(copy + 0x34, sprite.y);
+    if (sprite.shade >= 0.0f) {
+      for (uint32_t c = 0; c < 3; c++) {
+        StoreFloat(copy + 0x40 + 4 * c, sprite.shade);
+      }
+    }
+    if (sprite.image) {
+      uint32_t params = copy + 0x90;  // (in the copy's spare room, past the sprite)
+      Store32(params, layer);
+      ng2::guest::Virtual(params + 4)[0] = 1, ng2::guest::Virtual(params + 4)[1] = 0;
+      Store32(params + 8, 0);
+      Store32(params + 12, 0);
+      Store32(params + 16, 0xFFFFFFFF);
+      CallGuest(ctx, base, __imp__sub_83704E08, {copy, params});
+    } else {
+      CallGuest(ctx, base, __imp__sub_83704978, {copy});
+      CallGuest(ctx, base, __imp__sub_83691AD8, {copy, layer});
+    }
   }
   uint32_t frame = FindTextFrame();
   if (!frame) {
@@ -230,7 +282,9 @@ void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued) {
       CallGuest(ctx, base, __imp__sub_8242C048, {item + kTextPart});
       Store32(item + kText, item + kItemSize);
       Store32(item + kTextPart + 8, (ng2::guest::Load32(item + kTextPart + 8) & 0xFFFC3FFF) | 0x4000);
-      Store32(item + 0xF0, 1);
+      // (+0xF0 0: not fitted into its box, which squeezes a line longer
+      // than about 290 across; it's then placed by its top, below)
+      Store32(item + 0xF0, 0);
       g_panelItems.push_back({item, 0});
     }
     PanelItem& made = g_panelItems[i];
@@ -242,7 +296,9 @@ void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued) {
       chars[2 * k + 1] = uint8_t(text.text[k]);
     }
     StoreFloat(made.item + kTextPosition, text.x - kAnchorX);
-    StoreFloat(made.item + kTextPosition + 4, text.y - kAnchorY);
+    // (its line's center, as a fitted one: the top half a line above)
+    constexpr float kCenterDrop = 24.0f / 0x1C;
+    StoreFloat(made.item + kTextPosition + 4, text.y + kCenterDrop * float(text.size) - kAnchorY);
     if (frame != made.resource) {
       made.resource = frame;
       CallGuest(ctx, base, __imp__sub_837047E0, {made.item, frame});
@@ -254,12 +310,15 @@ void PanelFrame(PPCContext& ctx, uint8_t* base, bool queued) {
     }
     StoreFloat(made.item + kTextScale, float(scale));
     StoreFloat(made.item + kTextScale + 4, float(scale));
-    // A focused row's colour, dimmed (four floats).
+    // A focused row's colour, dimmed (four floats), or the text's own.
     for (uint32_t c = 0; c < 4; c++) {
       uint32_t bits = ng2::guest::Load32(kTextColor + 4 * c);
       float value;
       std::memcpy(&value, &bits, 4);
-      StoreFloat(made.item + 0x40 + 4 * c, c < 3 ? value * text.shade : value);
+      if (text.color) {
+        value = c < 3 ? float((text.color >> (16 - 8 * c)) & 0xFF) / 255.0f : value;
+      }
+      StoreFloat(made.item + 0x40 + 4 * c, (c < 3 ? value * text.shade : value) * (c == 3 ? text.alpha : 1.0f));
     }
     CallGuest(ctx, base, __imp__sub_83704978, {made.item});
     CallGuest(ctx, base, __imp__sub_83691AD8, {made.item, layer});
@@ -296,12 +355,14 @@ void ng2::overlay::QueuePanel(PPCContext& ctx, uint8_t* base) {
   PanelFrame(ctx, base, true);
 }
 
-void ng2::overlay::SetPanel(std::vector<Text> texts, uint32_t layer, bool queued) {
-  std::lock_guard lock(g_panelMutex);
-  g_panel = std::move(texts);
-  g_panelLayer = layer;
-  g_panelQueued = queued;
-  g_panelFrame = g_frameNumber.load(std::memory_order_relaxed);
+void ng2::overlay::SetPanel(std::vector<Text> texts, uint32_t layer, bool queued, std::vector<Sprite> sprites) {
+  Channel& channel = g_menuPanel;
+  std::lock_guard lock(channel.mutex);
+  channel.texts = std::move(texts);
+  channel.sprites = std::move(sprites);
+  channel.layer = layer;
+  channel.queued = queued;
+  channel.frame = g_frameNumber.load(std::memory_order_relaxed);
 }
 
 // The game starting a frame: time it, and queue the text for it.
@@ -337,9 +398,23 @@ REX_HOOK_RAW(sub_822F0EF8) {
   g_last = now;
   g_frameNumber.fetch_add(1, std::memory_order_relaxed);
   VersionFrame(ctx, base);
+  if (ng2::achievements::Frame()) {
+    // (a menu sound, as the game's menus play them: sub_8242AFC0(number),
+    // f1 the float at 0x8206EE68)
+    uint32_t bits = ng2::guest::Load32(0x8206EE68);
+    float volume;
+    std::memcpy(&volume, &bits, sizeof(volume));
+    PPCContext saved = ctx;
+    ctx.r1.u64 = saved.r1.u32 - 0x200;
+    ctx.r3.u64 = ng2::achievements::kToastSound;
+    ctx.f1.f64 = volume;
+    __imp__sub_8242AFC0(ctx, base);
+    ctx = saved;
+  }
   PanelFrame(ctx, base, false);
-  // In gameplay only (the HUD up), not on loading screens and menus.
-  if (!REXCVAR_GET(show_fps) || !ng2::aspect::HudShown() || (!g_item && !MakeItem(ctx, base))) {
+  PanelFrame(ctx, base, false, g_toastPanel);
+  // Everywhere, over everything (NGB's counter).
+  if (!REXCVAR_GET(show_fps) || (!g_item && !MakeItem(ctx, base))) {
     return;
   }
   // Averaged over half a second, so it can be read.
@@ -362,4 +437,35 @@ REX_HOOK_RAW(sub_822F0EF8) {
     g_frames = 0;
   }
   QueueText(ctx, base, g_item, &g_resource);
+}
+
+// The toast's first text's place (as given), for IsToastText on the 2D
+// pass's thread; frame: the frame it was set in.
+std::atomic<float> g_toastX{0.0f}, g_toastY{0.0f};
+std::atomic<uint64_t> g_toastFrame{~0ull};
+
+bool ng2::overlay::IsToastText(float x, float y) {
+  uint64_t frame = g_toastFrame.load(std::memory_order_relaxed);
+  if (frame == ~0ull || frame + 2 < g_frameNumber.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  // (its line is drawn at its top, a little above the line's centre)
+  // (and a couple of pixels left of its x)
+  return std::abs(x - g_toastX.load(std::memory_order_relaxed)) < 4.0f &&
+         std::abs(y - g_toastY.load(std::memory_order_relaxed)) < 24.0f;
+}
+
+void ng2::overlay::SetToast(std::vector<Text> texts) {
+  // (texts' layer: kTopLayer, over the pause menu too)
+  Channel& channel = g_toastPanel;
+  std::lock_guard lock(channel.mutex);
+  if (!texts.empty()) {
+    g_toastX.store(texts[0].x, std::memory_order_relaxed);
+    g_toastY.store(texts[0].y, std::memory_order_relaxed);
+    g_toastFrame.store(g_frameNumber.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
+  channel.texts = std::move(texts);
+  channel.layer = kTopLayer;
+  channel.queued = false;
+  channel.frame = g_frameNumber.load(std::memory_order_relaxed);
 }

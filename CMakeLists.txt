@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 VERSION 0.8.1 LANGUAGES CXX)
+project(ng2 VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -89,6 +89,9 @@ set(NG2_SOURCES
     src/gpu/d3d_hooks.cpp
     src/perf_overlay.cpp
     src/recomp_settings.cpp
+    src/settings_panel.cpp
+    src/achievements.cpp
+    src/lock_icon.cpp
     src/movie/movie_hooks.cpp
     src/movie/host_movie.cpp
     src/debug_waits.cpp
@@ -258,6 +261,7 @@ set(NG2_INTERNAL_SHADERS
     "depth_copy_ps:ps_6_0"
     "depth_copy_ms_ps:ps_6_0"
     "debug_ps:ps_6_0"
+    "image_ps:ps_6_0"
 )
 set(NG2_INTERNAL_SHADER_SOURCES "")
 foreach(_entry ${NG2_INTERNAL_SHADERS})
